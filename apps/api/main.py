@@ -1,7 +1,7 @@
 import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routers import webhooks, tasks
+from .routers import webhooks, tasks, health
 
 # Initialize FastAPI app configured for Vercel Serverless Functions
 app = FastAPI(
@@ -22,13 +22,13 @@ app.add_middleware(
 )
 
 # Register routers
+app.include_router(health.router)
 app.include_router(webhooks.router)
 app.include_router(tasks.router)
 
 @app.get("/api/health")
-@app.get("/api/v1/health")
-async def health_check():
-    """Health check endpoint for Vercel deployment verification."""
+async def legacy_health_check():
+    """Compatibility health check endpoint."""
     return {
         "status": "ok",
         "service": "jules-clone-api",
