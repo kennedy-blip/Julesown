@@ -5,7 +5,9 @@ back by the GitHub API for an object that GitHub confirmed it created.
 
 Commits are created through the Git Data API (blobs -> tree -> commit -> ref)
 rather than by ``git push`` from the sandbox, so write credentials never have
-to be exposed to the environment where model-chosen commands run.
+to be exposed to the environment where model-chosen commands run. A repository
+without any commit is the one case that API refuses; its first commit is made
+through the Contents API (see ``create_initial_commit``).
 """
 from __future__ import annotations
 
@@ -32,6 +34,36 @@ _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 REQUIRED_APP_PERMISSIONS = {"contents": "write", "pull_requests": "write"}
 
+# Listing: GitHub returns at most 100 items per page. Every page is fetched, up
+# to this many repositories (an account can have thousands).
+PAGE_SIZE = 100
+MAX_LISTED_REPOSITORIES = 2000
+MAX_LISTED_INSTALLATIONS = 300
+_DESCRIPTION_CHARS = 140
+
+# Committing: text files travel inside the tree request (GitHub writes the blobs
+# itself), so a change of fifty files is one request instead of fifty. Larger and
+# binary files are uploaded as blobs one by one.
+INLINE_FILE_BYTES = 200_000
+INLINE_TREE_BYTES = 1_000_000
+
+
+def _inline_text(change: "FileChange") -> Optional[str]:
+    """The file's content as text if it can be sent inside a tree request.
+
+    Only regular files that are non-empty, valid UTF-8 and free of NUL bytes:
+    for those a JSON string round-trips to exactly the same bytes.
+    """
+    if change.mode not in ("100644", "100755") or not change.content_b64:
+        return None
+    if len(change.content_b64) > INLINE_FILE_BYTES * 4 // 3 + 4:
+        return None
+    try:
+        text = base64.b64decode(change.content_b64, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return None
+    return None if "\x00" in text else text
+
 
 class GitHubError(Exception):
     """A GitHub operation failed. ``message`` is safe to show to the user."""
@@ -43,12 +75,16 @@ class GitHubError(Exception):
         status_code: Optional[int] = None,
         code: str = "github_error",
         hint: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.code = code
         self.hint = hint
+        # Machine-readable context (e.g. what was already written when a
+        # multi-step operation failed half way).
+        self.details: Dict[str, Any] = dict(details or {})
 
     def describe(self) -> str:
         return f"{self.message} {self.hint}" if self.hint else self.message
@@ -278,6 +314,7 @@ class GitHubClient:
         self._extra_secrets: List[str] = []
         self._jwt_cache: Optional[Tuple[str, float]] = None
         self._app_info: Optional[Dict[str, Any]] = None
+        self._pause: Callable[[float], None] = time.sleep  # between retries
         self._http = httpx.Client(
             base_url=api_url.rstrip("/"),
             timeout=timeout,
@@ -381,6 +418,15 @@ class GitHubClient:
         elif status == 403 and "rate limit" in lowered:
             code = "rate_limited"
             hint = "The GitHub API rate limit was hit; try again later."
+        elif "workflow" in lowered and "permission" in lowered:
+            # "refusing to allow a GitHub App to create or update workflow ... without
+            # `workflows` permission"
+            code = "workflow_permission"
+            hint = (
+                "GitHub only accepts files under .github/workflows from credentials with the "
+                "'Workflows' permission. Grant it to the GitHub App (or token), or ask for the "
+                "change without workflow files."
+            )
         elif status == 403:
             code = "forbidden"
             hint = "The GitHub App or token lacks permission for this operation."
@@ -633,7 +679,11 @@ class GitHubClient:
         )
 
     def get_branch_sha(self, slug: str, branch: str) -> Optional[str]:
-        """Commit sha of ``branch``, or ``None`` when the branch does not exist."""
+        """Commit sha of ``branch``, or ``None`` when the branch does not exist.
+
+        A repository without any commit has no branches at all; GitHub answers
+        409 for it and this raises ``GitHubError`` with code ``repo_empty``.
+        """
         access = self.access_for(slug)
         response = self._send(
             "GET",
@@ -644,7 +694,7 @@ class GitHubClient:
         if response.status_code == 404:
             return None
         if response.status_code == 409:
-            raise GitHubError(f"Repository {slug} is empty - it has no commits yet.", code="repo_empty")
+            raise self._conflict(response, slug, f"reading branch {branch}")
         if response.status_code != 200:
             raise self._error(response, f"reading branch {branch}")
         data = response.json()
@@ -652,68 +702,220 @@ class GitHubClient:
             return (data.get("object") or {}).get("sha")
         return None
 
-    def list_repositories(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Repositories the configured credentials can act on."""
-        collected: List[Dict[str, Any]] = []
-        seen = set()
+    def _conflict(self, response: httpx.Response, slug: str, action: str) -> GitHubError:
+        """GitHub's 409 for the Git database: the repository is empty, or (rarely)
+        still being created."""
+        error = self._error(response, action)
+        if "empty" in error.message.lower():
+            return GitHubError(
+                f"Repository {slug} is empty - it has no commits yet.", status_code=409, code="repo_empty"
+            )
+        error.code = "repo_unavailable"
+        error.hint = "GitHub may still be setting the repository up; try again in a moment."
+        return error
+
+    def is_empty(self, slug: str, default_branch: str) -> bool:
+        """True when the repository has no commits (and therefore no branch)."""
+        try:
+            self.get_branch_sha(slug, default_branch)
+        except GitHubError as exc:
+            if exc.code == "repo_empty":
+                return True
+            raise
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Listing repositories
+    # ------------------------------------------------------------------ #
+    def _collect_pages(
+        self,
+        path: str,
+        *,
+        bearer: str,
+        action: str,
+        limit: int,
+        items_key: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Any], Optional[int], bool, Optional[GitHubError]]:
+        """Every page of a list endpoint, up to ``limit`` items.
+
+        Returns ``(items, total, more, error)``: ``total`` is GitHub's own count
+        when the endpoint reports one, ``more`` says that items were left out,
+        and ``error`` is what stopped the listing after its first page (the
+        pages read until then are returned; a failing first page raises).
+        """
+        items: List[Any] = []
+        total: Optional[int] = None
+        page = 1
+        batch: List[Any] = []
+        while len(items) < limit:
+            try:
+                data = self._json(
+                    "GET",
+                    path,
+                    bearer=bearer,
+                    action=action,
+                    params={**(params or {}), "per_page": PAGE_SIZE, "page": page},
+                )
+            except GitHubError as exc:
+                if page == 1:
+                    raise
+                return items[:limit], total, True, exc
+            if items_key is not None:
+                raw = data.get(items_key) if isinstance(data, dict) else None
+                if isinstance(data, dict) and isinstance(data.get("total_count"), int):
+                    total = int(data["total_count"])
+            else:
+                raw = data
+            batch = raw if isinstance(raw, list) else []
+            items.extend(batch)
+            if len(batch) < PAGE_SIZE or (total is not None and len(items) >= total):
+                break
+            page += 1
+        if total is not None:
+            more = total > min(len(items), limit)
+        else:
+            more = len(items) > limit or (len(items) == limit and len(batch) == PAGE_SIZE)
+        return items[:limit], total, more, None
+
+    @staticmethod
+    def _repository_summary(repo: Dict[str, Any]) -> Dict[str, Any]:
+        name = str(repo.get("full_name") or "")
+        description = repo.get("description")
+        if isinstance(description, str):
+            description = " ".join(description.split())
+            if len(description) > _DESCRIPTION_CHARS:
+                description = description[: _DESCRIPTION_CHARS - 1].rstrip() + "…"
+        return {
+            "full_name": name,
+            "private": bool(repo.get("private")),
+            "default_branch": repo.get("default_branch") or "main",
+            "html_url": repo.get("html_url") or f"https://github.com/{name}",
+            "archived": bool(repo.get("archived")),
+            "fork": bool(repo.get("fork")),
+            "description": description or None,
+            "language": repo.get("language") or None,
+            "pushed_at": repo.get("pushed_at") or None,
+        }
+
+    def repository_catalog(self, limit: int = MAX_LISTED_REPOSITORIES) -> Dict[str, Any]:
+        """Every repository the configured credentials can act on.
+
+        With a GitHub App that is every repository of every installation of the
+        App; with a personal token, every repository the token's user can reach.
+        All pages are fetched (GitHub hands out at most 100 repositories per
+        request). The result is ordered by last push, newest first, and says
+        how each App installation is set up, so that the dashboard can explain
+        why a repository is missing.
+
+        ``repositories`` holds at most ``limit`` entries; ``total`` is the number
+        GitHub reports, and ``truncated`` tells whether some were left out.
+        """
+        repositories: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        installations: List[Dict[str, Any]] = []
+        total = 0
+        truncated = False
+        error: Optional[str] = None
 
         def add(items: Iterable[Any]) -> None:
             for repo in items:
                 if not isinstance(repo, dict):
                     continue
                 name = repo.get("full_name")
-                if not name or name in seen or repo.get("archived"):
+                if not name or str(name).lower() in seen:
                     continue
-                seen.add(name)
-                collected.append(
-                    {
-                        "full_name": name,
-                        "private": bool(repo.get("private")),
-                        "default_branch": repo.get("default_branch") or "main",
-                        "html_url": repo.get("html_url") or f"https://github.com/{name}",
-                    }
-                )
+                seen.add(str(name).lower())
+                repositories.append(self._repository_summary(repo))
 
-        if self.app_configured:
-            installations = self._json(
-                "GET",
-                "/app/installations",
-                bearer=self._app_jwt(),
-                action="listing App installations",
-                params={"per_page": 100},
-            )
-            for installation in installations if isinstance(installations, list) else []:
-                if len(collected) >= limit:
-                    break
-                token, _expires, _permissions = self._installation_token(int(installation["id"]))
-                page = self._json(
-                    "GET",
-                    "/installation/repositories",
-                    bearer=token,
-                    action="listing installation repositories",
-                    params={"per_page": 100},
+        try:
+            if self.app_configured:
+                found, _count, more, failure = self._collect_pages(
+                    "/app/installations",
+                    bearer=self._app_jwt(),
+                    action="listing App installations",
+                    limit=MAX_LISTED_INSTALLATIONS,
                 )
-                add(page.get("repositories") or [])
-        elif self._token:
-            if self._token.startswith("ghs_"):
-                page = self._json(
-                    "GET",
-                    "/installation/repositories",
-                    bearer=self._token,
-                    action="listing repositories",
-                    params={"per_page": 100},
-                )
-                add(page.get("repositories") or [])
-            else:
-                page = self._json(
-                    "GET",
-                    "/user/repos",
-                    bearer=self._token,
-                    action="listing repositories",
-                    params={"per_page": 100, "sort": "pushed"},
-                )
-                add(page if isinstance(page, list) else [])
-        return collected[:limit]
+                truncated = truncated or more
+                error = failure.describe() if failure else error
+                for installation in found:
+                    if not isinstance(installation, dict) or "id" not in installation:
+                        continue
+                    account = installation.get("account") or {}
+                    entry: Dict[str, Any] = {
+                        "id": int(installation["id"]),
+                        "account": account.get("login"),
+                        "account_type": account.get("type"),
+                        # "all": every repository of the account, including future ones.
+                        # "selected": only the repositories picked when the App was installed.
+                        "repository_selection": installation.get("repository_selection"),
+                        "manage_url": installation.get("html_url"),
+                        "suspended": bool(installation.get("suspended_at")),
+                        "repository_count": None,
+                    }
+                    installations.append(entry)
+                    if entry["suspended"]:
+                        continue
+                    remaining = limit - len(repositories)
+                    if remaining <= 0:
+                        truncated = True
+                        continue
+                    token, _expires, _permissions = self._installation_token(entry["id"])
+                    with self._lock:
+                        self._extra_secrets.append(token)
+                    listed, count, more, failure = self._collect_pages(
+                        "/installation/repositories",
+                        bearer=token,
+                        action="listing installation repositories",
+                        items_key="repositories",
+                        limit=remaining,
+                    )
+                    entry["repository_count"] = count if count is not None else len(listed)
+                    total += entry["repository_count"]
+                    truncated = truncated or more
+                    error = failure.describe() if failure else error
+                    add(listed)
+            elif self._token:
+                if self._token.startswith("ghs_"):
+                    listed, count, more, failure = self._collect_pages(
+                        "/installation/repositories",
+                        bearer=self._token,
+                        action="listing repositories",
+                        items_key="repositories",
+                        limit=limit,
+                    )
+                else:
+                    listed, count, more, failure = self._collect_pages(
+                        "/user/repos",
+                        bearer=self._token,
+                        action="listing repositories",
+                        limit=limit,
+                        params={"sort": "pushed"},
+                    )
+                truncated = truncated or more
+                error = failure.describe() if failure else error
+                add(listed)
+                total = count if count is not None else len(repositories)
+        except GitHubError as exc:
+            if not repositories and not installations:
+                raise
+            # Part of the list is better than none, as long as it says it is partial.
+            error = exc.describe()
+            truncated = True
+
+        # Most recently pushed first: the repositories being worked on are on top.
+        repositories.sort(key=lambda repo: repo["pushed_at"] or "", reverse=True)
+        return {
+            "repositories": repositories,
+            "total": max(total, len(repositories)),
+            "truncated": truncated,
+            "installations": installations,
+            "error": error,
+        }
+
+    def list_repositories(self, limit: int = MAX_LISTED_REPOSITORIES) -> List[Dict[str, Any]]:
+        """Repositories the configured credentials can act on (see ``repository_catalog``)."""
+        return self.repository_catalog(limit)["repositories"]
 
     # ------------------------------------------------------------------ #
     # Writing: commit, branch, pull request, comment
@@ -723,21 +925,36 @@ class GitHubClient:
         slug: str,
         *,
         parent_sha: str,
-        base_tree_sha: str,
+        base_tree_sha: Optional[str],
         changes: List[FileChange],
         message: str,
         expected_tree_sha: Optional[str] = None,
+        known_blobs: Iterable[str] = (),
+        inline_text: bool = True,
     ) -> Dict[str, Any]:
         """Create a commit on top of ``parent_sha`` containing ``changes``.
 
-        Blob shas returned by GitHub are compared with the shas git computed in
-        the sandbox, and the resulting tree is compared with the sandbox index
-        tree, so the commit is guaranteed to be exactly what was tested.
+        The resulting tree is compared with the sandbox index tree, so the
+        commit is guaranteed to be exactly what was tested. Files uploaded as
+        blobs are additionally compared one by one with the shas git computed
+        in the sandbox.
+
+        Text files are sent inside the tree request when the tree can be
+        verified afterwards (``expected_tree_sha``): one request for all of
+        them. Should GitHub build a different tree from that, everything is
+        uploaded blob by blob instead, which also names the file that differs.
+
+        ``base_tree_sha=None`` builds the tree from ``changes`` alone (the whole
+        content of a new repository). ``known_blobs`` are blob shas the
+        repository already has, which are not uploaded again.
         """
         if not changes:
             raise GitHubError("There are no changes to commit.", code="no_changes")
         token = self.access_for(slug).token
+        already_stored = set(known_blobs)
         entries: List[Dict[str, Any]] = []
+        inline_budget = INLINE_TREE_BYTES if inline_text and expected_tree_sha else 0
+        inlined = 0
         for change in changes:
             if change.status == "D":
                 entries.append({"path": change.path, "mode": "100644", "type": "blob", "sha": None})
@@ -746,6 +963,15 @@ class GitHubClient:
                 entries.append(
                     {"path": change.path, "mode": change.mode, "type": "commit", "sha": change.sha}
                 )
+                continue
+            if change.sha and change.sha in already_stored:
+                entries.append({"path": change.path, "mode": change.mode, "type": "blob", "sha": change.sha})
+                continue
+            text = _inline_text(change) if inline_budget > 0 else None
+            if text is not None and len(text.encode("utf-8")) <= inline_budget:
+                inline_budget -= len(text.encode("utf-8"))
+                inlined += 1
+                entries.append({"path": change.path, "mode": change.mode, "type": "blob", "content": text})
                 continue
             if change.content_b64 is None:
                 raise GitHubError(
@@ -767,16 +993,44 @@ class GitHubClient:
                     code="integrity_error",
                 )
             entries.append({"path": change.path, "mode": change.mode, "type": "blob", "sha": blob_sha})
+            if blob_sha:
+                already_stored.add(str(blob_sha))
 
-        tree = self._json(
-            "POST",
-            f"/repos/{slug}/git/trees",
-            bearer=token,
-            action="creating the git tree",
-            json_body={"base_tree": base_tree_sha, "tree": entries},
-            ok=(201,),
-        )
+        def blob_by_blob() -> Dict[str, Any]:
+            return self.create_commit(
+                slug,
+                parent_sha=parent_sha,
+                base_tree_sha=base_tree_sha,
+                changes=changes,
+                message=message,
+                expected_tree_sha=expected_tree_sha,
+                known_blobs=already_stored,
+                inline_text=False,
+            )
+
+        tree_request: Dict[str, Any] = {"tree": entries}
+        if base_tree_sha:
+            tree_request["base_tree"] = base_tree_sha
+        try:
+            tree = self._json(
+                "POST",
+                f"/repos/{slug}/git/trees",
+                bearer=token,
+                action="creating the git tree",
+                json_body=tree_request,
+                ok=(201,),
+            )
+        except GitHubError as exc:
+            # Sending text along is a shortcut, never a requirement: if GitHub does
+            # not take the request (other than for lack of access), go the long way.
+            if inlined and exc.status_code not in (401, 403, 404):
+                return blob_by_blob()
+            raise
         tree_sha = tree.get("sha")
+        if expected_tree_sha and tree_sha != expected_tree_sha and inlined:
+            # Not the tree the sandbox has. Upload every file as a blob instead:
+            # that either works or says which file differs.
+            return blob_by_blob()
         if expected_tree_sha and tree_sha != expected_tree_sha:
             raise GitHubError(
                 f"Integrity check failed: GitHub built tree {tree_sha} but the sandbox work tree is "
@@ -811,6 +1065,289 @@ class GitHubClient:
         if response.status_code == 422 and "already exists" in error.message.lower():
             error.code = "branch_exists"
         raise error
+
+    def update_branch(self, slug: str, branch: str, sha: str) -> None:
+        """Move ``branch`` forward to ``sha``. Never forced: GitHub refuses the
+        update unless ``sha`` descends from the commit the branch points to."""
+        token = self.access_for(slug).token
+        self._json(
+            "PATCH",
+            f"/repos/{slug}/git/refs/heads/{quote(branch, safe='/')}",
+            bearer=token,
+            action=f"updating branch {branch}",
+            json_body={"sha": sha, "force": False},
+            ok=(200,),
+        )
+
+    def _landed_commit(
+        self, slug: str, branch: str, *, parent_sha: str, tree_sha: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """The commit ``branch`` points to, if it is the one that was being made:
+        a child of ``parent_sha`` with exactly the expected tree.
+
+        Asked after a request failed, to tell "it did not happen" from "it
+        happened and the answer got lost on the way". ``None`` whenever that
+        cannot be said for certain.
+        """
+        if not tree_sha:
+            return None
+        try:
+            response = self._send(
+                "GET",
+                f"/repos/{slug}/commits",
+                bearer=self.access_for(slug).token,
+                action=f"checking what {branch} points to",
+                params={"sha": branch, "per_page": 1},
+            )
+            listed = response.json() if response.status_code == 200 else None
+        except (GitHubError, ValueError):
+            return None
+        tip = listed[0] if isinstance(listed, list) and listed and isinstance(listed[0], dict) else None
+        if tip is None:
+            return None
+        commit = tip.get("commit") if isinstance(tip.get("commit"), dict) else {}
+        parents = [str(parent.get("sha")) for parent in tip.get("parents") or [] if isinstance(parent, dict)]
+        sha = tip.get("sha")
+        if parents != [parent_sha] or (commit.get("tree") or {}).get("sha") != tree_sha:
+            return None
+        if not sha or not _SHA_RE.match(str(sha)):
+            return None
+        return {
+            "sha": sha,
+            "tree_sha": tree_sha,
+            "html_url": tip.get("html_url") or f"https://github.com/{slug}/commit/{sha}",
+        }
+
+    # ------------------------------------------------------------------ #
+    # The first commit of an empty repository
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _first_file(changes: List[FileChange]) -> FileChange:
+        """The file that becomes the repository's first commit.
+
+        The Contents API writes one regular, non-executable file. A README is
+        preferred (it is what GitHub itself starts a repository with), then
+        ``.gitignore``, then the smallest file.
+        """
+        files = [c for c in changes if c.status != "D" and c.mode in ("100644", "100755")]
+        candidates = [c for c in files if c.mode == "100644" and c.content_b64] or [
+            c for c in files if c.content_b64
+        ] or [c for c in files if c.content_b64 is not None]
+        if not candidates:
+            raise GitHubError(
+                "None of the new files can be committed as the repository's first file.",
+                code="no_changes",
+            )
+
+        def rank(change: FileChange) -> Tuple[int, int, str]:
+            name = change.path.lower()
+            if name == "readme.md":
+                order = 0
+            elif "/" not in name and name.startswith("readme"):
+                order = 1
+            elif name == ".gitignore":
+                order = 2
+            else:
+                order = 3
+            return (order, len(change.content_b64 or ""), change.path)
+
+        return min(candidates, key=rank)
+
+    def create_initial_commit(
+        self,
+        slug: str,
+        *,
+        branch: str,
+        changes: List[FileChange],
+        message: str,
+        first_message: str = "Initial commit",
+        expected_tree_sha: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Put ``changes`` into a repository that has no commits yet.
+
+        GitHub's Git Data API (blobs, trees, commits, refs) answers 409 for an
+        empty repository. The documented way in is the Contents API: writing one
+        file with it creates the repository's first commit and its default
+        branch. If there are more files, they follow in a second commit made
+        the usual way on top of it. Blob shas and the final tree are compared
+        with what the sandbox produced, exactly as for a pull request.
+
+        Returns ``sha`` / ``html_url`` of the last commit, the ``branch`` it is
+        on, and ``commits`` (1 or 2). If the first commit was made but the rest
+        failed, the raised error has code ``initial_commit_incomplete`` and
+        says in ``details`` what is already in the repository.
+        """
+        if not changes:
+            raise GitHubError("There are no changes to commit.", code="no_changes")
+        if any(change.status == "D" for change in changes):
+            raise GitHubError(
+                "An empty repository has nothing that could be deleted.", code="integrity_error"
+            )
+        token = self.access_for(slug).token
+        first = self._first_file(changes)
+        only_file = len(changes) == 1 and first.mode == "100644"
+
+        response = self._send(
+            "PUT",
+            f"/repos/{slug}/contents/{quote(first.path, safe='/')}",
+            bearer=token,
+            action=f"creating the first commit ({first.path})",
+            json_body={
+                "message": message if only_file else first_message,
+                "content": first.content_b64 or "",
+            },
+        )
+        refusal = (response.text or "").lower()
+        if response.status_code == 422 and "sha" in refusal and "supplied" in refusal:
+            # "sha" wasn't supplied: the file is already there, so somebody
+            # committed to the repository while the task was running.
+            raise GitHubError(
+                f"{slug} is no longer empty: {first.path} was added to it while the task was running. "
+                "Nothing was written.",
+                status_code=422,
+                code="repo_not_empty",
+            )
+        if response.status_code not in (200, 201):
+            raise self._error(response, f"creating the first commit ({first.path})")
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise GitHubError(
+                "GitHub returned an unreadable response while creating the first commit.",
+                code="github_error",
+            ) from exc
+        commit = data.get("commit") if isinstance(data, dict) else None
+        commit = commit if isinstance(commit, dict) else {}
+        first_sha = commit.get("sha")
+        if not first_sha or not _SHA_RE.match(str(first_sha)):
+            raise GitHubError("GitHub did not return the sha of the first commit.", code="github_error")
+        first_url = commit.get("html_url")
+        written = {"first_commit_sha": first_sha, "first_commit_url": first_url, "first_path": first.path}
+
+        def incomplete(reason: str, cause: Optional[BaseException] = None) -> GitHubError:
+            error = GitHubError(reason, code="initial_commit_incomplete", details=written)
+            if cause is not None:
+                error.__cause__ = cause
+            return error
+
+        blob_sha = ((data.get("content") or {}) if isinstance(data, dict) else {}).get("sha")
+        if first.sha and blob_sha != first.sha:
+            raise incomplete(
+                f"Integrity check failed for {first.path}: GitHub stored blob {blob_sha} but the "
+                f"sandbox produced {first.sha}."
+            )
+
+        def points_to_first_commit(name: str) -> bool:
+            # The branch was created a moment ago; allow GitHub a moment to show it.
+            for attempt in range(3):
+                try:
+                    if self.get_branch_sha(slug, name) == first_sha:
+                        return True
+                except GitHubError as exc:
+                    if exc.code != "repo_empty":
+                        raise
+                if attempt < 2:
+                    self._pause(0.6)
+            return False
+
+        try:
+            # Which branch did GitHub create? Normally the repository's default branch.
+            if not points_to_first_commit(branch):
+                branch = self.get_repository(slug).default_branch
+                if not points_to_first_commit(branch):
+                    raise incomplete(
+                        "GitHub created the first commit, but no branch points to it "
+                        f"(expected '{branch}')."
+                    )
+            written["branch"] = branch
+
+            first_tree = (commit.get("tree") or {}).get("sha")
+            if expected_tree_sha and first_tree == expected_tree_sha:
+                return {
+                    "sha": first_sha,
+                    "tree_sha": first_tree,
+                    "html_url": first_url,
+                    "branch": branch,
+                    "commits": 1,
+                }
+            if only_file and not expected_tree_sha:
+                return {
+                    "sha": first_sha,
+                    "tree_sha": first_tree,
+                    "html_url": first_url,
+                    "branch": branch,
+                    "commits": 1,
+                }
+
+            # Everything, as one tree, on top of the first commit. Half a first
+            # commit is the worst outcome, so a hiccup on GitHub's side is given a
+            # second attempt: blobs and trees are addressed by their content
+            # (sending them again changes nothing) and the branch only ever moves
+            # forward.
+            for attempt in (1, 2):
+                try:
+                    result = self.create_commit(
+                        slug,
+                        parent_sha=str(first_sha),
+                        base_tree_sha=None,
+                        changes=changes,
+                        message=message,
+                        expected_tree_sha=expected_tree_sha,
+                        known_blobs=[first.sha] if first.sha else (),
+                    )
+                    self.update_branch(slug, branch, result["sha"])
+                    break
+                except GitHubError as exc:
+                    # The request may have been carried out with only its answer
+                    # lost: then the branch already holds the project.
+                    landed = self._landed_commit(
+                        slug, branch, parent_sha=str(first_sha), tree_sha=expected_tree_sha
+                    )
+                    if landed is not None:
+                        result = landed
+                        break
+                    passing = exc.code == "github_unreachable" or (exc.status_code or 0) >= 500
+                    if attempt == 2 or not passing:
+                        raise
+                    self._pause(1.0)
+        except GitHubError as exc:
+            if exc.code == "initial_commit_incomplete":
+                raise
+            raise incomplete(exc.describe(), exc) from exc
+        return {**result, "branch": branch, "commits": 2}
+
+    def find_task_commit(self, slug: str, task_id: str) -> Optional[Dict[str, Any]]:
+        """The commit on the default branch that a task made directly (the first
+        commit of a repository that was empty), found by its ``Task-Id`` trailer."""
+        token = self.access_for(slug).token
+        response = self._send(
+            "GET",
+            f"/repos/{slug}/commits",
+            bearer=token,
+            action="looking up the task's commit",
+            params={"per_page": 30},
+        )
+        if response.status_code in (404, 409):
+            return None  # no such repository for these credentials, or still empty
+        if response.status_code != 200:
+            raise self._error(response, "looking up the task's commit")
+        try:
+            listed = response.json()
+        except ValueError:
+            return None
+        marker = f"Task-Id: {task_id}"
+        for item in listed if isinstance(listed, list) else []:
+            if not isinstance(item, dict):
+                continue
+            text = str((item.get("commit") or {}).get("message") or "")
+            sha = item.get("sha")
+            if marker in text.splitlines() and sha and _SHA_RE.match(str(sha)):
+                return {
+                    "sha": sha,
+                    "html_url": item.get("html_url") or f"https://github.com/{slug}/commit/{sha}",
+                    "title": text.splitlines()[0] if text else "",
+                }
+        return None
 
     @staticmethod
     def _pull_request_from(data: Dict[str, Any]) -> PullRequest:

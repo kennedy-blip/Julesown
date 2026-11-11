@@ -170,3 +170,29 @@ def is_documentation_path(path: str) -> bool:
 def is_docs_only(paths: Iterable[str]) -> bool:
     listed = list(paths)
     return bool(listed) and all(is_documentation_path(path) for path in listed)
+
+
+# --------------------------------------------------------------------------- #
+# Repositories without code
+# --------------------------------------------------------------------------- #
+# Files a repository gets when it is created on github.com ("Add a README",
+# "Add .gitignore", "Choose a license") - none of them is a project yet.
+_PLACEHOLDER_NAMES = {".gitignore", ".gitattributes", ".gitkeep", ".editorconfig", ".nojekyll"}
+_MAX_PLACEHOLDER_FILES = 6
+
+
+def has_no_code(paths: Iterable[str], total: int) -> bool:
+    """True when a repository holds nothing but its start-up files.
+
+    That is an empty repository, or one that only has what GitHub offers to
+    add when a repository is created (README, licence, ``.gitignore``). A task
+    on such a repository builds a project from scratch; there is no existing
+    code whose style or structure could be followed.
+    """
+    listed = list(paths)
+    if total > _MAX_PLACEHOLDER_FILES or len(listed) != total:
+        return False
+    return all(
+        is_documentation_path(path) or posixpath.basename(path).lower() in _PLACEHOLDER_NAMES
+        for path in listed
+    )

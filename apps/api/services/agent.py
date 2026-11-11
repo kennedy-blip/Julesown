@@ -5,6 +5,11 @@ the repository. It cannot commit, push or open pull requests - once it calls
 ``finish`` the task runner inspects the work tree, commits it through the
 GitHub API and opens the pull request. Every tool result the model sees is the
 real output of the sandbox; nothing is simulated.
+
+A repository without code (empty, or holding only a README, licence or
+``.gitignore``) is a different job: the agent builds a project from scratch.
+It then works from ``NEW_PROJECT_PROMPT``, which asks for a conventional,
+deployable layout instead of the smallest change to existing code.
 """
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .common import Deadline, Emit, clip, first_line, plain_text, strip_ansi
 from .llm import ChatClient, LLMError, LLMResponse, ToolCall
-from .sandbox import KeyFile, RepoCheckout, SandboxError
+from .sandbox import MAX_CHANGED_FILES, MAX_FILE_BYTES, KeyFile, RepoCheckout, SandboxError
 from .verification import VerificationRun, no_tests_reason, tests_status_of
 
 MAX_READ_LINES = 400
@@ -27,6 +32,12 @@ MAX_NUDGES = 2
 # reply as an invalid tool call (a known habit of some hosted open models).
 MAX_FORMAT_RETRIES = 3
 MAX_REPORTED_FILES = 60
+# When this little of the time budget is left, the model is asked once to wrap
+# up, so that a run which is nearly done ends with a result instead of a
+# timeout that throws its work away. The larger value applies once the
+# provider's rate limit has made the run wait: the next reply may be a minute away.
+WRAP_UP_SECONDS = 40.0
+WRAP_UP_SECONDS_RATE_LIMITED = 80.0
 INITIAL_CONTEXT_CHARS = 24_000
 MAX_CONTEXT_CHARS = 160_000
 MIN_CONTEXT_CHARS = 8_000
@@ -70,6 +81,53 @@ you call finish, the platform commits your working tree and opens the pull reque
 - Stay inside the repository and never print credentials or environment secrets.
 - When the work is done call finish with a short summary of what changed and why, and a pull \
 request title. If the task cannot be done, call finish with success=false and explain why."""
+
+# A repository without code: the task is to build a project, not to change one.
+NEW_PROJECT_PROMPT = """You are Jules, an autonomous software engineer. You are working in a Linux sandbox \
+in a GitHub repository that has no code yet: you are creating the project from scratch, and you act \
+only through the provided tools.
+
+How to work:
+- Build what the task asks for: complete and working rather than broad and half-finished. If the \
+task leaves the stack open, choose the simplest one that fits (plain HTML, CSS and JavaScript for \
+a small site or browser app).
+- Lay the project out the way its stack expects, so that a hosting platform (Vercel, Netlify, \
+Render, GitHub Pages ...) can deploy it without extra configuration: a static site has index.html \
+at the repository root; a Node project has a package.json with a name, a version, the scripts \
+platforms run (build, start, dev) and only the dependencies it really uses; a Python app has \
+requirements.txt and a documented start command. Read configuration from environment variables \
+(the port from PORT). Never hard-code secrets or localhost addresses. Add platform-specific config \
+files or CI workflows only if the task asks for them.
+- Always add a README.md (what the project is, how to run it locally, how to deploy it) and a \
+.gitignore that fits the stack. If the app needs environment variables, list them in .env.example \
+- never commit a real .env.
+- Paths are relative to the repository root. You can write several files in one reply.
+- Check your work before you finish with run_command, using what the stack offers: install and \
+build, or a syntax check (for example node --check). If you wrote tests, run them with run_tests. \
+Say in the summary what you ran and what you could not check.
+- Reply only by calling the provided tools; no other tools exist. Explanations belong in the \
+summary you pass to finish.
+- Do not run git commit, git push or branch commands: {delivery}
+- Stay inside the repository and never print credentials or environment secrets.
+- When the work is done call finish with a short summary of what you built and how to run it, and \
+a title (pr_title). If the task cannot be done, call finish with success=false and explain why."""
+
+_DELIVERY_FIRST_COMMIT = (
+    "after you call finish, the platform commits your working tree as the repository's first commit."
+)
+_DELIVERY_PULL_REQUEST = (
+    "after you call finish, the platform commits your working tree and opens the pull request for you."
+)
+
+
+def system_prompt_for(*, new_project: bool, first_commit: bool) -> str:
+    """The instructions for this kind of repository."""
+    if not new_project:
+        return SYSTEM_PROMPT
+    return NEW_PROJECT_PROMPT.format(
+        delivery=_DELIVERY_FIRST_COMMIT if first_commit else _DELIVERY_PULL_REQUEST
+    )
+
 
 AGENT_TOOLS: List[Dict[str, Any]] = [
     {
@@ -397,10 +455,14 @@ class CodingAgent:
         max_output_tokens: int = 8192,
         reserve_seconds: float = 25.0,
         sleep: Callable[[float], None] = time.sleep,
+        new_project: bool = False,
     ) -> None:
         self.llm = llm
         self.checkout = checkout
         self.workspace = checkout.workspace
+        # The repository has no code: the agent builds a project from scratch.
+        # Always the case for an empty repository.
+        self.new_project = bool(new_project or getattr(checkout, "empty", False))
         self.emit = emit
         self.deadline = deadline
         self.max_turns = max_turns
@@ -422,6 +484,9 @@ class CodingAgent:
         self._overwrite_refused: set[str] = set()
         self._unwritten: set[str] = set()  # writes that were refused and not repeated since
         self._finish_questioned = False
+        self._gaps_questioned = False  # a new project was sent back once for what it lacks
+        self._wrap_up_sent = False  # the model was told that time is nearly up
+        self._rate_limited = False  # the provider's rate limit has made this run wait
 
     # ------------------------------------------------------------------ #
     # Budgets
@@ -586,14 +651,21 @@ class CodingAgent:
         if relative not in self.files_read and len(self.files_read) < MAX_REPORTED_FILES:
             self.files_read.append(relative)
 
-    def _existing_line_count(self, absolute: str) -> Optional[int]:
+    def _existing_line_count(self, absolute: str, relative: str = "") -> Optional[int]:
         """Lines of the file at ``absolute`` if it exists and has content, else None
-        (replacing an empty file discards nothing)."""
-        result = self.workspace.run(
-            f'f={shlex.quote(absolute)}; if [ -s "$f" ] && [ -f "$f" ]; then wc -l < "$f"; else echo none; fi',
-            cwd=self.checkout.directory,
-            timeout=30.0,
-        )
+        (replacing an empty file discards nothing).
+
+        While a new project is being built, only files of the repository itself
+        count: one that a command generated during this run (``npm init``, a
+        project template) holds nothing of the user's that could be lost.
+        """
+        script = f'f={shlex.quote(absolute)}; if [ -s "$f" ] && [ -f "$f" ]; then wc -l < "$f"; else echo none; fi'
+        if self.new_project:
+            if not self.checkout.base_sha:
+                return None  # the repository was empty: nothing in it predates this run
+            in_base = f"{self.checkout.base_sha}:{relative}"
+            script = f"if git cat-file -e {shlex.quote(in_base)} 2>/dev/null; then {script}; else echo none; fi"
+        result = self.workspace.run(script, cwd=self.checkout.directory, timeout=30.0)
         try:
             return max(1, int(result.stdout.strip()))
         except ValueError:
@@ -609,7 +681,7 @@ class CodingAgent:
         """
         if relative in self._known_content or relative in self._overwrite_refused:
             return
-        existing_lines = self._existing_line_count(absolute)
+        existing_lines = self._existing_line_count(absolute, relative)
         if existing_lines is not None:
             self._overwrite_refused.add(relative)
             self._unwritten.add(relative)
@@ -621,6 +693,8 @@ class CodingAgent:
                 log=f"write_file {relative} held back: the existing file has not been read - the agent was asked to read it first",
                 level="info",
             )
+        if self.new_project:
+            return  # there is no code to look at first: the project is being created
         if self._inspections == 0 and not self._blind_write_refused:
             self._blind_write_refused = True
             self._unwritten.add(relative)
@@ -633,6 +707,81 @@ class CodingAgent:
                 log=f"write_file {relative} held back: nothing has been read yet - the agent was asked to look at the repository first",
                 level="info",
             )
+
+    def _new_project_gaps(self) -> List[str]:
+        """What a freshly built project still lacks before it is committed.
+
+        Only things that can be checked for certain and that bite later: no
+        README (nobody knows how to run or deploy it), dependencies without a
+        ``.gitignore``, a ``package.json`` no tool can parse, a ``.env`` that
+        would be committed - and what would make the commit itself fail (a file
+        above the size limit, such as the lock file of a large dependency tree,
+        or more files than a task may commit), while the agent can still do
+        something about it. Best effort: an unreadable answer means no gaps.
+        """
+        script = (
+            # Files that would be committed: everything git does not ignore.
+            "git ls-files -co --exclude-standard 2>/dev/null | { n=0; while IFS= read -r f; do "
+            'n=$((n+1)); if [ -f "$f" ] && [ "$(wc -c < "$f")" -gt '
+            + str(MAX_FILE_BYTES)
+            + ' ]; then echo "TOO_BIG $f"; fi; done; '
+            + f'if [ "$n" -gt {MAX_CHANGED_FILES} ]; then echo "TOO_MANY $n"; fi; }}; '
+            "ls -A | grep -iq '^readme' || echo NO_README; "
+            "if [ -f package.json ] || [ -f requirements.txt ] || [ -f pyproject.toml ]; then "
+            "[ -f .gitignore ] || echo NO_GITIGNORE; fi; "
+            "if [ -f package.json ]; then "
+            "if command -v python3 >/dev/null 2>&1; then "
+            "python3 -c 'import json; json.load(open(\"package.json\", encoding=\"utf-8\"))' >/dev/null 2>&1 "
+            "|| echo BAD_PACKAGE_JSON; "
+            "elif command -v node >/dev/null 2>&1; then "
+            "node -e 'JSON.parse(require(\"fs\").readFileSync(\"package.json\", \"utf8\"))' >/dev/null 2>&1 "
+            "|| echo BAD_PACKAGE_JSON; fi; fi; "
+            "for f in .env .env.local .env.production .env.development; do "
+            'if [ -f "$f" ] && ! git check-ignore -q "$f"; then echo "ENV_FILE $f"; fi; done; '
+            "ls -A | grep -v '^\\.git$' | grep -q . || echo NOTHING"
+        )
+        try:
+            result = self.workspace.run(script, cwd=self.checkout.directory, timeout=30.0)
+        except SandboxError:
+            return []
+        found = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if "NOTHING" in found:
+            return []  # nothing was created at all: that is reported as "no changes"
+        gaps: List[str] = []
+        if "NO_README" in found:
+            gaps.append(
+                "README.md is missing - add one that says what the project is, how to run it "
+                "locally and how to deploy it"
+            )
+        if "NO_GITIGNORE" in found:
+            gaps.append(
+                ".gitignore is missing although the project installs dependencies - add one for "
+                "the stack (dependencies, build output, .env)"
+            )
+        if "BAD_PACKAGE_JSON" in found:
+            gaps.append("package.json is not valid JSON - nothing can install or deploy the project until it is")
+        for line in found:
+            if line.startswith("ENV_FILE "):
+                name = line.split(" ", 1)[1]
+                gaps.append(
+                    f"{name} would be committed - list the variable names without values in "
+                    f".env.example and add {name} to .gitignore"
+                )
+            elif line.startswith("TOO_BIG "):
+                name = line.split(" ", 1)[1]
+                gaps.append(
+                    f"{name} is larger than {MAX_FILE_BYTES // 1000} kB, more than a task can commit "
+                    "- delete it or add it to .gitignore (a lock file is recreated by installing), "
+                    "otherwise nothing at all can be committed"
+                )
+            elif line.startswith("TOO_MANY "):
+                count = line.split(" ", 1)[1]
+                gaps.append(
+                    f"{count} files would be committed, more than the limit of {MAX_CHANGED_FILES} "
+                    "- add build output and installed dependencies to .gitignore, otherwise nothing "
+                    "at all can be committed"
+                )
+        return gaps
 
     def _tool_replace_in_file(self, args: Dict[str, Any]) -> str:
         absolute, relative = self._resolve(args.get("path"))
@@ -799,6 +948,7 @@ class CodingAgent:
                         f"Waiting {wait:.0f}s for {self.llm.provider}'s rate limit"
                         + (f" ({scope})" if scope else ""),
                     )
+                    self._rate_limited = True
                     self._sleep(wait)
                     continue
                 if exc.kind == "too_large" and shrinks < 3:
@@ -857,10 +1007,26 @@ class CodingAgent:
         file_listing: str = "",
         key_files: Sequence[KeyFile] = (),
     ) -> AgentOutcome:
-        task = (
-            f"Repository: {repository} (branch `{branch}`, commit {self.checkout.base_sha[:10]})\n\n"
-            f"Task:\n{prompt.strip()}\n"
-        )
+        first_commit = bool(getattr(self.checkout, "empty", False))
+        if first_commit:
+            where = (
+                f"Repository: {repository} - empty, it has no commits yet. Everything you create "
+                f"becomes its first commit on branch `{branch}`."
+            )
+        else:
+            where = f"Repository: {repository} (branch `{branch}`, commit {self.checkout.base_sha[:10]})"
+            if self.new_project:
+                where += " - it has no code yet."
+        task = f"{where}\n\nTask:\n{prompt.strip()}\n"
+        if self.new_project:
+            # A project is easy to make too big for one run. Whatever is not
+            # finished when the time is up is lost, so the model is told how
+            # much time there is.
+            minutes = max(1, int(round(max(self._time_left(), 0.0) / 60.0)))
+            task += (
+                f"\nTime budget: about {minutes} minute{'s' if minutes != 1 else ''} for the whole task, "
+                "including installs and builds. Plan a small, complete first version.\n"
+            )
         if file_listing:
             task += f"\n{file_listing}\n"
         if key_files:
@@ -880,7 +1046,10 @@ class CodingAgent:
                 + ", ".join(item.path + (" (beginning)" if item.truncated else "") for item in key_files),
             )
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": system_prompt_for(new_project=self.new_project, first_commit=first_commit),
+            },
             {"role": "user", "content": task},
         ]
         nudges = 0
@@ -900,6 +1069,23 @@ class CodingAgent:
         while turn < self.max_turns:
             if self._time_left() <= 5.0:
                 return outcome("timeout", error="The time budget ran out before the agent finished.")
+            wrap_up_at = WRAP_UP_SECONDS_RATE_LIMITED if self._rate_limited else WRAP_UP_SECONDS
+            if turn >= 1 and not self._wrap_up_sent and self._time_left() <= wrap_up_at:
+                # Work that is not finished when the time is up is thrown away.
+                # One more reply still fits: better a result that says what is
+                # missing than no result.
+                self._wrap_up_sent = True
+                self.emit("info", "The time budget is nearly used up: the agent was asked to wrap up")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Time is almost up: there is room for one more reply. Call finish now. If "
+                            "what you have done is usable as it is, summarise it and say plainly what "
+                            "is missing or unchecked. If it is not usable, call finish with success=false."
+                        ),
+                    }
+                )
             turn += 1
             compact_history(messages, self.context_budget)
             try:
@@ -925,7 +1111,12 @@ class CodingAgent:
                             "role": "user",
                             "content": (
                                 "Your reply was cut off because it was too long. Work in smaller steps: "
-                                "prefer replace_in_file over rewriting whole files."
+                                + (
+                                    "write fewer files per reply and keep each file small (split a "
+                                    "large one into modules)."
+                                    if self.new_project
+                                    else "prefer replace_in_file over rewriting whole files."
+                                )
                             ),
                         }
                     )
@@ -959,6 +1150,32 @@ class CodingAgent:
                         succeeded = succeeded.strip().lower() not in ("false", "0", "no")
                     if succeeded is False:
                         return outcome("gave_up", summary=summary, error=summary or "The agent gave up.")
+                    if self._wrap_up_sent:
+                        # Asked to stop because time is nearly up: sending it back
+                        # now would turn a result into a timeout.
+                        return outcome("finished", summary=summary, pr_title=title)
+                    gaps = self._new_project_gaps() if self.new_project and not self._gaps_questioned else []
+                    if gaps:
+                        self._gaps_questioned = True
+                        self.emit(
+                            "info",
+                            "finish held back: the new project is not ready to be committed ("
+                            + "; ".join(gap.split(" - ", 1)[0] for gap in gaps)
+                            + ") - the agent was asked to complete it",
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.id,
+                                "content": (
+                                    "Not finished yet. Before the project is committed:\n- "
+                                    + "\n- ".join(gaps)
+                                    + "\nFix this, then call finish again. If something is the way "
+                                    "it is on purpose, call finish again and say so in the summary."
+                                ),
+                            }
+                        )
+                        continue
                     if self._unwritten and not self._finish_questioned:
                         # The model reports success, but a write it attempted was
                         # refused and never repeated: what it describes is not there.

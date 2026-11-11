@@ -5,7 +5,8 @@ request can land on a different instance that has never seen the task, so the
 API never relies on it for correctness: results are streamed to the client
 over the request that runs the task, and a finished task can always be
 recovered from GitHub (its pull request lives on a branch named after the task
-id, see :func:`branch_for_task`).
+id, see :func:`branch_for_task`; a first commit made directly to an empty
+repository carries the task id in its message).
 """
 from __future__ import annotations
 
@@ -74,6 +75,12 @@ class TaskStore:
             "head_branch": None,
             "base_branch": None,
             "commit_sha": None,
+            "commit_url": None,
+            "repository_url": None,
+            # The repository had no commits: the result is its first commit, not a pull request.
+            "empty_repository": None,
+            # The repository had no code: the agent built a project from scratch.
+            "new_project": None,
             "changed_files": [],
             "docs_only": None,
             "files_read": [],

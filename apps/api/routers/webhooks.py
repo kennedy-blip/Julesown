@@ -138,6 +138,20 @@ def build_result_comment(task: Dict[str, Any]) -> str:
             tests = "The change only touches documentation, so no tests were needed."
         body = f"✅ I opened #{task['pr_number']}: {task['pr_url']}"
         return "\n\n".join(part for part in (body, summary, tests) if part) + footer
+    if task.get("status") == "completed" and task.get("outcome") == "initial_commit":
+        where = task.get("commit_url") or f"commit `{str(task.get('commit_sha') or '')[:10]}`"
+        branch = task.get("base_branch") or "the default branch"
+        tests = {
+            "passed": "Tests passed in the sandbox.",
+            "failed": "⚠️ The last test run failed - check the project before you rely on it.",
+        }.get(task.get("tests_status") or "", "The new project has no automated tests yet.")
+        if task.get("docs_only"):
+            tests = ""
+        body = (
+            f"✅ The repository was empty, so there was nothing to open a pull request against. "
+            f"I committed the project directly to `{branch}`: {where}"
+        )
+        return "\n\n".join(part for part in (body, summary, tests) if part) + footer
     if task.get("status") == "completed":
         return (
             "ℹ️ I worked on this but did not change any files, so there is no pull request."
