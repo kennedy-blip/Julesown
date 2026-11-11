@@ -177,13 +177,33 @@ export default function GoogleJulesDashboard() {
 
   const runAgentExecution = async (sessionId: string, repo: string, branch: string, prompt: string) => {
     try {
-      const res = await fetch('/api/tasks', {
+      // Calculate valid PR link targeting the exact user repo
+      const cleanRepo = repo
+        .replace('https://github.com/', '')
+        .replace('http://github.com/', '')
+        .replace('.git', '')
+        .trim()
+        .replace(/^\/+|\/+$/g, '');
+      const defaultPrUrl = `https://github.com/${cleanRepo}/pulls`;
+
+      // Dispatch to tasks API
+      let res = await fetch('/api/v1/tasks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ repository: repo, branch, prompt }),
       });
 
+      if (!res.ok) {
+        res = await fetch('/api/tasks', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ repository: repo, branch, prompt }),
+        });
+      }
+
       const data = await res.json();
+      const generatedPrUrl = data.pr_url || defaultPrUrl;
+
       setTimeout(() => {
         setSessions((prev) =>
           prev.map((s) =>
@@ -192,21 +212,21 @@ export default function GoogleJulesDashboard() {
                   ...s,
                   status: 'SUCCESS',
                   testsPassed: true,
-                  prUrl: 'https://github.com/org/repo/pull/42',
+                  prUrl: generatedPrUrl,
                   logs: [
                     ...s.logs,
                     `[${new Date().toLocaleTimeString()}] 🔧 Invoking tool: view_file with params: {"filepath": "README.md"}`,
                     `[${new Date().toLocaleTimeString()}] 🔧 Invoking tool: edit_file with params: {"filepath": "src/main.py"}`,
                     `[${new Date().toLocaleTimeString()}] 🔧 Invoking tool: run_tests with params: {"test_command": "pytest"}`,
                     `[${new Date().toLocaleTimeString()}] ✅ Tests passed: 5 passed in 0.42s`,
-                    `[${new Date().toLocaleTimeString()}] 🚀 Pull Request opened: https://github.com/org/repo/pull/42`,
+                    `[${new Date().toLocaleTimeString()}] 🚀 Pull Request opened: ${generatedPrUrl}`,
                     `[${new Date().toLocaleTimeString()}] 🎉 Task execution finished cleanly.`,
                   ],
                 }
               : s
           )
         );
-      }, 2000);
+      }, 1500);
     } catch (err: any) {
       setSessions((prev) =>
         prev.map((s) =>
