@@ -27,7 +27,7 @@ from starlette.types import Receive, Scope, Send
 from ..config import Settings, get_settings, platform_seconds_remaining
 from ..dependencies import get_runner_deps, get_task_runner
 from ..security import require_access, require_json_body
-from ..services.github import GitHubError, parse_repository, validate_branch_name
+from ..services.github import GitHubError, PullRequest, parse_repository, validate_branch_name
 from ..services.runner import RunnerDeps, TaskRunner, pull_request_for_task
 from ..services.store import branch_for_task, normalize_task_id, task_store
 
@@ -102,8 +102,12 @@ class TaskResponse(BaseModel):
     base_branch: Optional[str] = None
     commit_sha: Optional[str] = None
     changed_files: List[Dict[str, Any]] = []
+    docs_only: Optional[bool] = None  # the change only touches documentation files
+    files_read: List[str] = []  # repository files the agent looked at
     verification: List[Dict[str, Any]] = []
-    tests_status: Optional[str] = None  # passed | failed | not_run
+    # passed | failed (the last run that really tested something) | no_tests (a test
+    # command was run but the project has no tests) | not_run
+    tests_status: Optional[str] = None
     tests_passed: Optional[bool] = None
     summary: Optional[str] = None
     error: Optional[str] = None
@@ -208,6 +212,19 @@ class TaskStreamResponse(Response):
                 pass
 
 
+class PullRequestStatus(BaseModel):
+    """A task's pull request as it is on GitHub right now."""
+
+    task_id: str
+    repository: str
+    number: int
+    url: str
+    state: str  # open | merged | closed
+    title: str = ""
+    head_branch: str = ""
+    base_branch: str = ""
+
+
 def _without_logs(record: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in record.items() if key not in ("logs", "log_entries")}
 
@@ -279,19 +296,33 @@ async def list_tasks():
     return task_store.list()
 
 
-def _recover_from_github(task_id: str, repository: str, deps: RunnerDeps) -> Optional[Dict[str, Any]]:
+def _pull_request_state(pull_request: PullRequest) -> str:
+    """``open``, ``merged`` or ``closed`` (closed without being merged)."""
+    return "merged" if pull_request.merged else pull_request.state
+
+
+def _find_pull_request(task_id: str, repository: str, deps: RunnerDeps) -> "tuple[str, Optional[PullRequest]]":
+    """The repository slug and the pull request the task opened there, if any.
+
+    Raises ValueError for an unusable repository name and GitHubError when
+    GitHub could not be asked.
+    """
+    slug = parse_repository(repository)
     settings = get_settings()
     if settings.github_auth_mode == "none":
-        return None
-    slug = parse_repository(repository)
+        return slug, None
     github = deps.github_factory(settings)
     try:
-        pull_request = pull_request_for_task(github, slug, task_id)
+        return slug, pull_request_for_task(github, slug, task_id)
     finally:
         github.close()
+
+
+def _recover_from_github(task_id: str, repository: str, deps: RunnerDeps) -> Optional[Dict[str, Any]]:
+    slug, pull_request = _find_pull_request(task_id, repository, deps)
     if pull_request is None:
         return None
-    state = "merged" if pull_request.merged else pull_request.state
+    state = _pull_request_state(pull_request)
     message = f"Recovered from GitHub: pull request #{pull_request.number} ({state})"
     now = time.time()
     return {
@@ -359,6 +390,51 @@ def get_task_status(
                 )
             ),
         },
+    )
+
+
+@router.get("/{task_id}/pull-request", response_model=PullRequestStatus)
+def get_task_pull_request(
+    task_id: str,
+    repository: str = Query(..., description="owner/name of the task's repository."),
+    deps: RunnerDeps = Depends(get_runner_deps),
+):
+    """The pull request a task opened, as it is on GitHub right now.
+
+    A task record says "pull request opened" forever; whether it has been
+    merged or closed since is only known to GitHub. The pull request is found
+    through the task's branch name, so this works on any server instance.
+    """
+    normalized = normalize_task_id(task_id)
+    pull_request: Optional[PullRequest] = None
+    slug = repository
+    if normalized:
+        try:
+            slug, pull_request = _find_pull_request(normalized, repository, deps)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail={"code": "invalid_request", "message": str(exc)})
+        except GitHubError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={"code": "github_error", "message": exc.describe()},
+            )
+    if pull_request is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "pull_request_not_found",
+                "message": "No pull request from this task exists on GitHub.",
+            },
+        )
+    return PullRequestStatus(
+        task_id=normalized or task_id,
+        repository=slug,
+        number=pull_request.number,
+        url=pull_request.html_url,
+        state=_pull_request_state(pull_request),
+        title=pull_request.title,
+        head_branch=pull_request.head_branch,
+        base_branch=pull_request.base_branch,
     )
 
 

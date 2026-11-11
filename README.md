@@ -19,10 +19,13 @@ configuration check → GitHub access → E2B sandbox → git clone → agent lo
 3. **Sandbox + clone** – an E2B sandbox is started and the repository is cloned into it.
 4. **Agent** – the model works through tools (`list_files`, `read_file`, `search_code`, `write_file`,
    `replace_in_file`, `run_command`, `run_tests`, `finish`). Every step is streamed to the dashboard.
+   It is given the file list, the repository's manifests (`package.json`, `pyproject.toml`, …) and
+   the start of the README together with the task, and it has to look before it writes
+   (see [What the agent's work is based on](#-what-the-agents-work-is-based-on)).
 5. **Commit** – the files that changed are committed to a new branch `jules/task-<id>` through the
    GitHub API. The base branch is never modified.
 6. **Pull request** – a pull request is opened from that branch. Its description contains the agent's
-   summary, the changed files and the real test results.
+   summary, the changed files, the files the agent looked at and the real test results.
 
 Nothing in this pipeline is simulated:
 
@@ -31,8 +34,32 @@ Nothing in this pipeline is simulated:
 - If any step fails, the task is reported as **failed** with the reason (missing key, App not
   installed, rate limit, time budget…). If the agent changes nothing, the task finishes with
   **no changes** and no pull request.
-- Test status is what actually happened in the sandbox: *passed*, *failed* or *not run*. A pull
-  request opened with failing or missing tests says so.
+- Test status is what actually happened in the sandbox: *passed*, *failed*, *no tests* or *not run*.
+  A pull request opened with failing or missing tests says so.
+  - *No tests* means a test command was run but had nothing to test – for example `npm test` in a
+    project whose `test` script is still npm's placeholder (`echo "Error: no test specified" && exit 1`),
+    a missing `test` script, or a test runner that found no tests. That exits with an error code, but
+    it is not a failing test and is not reported as one.
+  - A change that only touches documentation (Markdown, `README`, `LICENSE`, …) needs no tests, so it
+    gets no warning about them.
+
+---
+
+## 🔎 What the agent's work is based on
+
+A language model will happily describe a project it has not looked at, and the result reads well and
+is wrong. The platform cannot check prose for truth, but it makes sure the model looked first and
+shows you what it looked at:
+
+- **Facts up front.** The repository's root manifests and the beginning of its README are part of
+  the task message, so the model does not have to guess what the project is built with.
+- **Look before you write.** The first `write_file` of a run is held back once if the model has not
+  read, searched or run anything yet, and an existing file is not overwritten before it has been read.
+  The model is told why and may repeat the call – this is a nudge, not a lock. If a held-back write is
+  never repeated, `finish` is questioned once.
+- **Shown to the reviewer.** The pull request (and the dashboard) lists the files the agent looked at,
+  or warns that it opened none. Check a pull request against that list before merging: a description
+  of "the dependencies" is only as good as the manifest behind it.
 
 ---
 
@@ -47,7 +74,7 @@ Nothing in this pipeline is simulated:
 │   │   │   ├── layout.tsx          # Root layout with the backend status badge
 │   │   │   └── not-found.tsx       # 404 page; forwards stray GitHub App redirects to the dashboard
 │   │   ├── components/             # TaskForm, LiveTerminal, PRStatusTracker, StageProgress, …
-│   │   └── lib/                    # API client (NDJSON stream), health store, session history
+│   │   └── lib/                    # API client (NDJSON stream), health store, session history, result wording
 │   └── api/                        # Python FastAPI backend (Vercel Python function)
 │       ├── main.py                 # App entrypoint
 │       ├── config.py               # Environment-driven settings and model defaults
@@ -61,6 +88,7 @@ Nothing in this pipeline is simulated:
 │       │   ├── runner.py           # The pipeline above, end to end
 │       │   ├── agent.py            # Tool-calling loop and tools
 │       │   ├── llm.py              # Groq / OpenAI / Anthropic clients
+│       │   ├── verification.py     # What a test command's result means; documentation-only changes
 │       │   ├── sandbox.py          # E2B sandbox adapter, clone and change collection
 │       │   ├── github.py           # GitHub App + token auth, commits, branches, pull requests
 │       │   └── store.py            # In-memory task records
@@ -104,6 +132,7 @@ With neither set, tasks are **locked** on Vercel / `ENVIRONMENT=production` and 
 | --- | --- | --- |
 | `GROQ_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | `openai/gpt-oss-120b` / `gpt-6-luna` / `claude-sonnet-5-5` | Model to use. If the configured model has been retired, the backend picks an available one from the provider's model list and says so in the task log. |
 | `GROQ_REASONING_EFFORT` / `OPENAI_REASONING_EFFORT` | `low` / `none` | Reasoning effort sent to the model (`default` omits the parameter). |
+| `GROQ_TEMPERATURE` | `0.2` | Sampling temperature for Groq, `0`–`2` (`default` leaves it to Groq, which uses `1`). A low value makes malformed tool calls and made-up content less likely. |
 | `JULES_TASK_BUDGET_SECONDS` | `270` | Time one task may take. On Vercel it is additionally capped by the function's remaining time. |
 | `JULES_MAX_AGENT_TURNS` | `30` | Maximum model turns per task. |
 | `JULES_COMMAND_TIMEOUT_SECONDS` | `120` | Time limit for one command in the sandbox. |
@@ -181,6 +210,7 @@ and every task leaves one summary line in the function logs (Vercel → your dep
 | `POST /api/v1/tasks/stream` | Run a task and stream progress as newline-delimited JSON (`task`, `log`, `update`, `ping`, `done`). Used by the dashboard. |
 | `POST /api/v1/tasks` | Run a task in the background; poll `GET /api/v1/tasks/{id}`. |
 | `GET /api/v1/tasks/{id}?repository=owner/name` | Task status. When the answering server instance does not know the task, its pull request is looked up on GitHub. |
+| `GET /api/v1/tasks/{id}/pull-request?repository=owner/name` | The task's pull request as it is on GitHub right now: `open`, `merged` or `closed`. The dashboard uses it to keep the history up to date. |
 | `GET /api/v1/github/repos` | Repositories the configured credentials can open pull requests on. |
 | `GET /api/v1/github/check?repository=…&branch=…` | Check, without running anything, that a task could act on a repository. |
 | `GET /api/v1/health`, `GET /api/v1/health/env` | Liveness and configuration diagnostics. |
@@ -190,21 +220,39 @@ Request body for both task endpoints (JSON, sent with `Content-Type: application
 `{"repository": "owner/name or GitHub URL", "branch": "optional", "prompt": "what to do"}`.
 Interactive documentation is served at `/api/docs`.
 
+Fields of a task record that describe how far the result can be trusted:
+
+| Field | Meaning |
+| --- | --- |
+| `tests_status` | `passed` or `failed` (the last run that really tested something), `no_tests` (test commands were run, but the project has no tests) or `not_run`. `tests_passed` is `true`/`false` only for the first two. |
+| `verification[]` | Every `run_tests` call: `command`, `exit_code`, `duration`, `outcome` (`passed`, `failed`, `timed_out`, `no_tests`) and, for `no_tests`, a `note` with the reason. |
+| `docs_only` | `true` when the change only touches documentation files. |
+| `files_read` | Repository files whose content the agent saw before it finished. |
+
 ---
 
 ## ⚠️ Limits worth knowing
 
 - **Scope of a task.** The time budget suits focused changes ("fix this failing test", "add input
   validation to X"), not large refactorings.
+- **Review before you merge.** The agent's summary and any documentation it writes are the model's
+  words. The platform reports what it can observe (files read, commands run, test results); it does
+  not verify that a description is accurate.
 - **LLM rate limits.** Free tiers are small (Groq's free tier allows about 8,000 tokens per minute on
   the default model). The agent sizes its context to the provider's limit and waits out rate limits,
   which makes runs slower; a task that cannot finish in time fails and says so. A paid tier or
   another provider removes most of this.
+- **Refused model replies.** Open models hosted by Groq sometimes answer with a call to a tool that
+  does not exist (`commentary`, `json`, …); Groq refuses such a reply and nothing is executed. The
+  agent tells the model what was wrong and asks again, up to three times per step and with a slightly
+  higher temperature each time. The log shows these as warnings. If the model keeps doing it, the
+  task fails with that reason: run it again or choose another model with `GROQ_MODEL`.
 - **Sandbox contents.** The default E2B template has git, Python and Node.js but not your project's
   dependencies; the agent installs what the tests need, which costs time. Use `E2B_TEMPLATE` for a
   prepared image.
 - **Task history** is kept in the server's memory and in your browser. It is not a database; the
-  durable record of a task is its pull request.
+  durable record of a task is its pull request. Whether a pull request has been merged or closed
+  since is read from GitHub when the dashboard loads and when you return to its tab.
 - **Change size.** A task may change up to 300 files / 4 MB (1 MB per file). Dependency and build
   directories (`node_modules`, `.venv`, `__pycache__`, …) are never committed.
 

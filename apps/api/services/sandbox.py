@@ -43,6 +43,31 @@ MAX_FILE_BYTES = 1_000_000
 MAX_TOTAL_BYTES = 4_000_000
 _BLOB_BATCH_BYTES = 400_000
 
+# Files that say what a project is and what it is built with. Their content is
+# handed to the agent with the task (see RepoCheckout.key_files), within a
+# small budget: on providers with tight per-minute token limits every
+# character of the first message is paid for again on every turn.
+MANIFEST_FILES = (
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+    "setup.cfg",
+    "Pipfile",
+    "go.mod",
+    "Cargo.toml",
+    "Gemfile",
+    "composer.json",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Makefile",
+)
+README_FILES = ("README.md", "README.rst", "README.txt", "README", "Readme.md", "readme.md")
+KEY_FILE_BYTES = 1600
+README_BYTES = 500
+KEY_FILES_TOTAL_BYTES = 2400
+
 
 class SandboxError(RuntimeError):
     """The sandbox could not do what was asked. The message is user-facing."""
@@ -220,6 +245,16 @@ class E2BWorkspace:
 # Git checkout inside a workspace
 # --------------------------------------------------------------------------- #
 @dataclass
+class KeyFile:
+    """A manifest or README (excerpt) of the repository, as read at the start of a run."""
+
+    path: str
+    content: str
+    size: int  # bytes of the whole file
+    truncated: bool = False
+
+
+@dataclass
 class ChangeSet:
     changes: List[FileChange] = field(default_factory=list)
     tree_sha: str = ""
@@ -322,6 +357,56 @@ class RepoCheckout:
         except (IndexError, ValueError):
             total = 0
         return [line for line in lines[1:] if line.strip()], total
+
+    def key_files(self) -> List[KeyFile]:
+        """The repository's manifests and the start of its README.
+
+        Best effort: an empty list if nothing could be read. Symbolic links,
+        binary and empty files are skipped; the total size is bounded.
+        """
+        names = " ".join(shlex.quote(name) for name in MANIFEST_FILES + README_FILES)
+        readmes = "|".join(README_FILES)
+        script = (
+            f"for f in {names}; do "
+            'if [ -f "$f" ] && [ ! -L "$f" ] && [ -s "$f" ] && grep -Iq \'\' "$f"; then '
+            f'case "$f" in {readmes}) n={README_BYTES};; *) n={KEY_FILE_BYTES};; esac; '
+            'printf \'%s %s \' "$f" "$(wc -c < "$f" | tr -d \' \')"; '
+            'head -c "$n" "$f" | base64 | tr -d \'\\n\'; printf \'\\n\'; '
+            "fi; done"
+        )
+        try:
+            result = self.workspace.run(script, cwd=self.directory, env=dict(GIT_ENV), timeout=30.0)
+        except SandboxError:
+            return []
+        if not result.ok:
+            return []
+        found: List[KeyFile] = []
+        seen_readme = False
+        used = 0
+        for line in result.stdout.splitlines():
+            pieces = line.split(" ")
+            if len(pieces) != 3 or not pieces[1].isdigit():
+                continue
+            path, size = pieces[0], int(pieces[1])
+            is_readme = path in README_FILES
+            if is_readme and seen_readme:
+                continue  # README.md and readme.md are the same file on some filesystems
+            try:
+                content = base64.b64decode(pieces[2], validate=True).decode("utf-8", "replace")
+            except (binascii.Error, ValueError):
+                continue
+            truncated = size > (README_BYTES if is_readme else KEY_FILE_BYTES)
+            if truncated:
+                # End on a whole line rather than in the middle of one.
+                last_newline = content.rfind("\n")
+                if last_newline >= len(content) // 2:
+                    content = content[: last_newline + 1]
+            if not content.strip() or used + len(content) > KEY_FILES_TOTAL_BYTES:
+                continue
+            seen_readme = seen_readme or is_readme
+            used += len(content)
+            found.append(KeyFile(path=path, content=content, size=size, truncated=truncated))
+        return found
 
     def diff_stat(self) -> str:
         result = self.git_shell(

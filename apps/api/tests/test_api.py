@@ -14,7 +14,6 @@ import hashlib
 import hmac
 import json
 import re
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -23,6 +22,8 @@ from fastapi.testclient import TestClient
 from apps.api.services.llm import LLMError
 from apps.api.services.sandbox import SandboxError
 from apps.api.services.store import branch_for_task, new_task_id, task_store
+
+from apps.api.routers.webhooks import build_result_comment
 
 from .conftest import CHECK_ADD, fix_add_script
 from .support import FakeGitHub, LocalWorkspace, ScriptedLLM, git
@@ -186,9 +187,18 @@ def test_task_opens_a_real_pull_request(client: TestClient, token_env, install_d
     assert task["head_branch"] == branch_for_task(task["task_id"]) and task["base_branch"] == "main"
     assert task["tests_status"] == "passed" and task["tests_passed"] is True
     assert task["verification"] == [
-        {"command": CHECK_ADD, "exit_code": 0, "passed": True, "timed_out": False, "duration": task["verification"][0]["duration"]}
+        {
+            "command": CHECK_ADD,
+            "exit_code": 0,
+            "passed": True,
+            "timed_out": False,
+            "duration": task["verification"][0]["duration"],
+            "outcome": "passed",
+            "note": "",
+        }
     ]
     assert task["changed_files"] == [{"path": "calc.py", "status": "M", "additions": 1, "deletions": 1}]
+    assert task["docs_only"] is False and task["files_read"] == ["README.md", "calc.py"]
     assert task["summary"].startswith("add() subtracted")
     assert (task["llm_provider"], task["llm_model"]) == ("scripted", "scripted-model")
     assert task["sandbox"] == "local test workspace"
@@ -209,6 +219,7 @@ def test_task_opens_a_real_pull_request(client: TestClient, token_env, install_d
     assert "add() subtracted instead of adding" in pull["body"]
     assert "> add() returns the wrong result, fix it" in pull["body"]
     assert "`calc.py` (modified, +1 / -1)" in pull["body"]
+    assert "Files the agent looked at: `README.md`, `calc.py`" in pull["body"]
     assert "✅ passed" in pull["body"] and task["task_id"] in pull["body"]
 
     # --- progress stream --------------------------------------------------
@@ -281,6 +292,7 @@ def test_failing_tests_are_reported_as_failing(client: TestClient, token_env, in
     install_deps(
         ScriptedLLM(
             [
+                [("read_file", {"path": "calc.py"})],
                 [("write_file", {"path": "NOTES.md", "content": "work in progress\n"})],
                 [("run_tests", {"command": CHECK_ADD})],  # still failing: add() was not fixed
                 [("finish", {"summary": "Added notes; the add() test still fails."})],
@@ -300,16 +312,166 @@ def test_untested_changes_are_labelled_untested(client: TestClient, token_env, i
     install_deps(
         ScriptedLLM(
             [
-                [("write_file", {"path": "docs/guide.md", "content": "# Guide\n"})],
-                [("finish", {"summary": "Added a guide."})],
+                [("read_file", {"path": "calc.py"})],
+                [("write_file", {"path": "helpers.py", "content": "def double(x):\n    return 2 * x\n"})],
+                [("finish", {"summary": "Added a helper."})],
             ]
         )
     )
     _events, task = run_stream(client, TASK)
     assert task["status"] == "completed" and task["tests_status"] == "not_run" and task["tests_passed"] is None
-    assert task["changed_files"] == [{"path": "docs/guide.md", "status": "A", "additions": 1, "deletions": 0}]
+    assert task["changed_files"] == [{"path": "helpers.py", "status": "A", "additions": 2, "deletions": 0}]
+    assert task["docs_only"] is False
     assert "did not run any tests" in github.pulls["acme/demo"][0]["body"]
-    assert github.pulls["acme/demo"][0]["title"] == "Added a guide."  # falls back to the summary
+    assert any("did not run tests" in message for message in messages(task, "warn"))
+    assert github.pulls["acme/demo"][0]["title"] == "Added a helper."  # falls back to the summary
+
+
+# npm's placeholder `test` script (what `npm init` writes), without needing npm.
+NPM_PLACEHOLDER_TEST = """sh -c 'echo "Error: no test specified" && exit 1'"""
+
+
+def refused_reply(tool: str) -> LLMError:
+    return LLMError(
+        f"groq refused the model's reply because it was not a valid tool call (it tried to call a tool named '{tool}', which does not exist).",
+        kind="tool_format",
+        status_code=400,
+        rejected_tool=tool,
+    )
+
+
+def test_first_production_run_replayed(client: TestClient, token_env, install_deps, github: FakeGitHub):
+    """The model does what it did in the first run on the deployed app
+    (kennedy-blip/Kensheets, "add spec.md and details on the project
+    dependencies"): it writes the file without reading anything, answers in
+    plain text, runs `npm test` on a project whose test script is npm's
+    placeholder, and twice sends a tool call the provider refuses.
+
+    That run ended with "Tests: Last run failed", a red warning in the pull
+    request, and a spec whose dependency list was invented. This is what the
+    pipeline makes of the same behaviour now."""
+    invented = "# Spec\n\nDepends on react, chart.js and webpack. Licence: MIT.\n"
+    grounded = "# Spec\n\nA calculator module (`calc.py`) with one function, `add`.\n"
+    install_deps(
+        ScriptedLLM(
+            [
+                [("write_file", {"path": "spec.md", "content": invented})],
+                "Added a new **spec.md** file detailing the project overview and dependencies.",
+                [("read_file", {"path": "calc.py"})],
+                [("write_file", {"path": "spec.md", "content": grounded})],
+                [("run_tests", {"command": NPM_PLACEHOLDER_TEST})],
+                refused_reply("commentary"),
+                refused_reply("json"),
+                LLMError("groq returned HTTP 429: slow down", kind="rate_limit", status_code=429, retry_after=0.01),
+                [("finish", {"summary": "Added spec.md describing the module.", "pr_title": "Add spec.md"})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, {**TASK, "prompt": "add spec.md and details on the project dependencies"})
+
+    assert task["status"] == "completed" and REAL_PR_URL.match(task["pr_url"])
+    # The invented version never reached the repository.
+    assert github.remote.show("acme/demo", task["head_branch"], "spec.md") == grounded.strip()
+    assert task["files_read"] == ["README.md", "calc.py"]
+    # Nothing failed: there were no tests to run, and the change is prose.
+    assert task["tests_status"] == "no_tests" and task["tests_passed"] is None and task["docs_only"] is True
+    assert task["verification"][0]["outcome"] == "no_tests" and task["verification"][0]["exit_code"] == 1
+    assert messages(task, "error") == []
+    assert messages(task, "warn") == [
+        "The model's reply was not a valid tool call (it called 'commentary', which is not one of its tools); asking it again (1/3)",
+        "The model's reply was not a valid tool call (it called 'json', which is not one of its tools); asking it again (2/3)",
+    ]
+    assert "write_file spec.md held back: nothing has been read yet - the agent was asked to look at the repository first" in messages(task, "info")
+    assert messages(task, "agent") == ["Added a new spec.md file detailing the project overview and dependencies."]
+    assert messages(task, "success")[-1].startswith("Pull request #1 opened: ")
+    assert task["log_entries"][-1]["level"] == "success"  # no warning after the pull request line
+
+    body = github.pulls["acme/demo"][0]["body"]
+    assert "| ➖ no tests to run |" in body and "❌" not in body and "did not pass" not in body
+    assert (
+        "This repository has no automated tests to run (the \"test\" script in package.json is npm's "
+        "placeholder), so the change is untested. It only touches documentation."
+    ) in body
+    assert "Review before merging" not in body
+    assert "Files the agent looked at: `README.md`, `calc.py`" in body
+
+
+def test_documentation_change_without_a_test_run_is_not_a_warning(
+    client: TestClient, token_env, install_deps, github: FakeGitHub
+):
+    install_deps(
+        ScriptedLLM(
+            [
+                [("read_file", {"path": "README.md"})],
+                [("replace_in_file", {"path": "README.md", "old_text": "projct", "new_text": "project"})],
+                [("write_file", {"path": "docs/guide.md", "content": "# Guide\n"})],
+                [("finish", {"summary": "Fixed a typo and added a guide."})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
+    assert task["status"] == "completed" and task["tests_status"] == "not_run" and task["docs_only"] is True
+    assert messages(task, "warn") == [] and task["log_entries"][-1]["level"] == "success"
+    body = github.pulls["acme/demo"][0]["body"]
+    assert "No tests were run: this pull request only changes documentation." in body
+    assert "⚠️" not in body and "did not run any tests" not in body
+    assert "tests were needed" in build_result_comment(task) and "⚠️" not in build_result_comment(task)
+
+
+def test_code_change_in_a_repository_without_tests_says_so(
+    client: TestClient, token_env, install_deps, github: FakeGitHub
+):
+    install_deps(
+        ScriptedLLM(
+            [
+                [("read_file", {"path": "calc.py"})],
+                [("replace_in_file", {"path": "calc.py", "old_text": "return a - b", "new_text": "return a + b"})],
+                [("run_tests", {"command": NPM_PLACEHOLDER_TEST})],
+                [("finish", {"summary": "Fixed add()."})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
+    assert task["status"] == "completed" and task["tests_status"] == "no_tests" and task["docs_only"] is False
+    assert task["tests_passed"] is None  # untested is not "passed"...
+    assert messages(task, "error") == []  # ...and not a failure either
+    assert messages(task, "warn") == [
+        "This repository has no automated tests, so the change is untested - the pull request says so. "
+        "Review before merging."
+    ]
+    body = github.pulls["acme/demo"][0]["body"]
+    assert "so the change is untested. Review before merging." in body and "| ➖ no tests to run |" in body
+    assert "Output of the last run" not in body  # there is no test output worth showing
+    assert "has no automated tests, so the change is untested." in build_result_comment(task)
+
+
+def test_pull_request_says_when_nothing_was_read(client: TestClient, token_env, install_deps, github: FakeGitHub):
+    """The model may insist on writing without looking - the reviewer is told."""
+    github.add_repo("acme/blank", {"main.c": "int main(void) { return 0; }\n"})  # no manifest, no README
+    note = "Notes\n"
+    install_deps(
+        ScriptedLLM(
+            [
+                [("write_file", {"path": "NOTES.md", "content": note})],
+                [("write_file", {"path": "NOTES.md", "content": note})],
+                [("finish", {"summary": "Added notes."})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, {**TASK, "repository": "acme/blank"})
+    assert task["status"] == "completed" and task["files_read"] == []
+    body = github.pulls["acme/blank"][0]["body"]
+    assert "⚠️ The agent did not open any file of the repository before making this change." in body
+    assert "Files the agent looked at" not in body
+
+
+def test_model_stuck_on_refused_replies_fails_the_task_with_advice(
+    client: TestClient, token_env, install_deps, github: FakeGitHub
+):
+    install_deps(ScriptedLLM([refused_reply("json")] * 4, model="openai/gpt-oss-120b"))
+    _events, task = run_stream(client, TASK)
+    assert_honest_failure(task, "agent", "answered 4 times in a row with an invalid tool call", "run it again")
+    assert github.calls("POST", r"/git/|/pulls") == []
 
 
 def test_private_repository_is_cloned_with_a_read_only_token(
@@ -465,6 +627,7 @@ def test_agent_giving_up_discards_partial_work(client: TestClient, token_env, in
     install_deps(
         ScriptedLLM(
             [
+                [("search_code", {"query": "multiply("})],
                 [("write_file", {"path": "half.py", "content": "x = 1\n"})],
                 [("finish", {"summary": "I could not find the module to change.", "success": False})],
             ]
@@ -582,6 +745,58 @@ def test_recovery_reports_github_problems(client: TestClient, token_env, install
     github.fail_next("GET", r"/repos/acme/demo/pulls$", 500, {"message": "Server Error"})
     response = client.get(f"/api/v1/tasks/{new_task_id()}?repository=acme/demo")
     assert response.status_code == 502 and response.json()["detail"]["code"] == "github_error"
+
+
+def test_pull_request_state_is_read_from_github(client: TestClient, token_env, install_deps, github: FakeGitHub):
+    """A task record says "pull request opened" for good. What became of the
+    pull request - merged, closed - is asked from GitHub when someone looks."""
+    install_deps(fix_add_script())
+    _events, task = run_stream(client, TASK)
+    url = f"/api/v1/tasks/{task['task_id']}/pull-request"
+
+    opened = client.get(url, params={"repository": "acme/demo"})
+    assert opened.status_code == 200
+    assert opened.json() == {
+        "task_id": task["task_id"],
+        "repository": "acme/demo",
+        "number": 1,
+        "url": "https://github.com/acme/demo/pull/1",
+        "state": "open",
+        "title": "Fix add()",
+        "head_branch": task["head_branch"],
+        "base_branch": "main",
+    }
+
+    pull = github.pulls["acme/demo"][0]
+    pull.update(state="closed", merged_at="2026-11-11T15:40:00Z")
+    task_store.clear()  # works on an instance that never saw the task, and with a GitHub URL
+    merged = client.get(url, params={"repository": "https://github.com/acme/demo"}).json()
+    assert merged["state"] == "merged" and merged["number"] == 1
+
+    pull.update(state="closed", merged_at=None)
+    assert client.get(url, params={"repository": "acme/demo"}).json()["state"] == "closed"
+
+
+def test_pull_request_state_errors(client: TestClient, token_env, install_deps, github: FakeGitHub):
+    install_deps(fix_add_script())
+    unknown = client.get(f"/api/v1/tasks/{new_task_id()}/pull-request", params={"repository": "acme/demo"})
+    assert unknown.status_code == 404 and unknown.json()["detail"]["code"] == "pull_request_not_found"
+    assert client.get("/api/v1/tasks/not-a-task-id/pull-request", params={"repository": "acme/demo"}).status_code == 404
+    assert client.get(f"/api/v1/tasks/{new_task_id()}/pull-request").status_code == 422  # repository is required
+    bad = client.get(f"/api/v1/tasks/{new_task_id()}/pull-request", params={"repository": "what is this"})
+    assert bad.status_code == 422 and bad.json()["detail"]["code"] == "invalid_request"
+    github.fail_next("GET", r"/repos/acme/demo/pulls$", 500, {"message": "Server Error"})
+    failed = client.get(f"/api/v1/tasks/{new_task_id()}/pull-request", params={"repository": "acme/demo"})
+    assert failed.status_code == 502 and failed.json()["detail"]["code"] == "github_error"
+
+
+def test_pull_request_state_needs_the_access_key(client: TestClient, token_env, install_deps, monkeypatch):
+    install_deps(fix_add_script())
+    monkeypatch.setenv("JULES_ACCESS_KEY", "k" * 32)
+    url = f"/api/v1/tasks/{new_task_id()}/pull-request"
+    assert client.get(url, params={"repository": "acme/demo"}).status_code == 401
+    with_key = client.get(url, params={"repository": "acme/demo"}, headers={"Authorization": "Bearer " + "k" * 32})
+    assert with_key.status_code == 404
 
 
 # --------------------------------------------------------------------------- #
@@ -715,6 +930,34 @@ def test_webhook_command_runs_a_task_and_comments_the_result(
     again = deliver(client, "issue_comment", comment_event("/jules fix it"))
     assert again.status_code == 200 and again.json()["dispatched"] is False
     assert len(task_store.list()) == 1
+
+
+@pytest.mark.parametrize(
+    "tests_status, docs_only, expected, warns",
+    [
+        ("passed", False, "Tests passed in the sandbox.", False),
+        ("failed", False, "The last test run failed - see the pull request.", True),
+        ("failed", True, "The last test run failed - see the pull request.", True),  # a failure is never played down
+        ("not_run", False, "No tests were run.", True),
+        ("not_run", True, "The change only touches documentation, so no tests were needed.", False),
+        ("no_tests", False, "The repository has no automated tests, so the change is untested.", False),
+        ("no_tests", True, "The change only touches documentation, so no tests were needed.", False),
+    ],
+)
+def test_result_comment_describes_the_testing_honestly(tests_status, docs_only, expected, warns):
+    comment = build_result_comment(
+        {
+            "task_id": "a" * 32,
+            "status": "completed",
+            "outcome": "pull_request",
+            "pr_number": 4,
+            "pr_url": "https://github.com/acme/demo/pull/4",
+            "summary": "Did it.",
+            "tests_status": tests_status,
+            "docs_only": docs_only,
+        }
+    )
+    assert expected in comment and ("⚠️" in comment) is warns
 
 
 def test_webhook_failure_is_commented_honestly(client: TestClient, token_env, install_deps, github: FakeGitHub, monkeypatch):

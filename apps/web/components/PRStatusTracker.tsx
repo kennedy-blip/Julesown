@@ -2,7 +2,9 @@
 
 import React from 'react';
 import {
+  GitMerge,
   GitPullRequest,
+  GitPullRequestClosed,
   CheckCircle2,
   XCircle,
   Clock,
@@ -13,6 +15,9 @@ import {
   HelpCircle,
 } from 'lucide-react';
 import { pullRequestUrl } from '@/lib/api';
+import { plainProse, runLabel, runOutcome, summarizeTests } from '@/lib/results';
+import type { Tone } from '@/lib/results';
+import { pullRequestState } from '@/lib/sessions';
 import type { Session } from '@/lib/sessions';
 import { Linkified } from './Linkified';
 import { StageProgress } from './StageProgress';
@@ -31,6 +36,31 @@ const FILE_STATUS: Record<string, { label: string; className: string }> = {
 };
 
 const MAX_FILES_SHOWN = 12;
+const MAX_READ_FILES_SHOWN = 8;
+
+const TONE_TEXT: Record<Tone, string> = {
+  good: 'text-emerald-400',
+  bad: 'text-rose-400',
+  caution: 'text-amber-400',
+  neutral: 'text-slate-300',
+  pending: 'text-slate-500',
+};
+
+function ToneIcon({ tone }: { tone: Tone }) {
+  const className = `w-4 h-4 flex-shrink-0 ${TONE_TEXT[tone]}`;
+  switch (tone) {
+    case 'good':
+      return <CheckCircle2 className={className} />;
+    case 'bad':
+      return <XCircle className={className} />;
+    case 'caution':
+      return <AlertTriangle className={className} />;
+    case 'neutral':
+      return <MinusCircle className={className} />;
+    default:
+      return <Clock className={className} />;
+  }
+}
 
 export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrackerProps) {
   if (!session) {
@@ -46,7 +76,9 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
   const task = session.task;
   const prUrl = session.state === 'completed' ? pullRequestUrl(task) : null;
   const noChanges = session.state === 'completed' && !prUrl;
-  const testsStatus = task ? task.tests_status : null;
+  // What GitHub said the last time it was asked (null: not asked yet).
+  const prState = prUrl ? pullRequestState(session) : null;
+  const tests = summarizeTests(task, session.state);
   const failureText = (task && task.error) || session.note || 'The task failed without an error message.';
 
   const statusPill = () => {
@@ -55,6 +87,22 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
         <span className="inline-flex items-center text-xs text-yellow-400 bg-yellow-400/10 px-2.5 py-1 rounded-full border border-yellow-400/20">
           <Clock className="w-3.5 h-3.5 mr-1 animate-spin" />
           Agent working
+        </span>
+      );
+    }
+    if (prUrl && prState === 'merged') {
+      return (
+        <span className="inline-flex items-center text-xs text-purple-300 bg-purple-400/10 px-2.5 py-1 rounded-full border border-purple-400/30">
+          <GitMerge className="w-3.5 h-3.5 mr-1" />
+          Pull request merged
+        </span>
+      );
+    }
+    if (prUrl && prState === 'closed') {
+      return (
+        <span className="inline-flex items-center text-xs text-slate-300 bg-slate-700/40 px-2.5 py-1 rounded-full border border-slate-600/50">
+          <GitPullRequestClosed className="w-3.5 h-3.5 mr-1" />
+          Pull request closed
         </span>
       );
     }
@@ -90,51 +138,17 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
     );
   };
 
-  const testsCell = () => {
-    if (testsStatus === 'passed') {
-      return (
-        <>
-          <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
-          <span className="text-emerald-400">Passed in the sandbox</span>
-        </>
-      );
-    }
-    if (testsStatus === 'failed') {
-      return (
-        <>
-          <XCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
-          <span className="text-rose-400">Last run failed</span>
-        </>
-      );
-    }
-    if (testsStatus === 'not_run') {
-      return (
-        <>
-          <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
-          <span className="text-amber-400">No tests were run</span>
-        </>
-      );
-    }
-    // Without a report from the server, say so instead of implying nothing was run.
-    const unknown = session.state === 'interrupted' || (task !== null && task.recovered);
-    return (
-      <>
-        <Clock className="w-4 h-4 text-slate-500 flex-shrink-0" />
-        <span className="text-slate-500">
-          {session.state === 'running' ? 'Not run yet' : unknown ? 'Unknown' : 'Not run'}
-        </span>
-      </>
-    );
-  };
-
   const changedFiles = task && Array.isArray(task.changed_files) ? task.changed_files : [];
   const verification = task && Array.isArray(task.verification) ? task.verification : [];
+  // Results saved by earlier versions (and ones recovered from GitHub) do not say what was read.
+  const filesRead = task && !task.recovered && Array.isArray(task.files_read) ? task.files_read : null;
 
   return (
     <div
       className="bg-[#0f172a] border border-slate-800 rounded-xl p-6 shadow-xl relative overflow-hidden"
       data-testid="result-panel"
       data-state={session.state}
+      data-pr-state={prState || undefined}
     >
       <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-800 gap-3">
         <div className="flex items-center space-x-2">
@@ -157,8 +171,13 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <div className="bg-[#090d16] p-3 rounded-lg border border-slate-800/80">
             <span className="text-xs text-slate-400 block mb-1">Tests</span>
-            <div className="flex items-center space-x-1.5 text-xs font-medium" data-testid="tests-status">
-              {testsCell()}
+            <div
+              className="flex items-center space-x-1.5 text-xs font-medium"
+              data-testid="tests-status"
+              data-tone={tests.tone}
+            >
+              <ToneIcon tone={tests.tone} />
+              <span className={TONE_TEXT[tests.tone]}>{tests.label}</span>
             </div>
           </div>
 
@@ -185,15 +204,50 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
           <div>
             <div className="text-xs text-slate-400 mb-1">Verification runs</div>
             <ul className="bg-[#090d16] rounded-lg border border-slate-800/80 divide-y divide-slate-800/80">
-              {verification.slice(-4).map((run, index) => (
-                <li key={index} className="flex items-center justify-between gap-3 px-2.5 py-1.5 text-[11px] font-mono">
-                  <span className="truncate text-slate-300">$ {run.command}</span>
-                  <span className={`flex-shrink-0 ${run.passed ? 'text-emerald-400' : 'text-rose-400'}`}>
-                    {run.timed_out ? 'timed out' : run.passed ? 'passed' : `exit ${run.exit_code}`}
-                  </span>
-                </li>
-              ))}
+              {verification.slice(-4).map((run, index) => {
+                const outcome = runOutcome(run);
+                const tone =
+                  outcome === 'passed' ? 'text-emerald-400' : outcome === 'no_tests' ? 'text-slate-400' : 'text-rose-400';
+                return (
+                  <li
+                    key={index}
+                    className="flex items-center justify-between gap-3 px-2.5 py-1.5 text-[11px] font-mono"
+                    title={outcome === 'no_tests' && run.note ? `Nothing to test: ${run.note}` : undefined}
+                  >
+                    <span className="truncate text-slate-300">$ {run.command}</span>
+                    <span className={`flex-shrink-0 ${tone}`} data-testid="verification-result">
+                      {runLabel(run)}
+                    </span>
+                  </li>
+                );
+              })}
             </ul>
+            {verification.some((run) => runOutcome(run) === 'no_tests' && run.note) && (
+              <p className="text-[11px] text-slate-500 mt-1" data-testid="no-tests-note">
+                Nothing to test: {verification.filter((run) => runOutcome(run) === 'no_tests' && run.note).slice(-1)[0].note}.
+                This is not a failure of the change.
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Only next to a change someone will review; an unfinished run has not read "nothing". */}
+        {filesRead && prUrl && (
+          <div data-testid="files-read">
+            <div className="text-xs text-slate-400 mb-1">Files the agent looked at</div>
+            {filesRead.length > 0 ? (
+              <p className="text-[11px] font-mono text-slate-300 bg-[#090d16] px-2.5 py-1.5 rounded-lg border border-slate-800/80 break-words">
+                {filesRead.slice(0, MAX_READ_FILES_SHOWN).join(', ')}
+                {filesRead.length > MAX_READ_FILES_SHOWN && (
+                  <span className="text-slate-500"> and {filesRead.length - MAX_READ_FILES_SHOWN} more</span>
+                )}
+              </p>
+            ) : (
+              <p className="text-xs text-amber-400 flex items-start gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                None. The agent did not open any file of the repository, so check what it wrote against the code.
+              </p>
+            )}
           </div>
         )}
 
@@ -233,7 +287,7 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
           <div>
             <div className="text-xs text-slate-400 mb-1">{task.recovered ? 'Summary' : 'Agent summary'}</div>
             <p className="text-xs text-slate-200 bg-[#090d16] p-2.5 rounded-lg border border-slate-800/80 whitespace-pre-wrap break-words">
-              <Linkified text={task.summary} />
+              <Linkified text={plainProse(task.summary)} />
             </p>
           </div>
         )}
@@ -246,25 +300,46 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
               target="_blank"
               rel="noreferrer noopener"
               data-testid="pr-link"
-              className="w-full flex items-center justify-center space-x-2 bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs py-2.5 px-4 rounded-lg transition-colors shadow-lg shadow-emerald-600/20"
+              className={`w-full flex items-center justify-center space-x-2 text-white font-medium text-xs py-2.5 px-4 rounded-lg transition-colors shadow-lg ${
+                prState === 'merged'
+                  ? 'bg-purple-600 hover:bg-purple-500 shadow-purple-600/20'
+                  : prState === 'closed'
+                    ? 'bg-slate-700 hover:bg-slate-600 shadow-slate-900/20'
+                    : 'bg-emerald-600 hover:bg-emerald-500 shadow-emerald-600/20'
+              }`}
             >
-              <GitPullRequest className="w-4 h-4" />
+              {prState === 'merged' ? (
+                <GitMerge className="w-4 h-4" />
+              ) : prState === 'closed' ? (
+                <GitPullRequestClosed className="w-4 h-4" />
+              ) : (
+                <GitPullRequest className="w-4 h-4" />
+              )}
               <span>
-                Review pull request{task.pr_number ? ` #${task.pr_number}` : ''} on GitHub
+                {prState === 'merged' ? 'View merged' : prState === 'closed' ? 'View closed' : 'Review'} pull request
+                {task.pr_number ? ` #${task.pr_number}` : ''} on GitHub
               </span>
               <ExternalLink className="w-3.5 h-3.5 ml-1" />
             </a>
             <div className="text-[11px] font-mono text-slate-500 break-all text-center">{prUrl}</div>
-            {testsStatus === 'failed' && (
-              <p className="text-xs text-amber-400 flex items-start gap-1.5">
-                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
-                The agent&apos;s last test run failed. The pull request says so too. Review it carefully before merging.
+            {prState === 'merged' && (
+              <p className="text-xs text-purple-200/80 text-center" data-testid="pr-state-note">
+                This pull request has been merged into {task.base_branch || 'the base branch'}.
               </p>
             )}
-            {testsStatus === 'not_run' && (
-              <p className="text-xs text-amber-400 flex items-start gap-1.5">
+            {prState === 'closed' && (
+              <p className="text-xs text-slate-400 text-center" data-testid="pr-state-note">
+                This pull request was closed without being merged.
+              </p>
+            )}
+            {/* Advice for the reviewer: pointless once the pull request is merged or closed. */}
+            {tests.advice && prState !== 'merged' && prState !== 'closed' && (
+              <p
+                className={`text-xs flex items-start gap-1.5 ${tests.tone === 'neutral' ? 'text-slate-400' : 'text-amber-400'}`}
+                data-testid="tests-advice"
+              >
                 <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
-                The agent did not run any tests for this change.
+                {tests.advice}
               </p>
             )}
             {task.recovered && (

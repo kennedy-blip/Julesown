@@ -1,4 +1,4 @@
-import type { LogEntry, TaskRecord } from './api';
+import type { LogEntry, PullRequestState, TaskRecord } from './api';
 import { pullRequestUrl } from './api';
 
 /**
@@ -19,18 +19,42 @@ export interface Session {
   logs: LogEntry[];
   /** Client-side explanation (request refused, connection lost, ...). */
   note: string | null;
+  /**
+   * What became of the pull request after the task opened it, as last read
+   * from GitHub. Absent until it has been looked up.
+   */
+  pullRequest?: { state: PullRequestState; checkedAt: number } | null;
   createdAt: number; // ms
   updatedAt: number; // ms
 }
 
-export type SessionBadge = 'RUNNING' | 'PR OPENED' | 'NO CHANGES' | 'FAILED' | 'UNKNOWN';
+export type SessionBadge = 'RUNNING' | 'PR OPENED' | 'MERGED' | 'PR CLOSED' | 'NO CHANGES' | 'FAILED' | 'UNKNOWN';
+
+/** The pull request's state on GitHub if it has been looked up, else null. */
+export function pullRequestState(session: Session): PullRequestState | null {
+  if (session.state !== 'completed' || !pullRequestUrl(session.task)) return null;
+  return session.pullRequest ? session.pullRequest.state : null;
+}
 
 export function sessionBadge(session: Session): SessionBadge {
   if (session.state === 'running') return 'RUNNING';
   if (session.state === 'failed') return 'FAILED';
   if (session.state === 'interrupted') return 'UNKNOWN';
-  if (pullRequestUrl(session.task)) return 'PR OPENED';
+  if (pullRequestUrl(session.task)) {
+    const state = pullRequestState(session);
+    return state === 'merged' ? 'MERGED' : state === 'closed' ? 'PR CLOSED' : 'PR OPENED';
+  }
   return 'NO CHANGES';
+}
+
+/**
+ * Whether the pull request of this session is worth asking GitHub about:
+ * there is one, and it was not already seen merged (which is final).
+ */
+export function pullRequestCanChange(session: Session): boolean {
+  if (session.state !== 'completed' || !pullRequestUrl(session.task)) return false;
+  if (!session.task || !session.task.task_id) return false;
+  return pullRequestState(session) !== 'merged';
 }
 
 // --------------------------------------------------------------------------
@@ -47,6 +71,17 @@ function isLogEntry(value: unknown): value is LogEntry {
   if (!value || typeof value !== 'object') return false;
   const entry = value as Record<string, unknown>;
   return typeof entry.ts === 'number' && typeof entry.level === 'string' && typeof entry.message === 'string';
+}
+
+function revivePullRequest(value: unknown): Session['pullRequest'] {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  const states: PullRequestState[] = ['open', 'merged', 'closed'];
+  if (states.indexOf(raw.state as PullRequestState) < 0) return null;
+  return {
+    state: raw.state as PullRequestState,
+    checkedAt: typeof raw.checkedAt === 'number' ? raw.checkedAt : 0,
+  };
 }
 
 function reviveSession(value: unknown): Session | null {
@@ -67,6 +102,7 @@ function reviveSession(value: unknown): Session | null {
     task,
     logs: Array.isArray(raw.logs) ? raw.logs.filter(isLogEntry) : [],
     note: typeof raw.note === 'string' ? raw.note : null,
+    pullRequest: revivePullRequest(raw.pullRequest),
     createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
     updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
   };
