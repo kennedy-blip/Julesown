@@ -13,7 +13,12 @@ export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
  */
 export type TestsStatus = 'passed' | 'failed' | 'no_tests' | 'not_run';
 export type VerificationOutcome = 'passed' | 'failed' | 'timed_out' | 'no_tests';
-export type TaskOutcome = 'pull_request' | 'no_changes';
+/**
+ * pull_request   - the change is on a branch and GitHub opened a pull request for it
+ * initial_commit - the repository was empty: the result is its first commit
+ * no_changes     - the agent finished without changing (or creating) any file
+ */
+export type TaskOutcome = 'pull_request' | 'no_changes' | 'initial_commit';
 
 export interface LogEntry {
   ts: number; // unix seconds
@@ -53,6 +58,13 @@ export interface TaskRecord {
   head_branch: string | null;
   base_branch: string | null;
   commit_sha: string | null;
+  /** The commit on GitHub when the result was committed directly (outcome 'initial_commit'). */
+  commit_url?: string | null;
+  repository_url?: string | null;
+  /** The repository had no commits when the task started (null until that is known). */
+  empty_repository?: boolean | null;
+  /** The repository had no code: the agent built a project from scratch. */
+  new_project?: boolean | null;
   changed_files: ChangedFile[];
   /** The change only touches documentation files (null until the changes are known). */
   docs_only?: boolean | null;
@@ -105,11 +117,35 @@ export interface RepoSummary {
   private: boolean;
   default_branch: string;
   html_url: string;
+  archived?: boolean;
+  fork?: boolean;
+  description?: string | null;
+  language?: string | null;
+  /** ISO time of the last push; the list is ordered by it, newest first. */
+  pushed_at?: string | null;
+}
+
+/** One account the GitHub App is installed on. */
+export interface AppInstallation {
+  id: number;
+  account: string | null;
+  account_type: string | null;
+  /** 'all': every repository of the account. 'selected': only the ones picked on GitHub. */
+  repository_selection: 'all' | 'selected' | string | null;
+  /** Where the repositories the App can access are chosen. */
+  manage_url: string | null;
+  suspended: boolean;
+  repository_count: number | null;
 }
 
 export interface RepoListing {
   auth_mode: 'app' | 'token' | 'none';
+  /** Every repository the backend's GitHub credentials can work on. */
   repositories: RepoSummary[];
+  /** How many GitHub reports; more than `repositories.length` only when `truncated`. */
+  total?: number;
+  truncated?: boolean;
+  installations?: AppInstallation[];
   install_url: string | null;
   error: string | null;
 }
@@ -119,6 +155,8 @@ export interface RepoCheck {
   repository: string;
   default_branch: string | null;
   private: boolean | null;
+  /** The repository has no commits: a task creates the project and its first commit. */
+  empty?: boolean | null;
   auth_mode: string;
   code: string | null;
   error: string | null;
@@ -373,6 +411,21 @@ const PULL_REQUEST_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/;
 export function pullRequestUrl(task: Pick<TaskRecord, 'pr_url'> | null | undefined): string | null {
   const url = task && task.pr_url;
   return typeof url === 'string' && PULL_REQUEST_URL.test(url) ? url : null;
+}
+
+const COMMIT_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/commit\/[0-9a-f]{40}$/;
+
+/**
+ * The link to the first commit of a repository that was empty, or null.
+ * Like pull request links, it is only shown when it is the URL GitHub
+ * returned for the commit it created.
+ */
+export function firstCommitUrl(
+  task: Pick<TaskRecord, 'outcome' | 'commit_url'> | null | undefined
+): string | null {
+  if (!task || task.outcome !== 'initial_commit') return null;
+  const url = task.commit_url;
+  return typeof url === 'string' && COMMIT_URL.test(url) ? url : null;
 }
 
 const REPOSITORY_SLUG = /^[\w.-]+\/[\w.-]+$/;

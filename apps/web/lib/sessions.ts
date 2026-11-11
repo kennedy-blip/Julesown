@@ -1,9 +1,9 @@
 import type { LogEntry, PullRequestState, TaskRecord } from './api';
-import { pullRequestUrl } from './api';
+import { firstCommitUrl, pullRequestUrl } from './api';
 
 /**
  * running      - this tab is receiving the task's live stream
- * completed    - the server reported the task finished (pull request or no changes)
+ * completed    - the server reported the task finished (pull request, first commit or no changes)
  * failed       - the server reported a failure, or refused the request
  * interrupted  - the live connection ended before a result arrived; the outcome is unknown
  */
@@ -28,7 +28,15 @@ export interface Session {
   updatedAt: number; // ms
 }
 
-export type SessionBadge = 'RUNNING' | 'PR OPENED' | 'MERGED' | 'PR CLOSED' | 'NO CHANGES' | 'FAILED' | 'UNKNOWN';
+export type SessionBadge =
+  | 'RUNNING'
+  | 'PR OPENED'
+  | 'MERGED'
+  | 'PR CLOSED'
+  | 'PUSHED'
+  | 'NO CHANGES'
+  | 'FAILED'
+  | 'UNKNOWN';
 
 /** The pull request's state on GitHub if it has been looked up, else null. */
 export function pullRequestState(session: Session): PullRequestState | null {
@@ -44,6 +52,8 @@ export function sessionBadge(session: Session): SessionBadge {
     const state = pullRequestState(session);
     return state === 'merged' ? 'MERGED' : state === 'closed' ? 'PR CLOSED' : 'PR OPENED';
   }
+  // The repository was empty: the result is its first commit, on the default branch.
+  if (firstCommitUrl(session.task)) return 'PUSHED';
   return 'NO CHANGES';
 }
 

@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { GitBranch, GitFork, Play, Sparkles, CheckCircle2, AlertTriangle, Loader2 } from 'lucide-react';
+import { GitBranch, GitFork, PackagePlus, Play, Sparkles, CheckCircle2, AlertTriangle, Loader2 } from 'lucide-react';
 import { looksLikeRepository } from '@/lib/api';
 import type { RepoSummary } from '@/lib/api';
 import type { Readiness } from '@/lib/health';
@@ -16,7 +16,15 @@ export interface TaskFormValues {
 export type RepoCheckState =
   | { phase: 'idle' }
   | { phase: 'checking' }
-  | { phase: 'ok'; repository: string; defaultBranch: string | null; isPrivate: boolean | null; authMode: string }
+  | {
+      phase: 'ok';
+      repository: string;
+      defaultBranch: string | null;
+      isPrivate: boolean | null;
+      authMode: string;
+      /** The repository has no commits: the task creates the project and its first commit. */
+      empty: boolean;
+    }
   | { phase: 'error'; message: string };
 
 interface TaskFormProps {
@@ -60,6 +68,9 @@ export function TaskForm({
   );
   const defaultBranch =
     (repoCheck.phase === 'ok' && repoCheck.defaultBranch) || (knownRepo && knownRepo.default_branch) || null;
+  // Nothing to base a change on: the agent builds the project, and its result
+  // becomes the first commit on the default branch.
+  const emptyRepository = repositoryValid && repoCheck.phase === 'ok' && repoCheck.empty;
 
   const submit = (event: React.FormEvent) => {
     event.preventDefault();
@@ -129,7 +140,18 @@ export function TaskForm({
               type="text"
               value={values.branch}
               onChange={(e) => onChange({ branch: e.target.value })}
-              placeholder={defaultBranch ? `default (${defaultBranch})` : 'default branch'}
+              placeholder={
+                emptyRepository
+                  ? `${defaultBranch || 'default branch'} · first commit`
+                  : defaultBranch
+                    ? `default (${defaultBranch})`
+                    : 'default branch'
+              }
+              title={
+                emptyRepository
+                  ? 'An empty repository has no branches yet: the first commit is made on its default branch.'
+                  : undefined
+              }
               autoComplete="off"
               spellCheck={false}
               className="w-full bg-[#090d16] border border-slate-800 focus:border-blue-500 rounded-lg px-3 py-2 text-xs text-slate-100 placeholder-slate-500 outline-none transition-colors font-mono"
@@ -138,7 +160,12 @@ export function TaskForm({
         </div>
 
         {/* What the backend says about this repository, before anything is run. */}
-        <div className="min-h-[18px] text-[11px] -mt-2" data-testid="repo-check" data-phase={repoCheck.phase}>
+        <div
+          className="min-h-[18px] text-[11px] -mt-2"
+          data-testid="repo-check"
+          data-phase={repoCheck.phase}
+          data-empty={emptyRepository ? 'true' : undefined}
+        >
           {values.repository.trim() !== '' && !repositoryValid && (
             <span className="text-amber-400">Enter the repository as owner/name or paste its GitHub URL.</span>
           )}
@@ -147,7 +174,19 @@ export function TaskForm({
               <Loader2 className="w-3 h-3 animate-spin" /> Checking access to the repository…
             </span>
           )}
-          {repositoryValid && repoCheck.phase === 'ok' && (
+          {emptyRepository && repoCheck.phase === 'ok' && (
+            <span className="text-sky-300 inline-flex items-start gap-1.5">
+              <PackagePlus className="w-3 h-3 flex-shrink-0 mt-0.5" />
+              <span>
+                {repoCheck.repository} is empty
+                {repoCheck.isPrivate === null ? '' : repoCheck.isPrivate ? ' (private)' : ' (public)'}. Jules will build
+                the project from your instructions and commit it to {repoCheck.defaultBranch || 'the default branch'} as
+                the first commit
+                {repoCheck.authMode === 'app' ? ' · via GitHub App' : repoCheck.authMode === 'token' ? ' · via token' : ''}
+              </span>
+            </span>
+          )}
+          {repositoryValid && repoCheck.phase === 'ok' && !repoCheck.empty && (
             <span className="text-emerald-400 inline-flex items-center gap-1.5">
               <CheckCircle2 className="w-3 h-3 flex-shrink-0" />
               <span>
@@ -177,7 +216,11 @@ export function TaskForm({
             onKeyDown={onPromptKeyDown}
             rows={3}
             maxLength={8000}
-            placeholder="Describe one concrete change, e.g. “Fix the failing date parsing test and add a regression test”"
+            placeholder={
+              emptyRepository
+                ? 'Describe what to build, e.g. “A to-do list web app that saves to the browser, ready to deploy on Vercel”'
+                : 'Describe one concrete change, e.g. “Fix the failing date parsing test and add a regression test”'
+            }
             className="w-full bg-[#090d16] border border-slate-800 focus:border-blue-500 rounded-lg px-3 py-2 text-xs text-slate-100 placeholder-slate-500 outline-none transition-colors resize-y font-mono"
             required
           />

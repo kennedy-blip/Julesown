@@ -2,6 +2,7 @@
 
 import React from 'react';
 import {
+  GitCommitHorizontal,
   GitMerge,
   GitPullRequest,
   GitPullRequestClosed,
@@ -14,7 +15,7 @@ import {
   MinusCircle,
   HelpCircle,
 } from 'lucide-react';
-import { pullRequestUrl } from '@/lib/api';
+import { firstCommitUrl, pullRequestUrl } from '@/lib/api';
 import { plainProse, runLabel, runOutcome, summarizeTests } from '@/lib/results';
 import type { Tone } from '@/lib/results';
 import { pullRequestState } from '@/lib/sessions';
@@ -75,7 +76,11 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
 
   const task = session.task;
   const prUrl = session.state === 'completed' ? pullRequestUrl(task) : null;
-  const noChanges = session.state === 'completed' && !prUrl;
+  // The repository was empty: there is no pull request, the result is its first commit.
+  const commitUrl = session.state === 'completed' ? firstCommitUrl(task) : null;
+  const firstCommit = session.state === 'completed' && !!task && task.outcome === 'initial_commit';
+  const emptyRepository = !!task && (task.empty_repository === true || task.outcome === 'initial_commit');
+  const noChanges = session.state === 'completed' && !prUrl && !firstCommit;
   // What GitHub said the last time it was asked (null: not asked yet).
   const prState = prUrl ? pullRequestState(session) : null;
   const tests = summarizeTests(task, session.state);
@@ -114,11 +119,19 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
         </span>
       );
     }
+    if (firstCommit) {
+      return (
+        <span className="inline-flex items-center text-xs text-sky-300 bg-sky-400/10 px-2.5 py-1 rounded-full border border-sky-400/30">
+          <GitCommitHorizontal className="w-3.5 h-3.5 mr-1" />
+          First commit pushed
+        </span>
+      );
+    }
     if (noChanges) {
       return (
         <span className="inline-flex items-center text-xs text-slate-300 bg-slate-700/40 px-2.5 py-1 rounded-full border border-slate-600/50">
           <MinusCircle className="w-3.5 h-3.5 mr-1" />
-          Finished · no changes
+          {emptyRepository ? 'Finished · nothing created' : 'Finished · no changes'}
         </span>
       );
     }
@@ -149,6 +162,7 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
       data-testid="result-panel"
       data-state={session.state}
       data-pr-state={prState || undefined}
+      data-outcome={(session.state === 'completed' && task && task.outcome) || undefined}
     >
       <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-800 gap-3">
         <div className="flex items-center space-x-2">
@@ -186,9 +200,11 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
             <span className="text-xs font-mono text-indigo-300 truncate block" data-testid="branch-info">
               {task && task.head_branch
                 ? `${task.head_branch} → ${task.base_branch || '?'}`
-                : session.branch
-                  ? `base: ${session.branch}`
-                  : '—'}
+                : emptyRepository && task && task.base_branch
+                  ? `${task.base_branch} · first commit`
+                  : session.branch
+                    ? `base: ${session.branch}`
+                    : '—'}
             </span>
           </div>
 
@@ -242,6 +258,10 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
                   <span className="text-slate-500"> and {filesRead.length - MAX_READ_FILES_SHOWN} more</span>
                 )}
               </p>
+            ) : task && task.new_project ? (
+              <p className="text-xs text-slate-400">
+                None: the repository had no code yet, so the project was created from scratch.
+              </p>
             ) : (
               <p className="text-xs text-amber-400 flex items-start gap-1.5">
                 <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
@@ -254,7 +274,7 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
         {changedFiles.length > 0 && (
           <div>
             <div className="text-xs text-slate-400 mb-1">
-              {changedFiles.length} file{changedFiles.length === 1 ? '' : 's'} changed
+              {changedFiles.length} file{changedFiles.length === 1 ? '' : 's'} {emptyRepository ? 'created' : 'changed'}
             </div>
             <ul className="bg-[#090d16] rounded-lg border border-slate-800/80 divide-y divide-slate-800/80">
               {changedFiles.slice(0, MAX_FILES_SHOWN).map((file) => {
@@ -351,9 +371,57 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
           </div>
         )}
 
+        {firstCommit && task && (
+          <div className="pt-1 space-y-2" data-testid="first-commit">
+            {commitUrl ? (
+              <a
+                href={commitUrl}
+                target="_blank"
+                rel="noreferrer noopener"
+                data-testid="commit-link"
+                className="w-full flex items-center justify-center space-x-2 bg-sky-600 hover:bg-sky-500 text-white font-medium text-xs py-2.5 px-4 rounded-lg transition-colors shadow-lg shadow-sky-600/20"
+              >
+                <GitCommitHorizontal className="w-4 h-4" />
+                <span>
+                  View the first commit{task.commit_sha ? ` ${task.commit_sha.slice(0, 7)}` : ''} on GitHub
+                </span>
+                <ExternalLink className="w-3.5 h-3.5 ml-1" />
+              </a>
+            ) : (
+              <p className="text-xs text-slate-300 text-center font-mono">
+                First commit {task.commit_sha ? task.commit_sha.slice(0, 10) : ''} on {task.base_branch || 'the default branch'}
+              </p>
+            )}
+            {commitUrl && <div className="text-[11px] font-mono text-slate-500 break-all text-center">{commitUrl}</div>}
+            <p className="text-xs text-sky-200/80" data-testid="first-commit-note">
+              The repository was empty, so there was no branch a pull request could be opened against. The files
+              were committed directly to {task.base_branch || 'the default branch'}: the repository now has its
+              first commit and can be cloned, changed by further tasks (as pull requests) or imported into a
+              hosting platform.
+            </p>
+            {tests.advice && (
+              <p
+                className={`text-xs flex items-start gap-1.5 ${tests.tone === 'bad' ? 'text-amber-400' : 'text-slate-400'}`}
+                data-testid="tests-advice"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                {tests.advice}
+              </p>
+            )}
+            {task.recovered && (
+              <p className="text-xs text-slate-400">
+                This result was looked up on GitHub because the server instance that ran the task is no longer
+                available. The run&apos;s log and details could not be recovered, only the commit itself.
+              </p>
+            )}
+          </div>
+        )}
+
         {noChanges && (
           <div className="bg-slate-800/40 border border-slate-700/60 rounded-lg p-3 text-xs text-slate-300" data-testid="no-changes">
-            The agent finished without changing any files, so no pull request was opened.
+            {emptyRepository
+              ? 'The agent finished without creating any files, so nothing was pushed. The repository is still empty.'
+              : 'The agent finished without changing any files, so no pull request was opened.'}
           </div>
         )}
 
@@ -361,7 +429,7 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
           <div className="bg-rose-500/10 border border-rose-500/30 rounded-lg p-3" data-testid="failure">
             <div className="flex items-center gap-1.5 text-xs font-semibold text-rose-300 mb-1">
               <XCircle className="w-3.5 h-3.5" />
-              No pull request was opened
+              {emptyRepository ? 'The task did not complete' : 'No pull request was opened'}
             </div>
             <p className="text-xs text-rose-100/90 whitespace-pre-wrap break-words">
               <Linkified text={failureText} />
@@ -379,7 +447,7 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
               <Linkified
                 text={
                   session.note ||
-                  'The result did not arrive. If the run finished, its pull request can be found by checking again.'
+                  'The result did not arrive. If the run finished, its pull request (or first commit) can be found by checking again.'
                 }
               />
             </p>
@@ -397,7 +465,9 @@ export function PRStatusTracker({ session, onRecheck, rechecking }: PRStatusTrac
 
         {session.state === 'running' && (
           <p className="text-xs text-slate-500 italic text-center">
-            A pull request link appears here only once GitHub has created the pull request.
+            {emptyRepository
+              ? 'The repository is empty: a link to its first commit appears here once GitHub has stored it.'
+              : 'A pull request link appears here only once GitHub has created the pull request.'}
           </p>
         )}
       </div>

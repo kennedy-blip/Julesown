@@ -38,12 +38,43 @@ export function runLabel(run: VerificationRun): string {
   }
 }
 
+/**
+ * A project that was just created in an empty repository. Its result is not a
+ * pull request waiting for review but a commit that is already there, so the
+ * advice is about using the project, not about merging.
+ */
+function summarizeNewProject(status: TaskRecord['tests_status'], docsOnly: boolean): TestsSummary {
+  switch (status) {
+    case 'passed':
+      return { tone: 'good', label: 'Passed in the sandbox', advice: null };
+    case 'failed':
+      return {
+        tone: 'bad',
+        label: 'Last run failed',
+        advice:
+          "The agent's last test run failed. The files were committed anyway: an empty repository has no pull request that could hold them back. Check the project before you rely on it.",
+      };
+    default:
+      return docsOnly
+        ? { tone: 'neutral', label: 'None needed · docs only', advice: null }
+        : {
+            tone: 'neutral',
+            label: 'No tests yet',
+            advice: 'The new project has no automated tests. Try it before you deploy it.',
+          };
+  }
+}
+
 export function summarizeTests(task: TaskRecord | null, state: SessionState): TestsSummary {
   const status = task ? task.tests_status : null;
   const docsOnly = !!task && task.docs_only === true;
   // A warning about missing tests is about a change someone is going to review.
   // A task that failed, changed nothing or is still running has no such change (yet).
   const hasChange = state === 'completed' && !!task && task.outcome !== 'no_changes';
+
+  if (hasChange && task && task.outcome === 'initial_commit' && status) {
+    return summarizeNewProject(status, docsOnly);
+  }
 
   if (!hasChange && (status === 'not_run' || status === 'no_tests')) {
     return {

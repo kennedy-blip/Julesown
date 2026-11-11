@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Plus, FolderGit2, KeyRound, RefreshCw, Trash2, AlertTriangle, CheckCircle2, X, ExternalLink } from 'lucide-react';
+import { Plus, KeyRound, RefreshCw, Trash2, AlertTriangle, CheckCircle2, X } from 'lucide-react';
+import { RepositoryPicker } from '@/components/RepositoryPicker';
 import { TaskForm } from '@/components/TaskForm';
 import type { RepoCheckState, TaskFormValues } from '@/components/TaskForm';
 import { LiveTerminal } from '@/components/LiveTerminal';
@@ -36,7 +37,7 @@ const PR_STATE_STARTUP_LIMIT = 8;
 
 const GITHUB_APP_NOTICES: Record<string, string> = {
   installed:
-    'GitHub App installation saved. Jules can now open pull requests on the repositories you selected.',
+    'GitHub App installation saved. Jules can now work on the repositories you selected.',
   requested:
     'Installation requested. An owner of that organization has to approve it before Jules can access its repositories.',
   authorized: 'GitHub authorization complete.',
@@ -92,6 +93,8 @@ function applyLookup(session: Session, found: TaskRecord): Session {
       outcome: found.outcome,
       pr_url: found.pr_url,
       pr_number: found.pr_number,
+      commit_sha: found.commit_sha || known.commit_sha,
+      commit_url: found.commit_url || known.commit_url,
       head_branch: found.head_branch || known.head_branch,
       base_branch: found.base_branch || known.base_branch,
       summary: known.summary || found.summary,
@@ -120,6 +123,7 @@ function applyLookup(session: Session, found: TaskRecord): Session {
 const BADGE_STYLES: Record<SessionBadge, string> = {
   RUNNING: 'bg-amber-500/10 text-amber-400 border border-amber-500/20',
   'PR OPENED': 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20',
+  PUSHED: 'bg-sky-500/10 text-sky-300 border border-sky-500/30',
   MERGED: 'bg-purple-500/10 text-purple-300 border border-purple-500/30',
   'PR CLOSED': 'bg-slate-700/40 text-slate-300 border border-slate-600/50',
   'NO CHANGES': 'bg-slate-700/40 text-slate-300 border border-slate-600/50',
@@ -253,7 +257,9 @@ export default function Dashboard() {
   }, [canCallApi, accessMode, accessKey, loadRepositories]);
 
   const repositories = listing ? listing.repositories : [];
-  const firstRepository = repositories.length > 0 ? repositories[0].full_name : '';
+  // The list is ordered by last push: the first usable entry is the repository worked on most recently.
+  const firstUsable = repositories.find((repo) => !repo.archived);
+  const firstRepository = firstUsable ? firstUsable.full_name : '';
   useEffect(() => {
     if (firstRepository) {
       setForm((current) => (current.repository.trim() ? current : { ...current, repository: firstRepository }));
@@ -263,6 +269,9 @@ export default function Dashboard() {
   // ------------------------------------------------------------------
   // Pre-flight check of the repository in the form
   // ------------------------------------------------------------------
+  // Asked again when a task ends: a task changes what is true about a
+  // repository (an empty one, for instance, is not empty afterwards).
+  const taskInProgress = sessions.some((session) => session.state === 'running');
   useEffect(() => {
     if (!canCallApi || githubAuthMode === 'none' || !looksLikeRepository(form.repository)) {
       setRepoCheck({ phase: 'idle' });
@@ -281,6 +290,7 @@ export default function Dashboard() {
             defaultBranch: result.default_branch,
             isPrivate: result.private,
             authMode: result.auth_mode,
+            empty: result.empty === true,
           });
         } else {
           setRepoCheck({ phase: 'error', message: result.error || 'This repository cannot be used.' });
@@ -298,7 +308,7 @@ export default function Dashboard() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [canCallApi, githubAuthMode, form.repository, form.branch, accessKey]);
+  }, [canCallApi, githubAuthMode, form.repository, form.branch, accessKey, taskInProgress]);
 
   // ------------------------------------------------------------------
   // Looking up a task whose live connection was lost
@@ -326,8 +336,8 @@ export default function Dashboard() {
         let note: string;
         if (error instanceof ApiError && error.status === 404) {
           note = recent
-            ? 'No pull request from this task exists on GitHub yet. The run may still be in progress on the server, so this is checked again automatically for a few minutes.'
-            : 'No pull request from this task exists on GitHub. The run did not get as far as opening one (it may have been stopped by the hosting time limit).';
+            ? 'Nothing from this task exists on GitHub yet. The run may still be in progress on the server, so this is checked again automatically for a few minutes.'
+            : 'Nothing from this task exists on GitHub: no pull request and no commit. The run did not get that far (it may have been stopped by the hosting time limit).';
         } else if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
           note = error.message;
         } else {
@@ -519,14 +529,14 @@ export default function Dashboard() {
 
   const modelLabel = healthData && healthData.llm ? `${healthData.llm.provider} · ${healthData.llm.model}` : null;
 
-  let pickerPlaceholder = 'Choose a repository…';
-  if (listingLoading) pickerPlaceholder = 'Loading…';
-  else if (!listing) {
-    // The list was not loaded; do not claim there are no repositories.
-    if (accessMode === 'locked') pickerPlaceholder = 'Locked';
-    else if (accessMode === 'key' && !accessKey.trim()) pickerPlaceholder = 'Enter the access key first';
-    else pickerPlaceholder = 'Not available';
-  } else if (repositories.length === 0) pickerPlaceholder = 'None found';
+  // Why there is no repository list, when there is none (never "no repositories").
+  let listUnavailable: string | null = null;
+  if (!listing && !listingLoading) {
+    if (accessMode === 'locked') listUnavailable = 'Locked';
+    else if (accessMode === 'key' && !accessKey.trim()) listUnavailable = 'Enter the access key first';
+    else if (health.phase !== 'ok') listUnavailable = health.phase === 'unreachable' ? 'Backend not reachable' : 'Checking the backend…';
+    else if (githubAuthMode === 'none') listUnavailable = 'GitHub is not configured';
+  }
 
   const selectSession = (session: Session) => {
     setActiveId(session.id);
@@ -655,52 +665,15 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 items-start">
         {/* ---- Sidebar ---- */}
         <div className="lg:col-span-4 bg-[#0f172a] border border-slate-800 rounded-xl p-4 space-y-4">
-          <div className="space-y-1.5">
-            <label htmlFor="repository-picker" className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider block">
-              Repositories Jules can access
-            </label>
-            <div className="relative">
-              <select
-                id="repository-picker"
-                value={repositories.some((repo) => repo.full_name === form.repository) ? form.repository : ''}
-                onChange={(e) => {
-                  if (e.target.value) setForm((current) => ({ ...current, repository: e.target.value, branch: '' }));
-                }}
-                disabled={repositories.length === 0}
-                className="w-full bg-[#1e293b] border border-slate-700/60 rounded-lg px-3 py-2 pr-8 text-xs text-slate-100 font-mono focus:border-blue-500 outline-none transition-colors appearance-none disabled:opacity-60"
-              >
-                <option value="">{pickerPlaceholder}</option>
-                {repositories.map((repo) => (
-                  <option key={repo.full_name} value={repo.full_name}>
-                    {repo.full_name}
-                    {repo.private ? ' (private)' : ''}
-                  </option>
-                ))}
-              </select>
-              <FolderGit2 className="w-3.5 h-3.5 text-slate-400 absolute right-3 top-2.5 pointer-events-none" />
-            </div>
-
-            <div className="text-[11px] text-slate-500 space-y-1" data-testid="repo-listing-status">
-              {listingError && <p className="text-amber-400 break-words">{listingError}</p>}
-              {!listingError && listing && repositories.length === 0 && githubAuthMode === 'app' && (
-                <p className="text-amber-400">The GitHub App is not installed on any repository yet.</p>
-              )}
-              {listing && listing.install_url && (
-                <a
-                  href={listing.install_url}
-                  target="_blank"
-                  rel="noreferrer noopener"
-                  className="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300 underline"
-                >
-                  Install the GitHub App on {repositories.length === 0 ? 'a repository' : 'more repositories'}
-                  <ExternalLink className="w-3 h-3" />
-                </a>
-              )}
-              {listing && githubAuthMode === 'token' && (
-                <p>Listed from the configured GITHUB_TOKEN. You can also type any repository it can push to.</p>
-              )}
-            </div>
-          </div>
+          <RepositoryPicker
+            listing={listing}
+            loading={listingLoading}
+            error={listingError}
+            selected={form.repository}
+            onSelect={(fullName) => setForm((current) => ({ ...current, repository: fullName, branch: '' }))}
+            onRefresh={() => void loadRepositories()}
+            unavailable={listUnavailable}
+          />
 
           {(accessMode === 'key' || accessProblem) && (
             <div className="space-y-1.5">
