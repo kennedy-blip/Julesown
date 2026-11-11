@@ -402,28 +402,82 @@ def test_listing_is_capped_and_says_so(github: FakeGitHub, rsa_private_key_pem):
     assert len(as_token["repositories"]) == 200 and as_token["truncated"] is True
 
 
+def pages_asked(github: FakeGitHub, path: str) -> List[int]:
+    return sorted(int(query["page"]) for method, asked, query in github.queries if asked == path and method == "GET")
+
+
 def test_listing_keeps_what_it_has_when_a_page_fails(github: FakeGitHub):
-    add_many(github, 150)
+    add_many(github, 350)  # with acme/demo: 351 repositories, four pages
     client = github.client(token=FakeGitHub.PAT)
-    calls = {"count": 0}
-    original = github._handle
-
-    def flaky(request):
-        if request.url.path == "/user/repos":
-            calls["count"] += 1
-            if calls["count"] == 2:
-                return github._json(502, {"message": "Server Error"})
-        return original(request)
-
-    github.transport.handler = flaky  # type: ignore[attr-defined]
+    github.fail_next("GET", r"^/user/repos$", 502, {"message": "Server Error"}, times=99, params={"page": "2"})
     catalog = client.repository_catalog()
-    assert len(catalog["repositories"]) == 100 and catalog["truncated"] is True
+    # Everything that could be read is there - also the pages after the one that failed.
+    assert len(catalog["repositories"]) == 251 and catalog["truncated"] is True
     assert "HTTP 502" in catalog["error"]
+    assert pages_asked(github, "/user/repos") == [1, 2, 2, 3, 4]  # the failing page was tried twice
 
     # Nothing at all is an error, not an empty list that looks like "no repositories".
-    calls["count"] = 1
+    github.failures.clear()
+    github.fail_next("GET", r"^/user/repos$", 502, {"message": "Server Error"}, params={"page": "1"})
     with pytest.raises(GitHubError):
         client.repository_catalog()
+
+
+def test_a_page_that_fails_once_is_asked_for_again(github: FakeGitHub, rsa_private_key_pem):
+    """Several pages are requested at the same time; if GitHub turns one of them
+    away, that is no reason to show an incomplete list."""
+    names = add_many(github, 450)
+    github.fail_next(
+        "GET", r"^/installation/repositories$", 403, {"message": "You have exceeded a secondary rate limit."}, params={"page": "3"}
+    )
+    catalog = github.client(app_id="123456", app_private_key=rsa_private_key_pem).repository_catalog()
+    listed = {repo["full_name"] for repo in catalog["repositories"]}
+    assert set(names) <= listed and len(listed) == 451
+    assert catalog["truncated"] is False and catalog["error"] is None
+
+
+def test_later_pages_are_requested_once_each_whatever_says_how_many_there_are(github: FakeGitHub, rsa_private_key_pem):
+    names = add_many(github, 420)
+    # A GitHub App listing reports total_count; a token listing only has the Link header.
+    as_app = github.client(app_id="123456", app_private_key=rsa_private_key_pem).repository_catalog()
+    assert len(as_app["repositories"]) == 421
+    assert pages_asked(github, "/installation/repositories") == [1, 1, 2, 3, 4, 5]  # busy: five pages, acme: one
+    as_token = github.client(token=FakeGitHub.PAT).repository_catalog()
+    assert len(as_token["repositories"]) == 421 and as_token["truncated"] is False
+    assert pages_asked(github, "/user/repos") == [1, 2, 3, 4, 5]
+    assert {repo["full_name"] for repo in as_token["repositories"]} == set(names) | {"acme/demo"}
+
+
+def test_listing_without_a_page_count_reads_page_by_page(github: FakeGitHub):
+    """No total and no Link header (some GitHub Enterprise proxies drop it):
+    pages are read one after the other until a short one arrives."""
+    github.send_link_header = False
+    add_many(github, 230)
+    client = github.client(token=FakeGitHub.PAT)
+    catalog = client.repository_catalog()
+    assert len(catalog["repositories"]) == 231 and catalog["truncated"] is False and catalog["error"] is None
+    assert pages_asked(github, "/user/repos") == [1, 2, 3]
+
+    # A failing page ends the listing there, with what was read so far.
+    github.queries.clear()
+    github.fail_next("GET", r"^/user/repos$", 502, {"message": "Server Error"}, params={"page": "2"})
+    partial = client.repository_catalog()
+    assert len(partial["repositories"]) == 100 and partial["truncated"] is True and "HTTP 502" in partial["error"]
+    assert pages_asked(github, "/user/repos") == [1, 2]
+
+    # Exactly as many repositories as the limit, all pages full: more cannot be ruled out.
+    github.failures.clear()
+    capped = client.repository_catalog(limit=200)
+    assert len(capped["repositories"]) == 200 and capped["truncated"] is True
+    assert client.repository_catalog(limit=100)["truncated"] is True
+    assert client.repository_catalog(limit=300)["truncated"] is False
+
+
+def test_listing_never_asks_for_more_pages_than_the_limit_needs(github: FakeGitHub):
+    add_many(github, 640)
+    catalog = github.client(token=FakeGitHub.PAT).repository_catalog(limit=250)
+    assert len(catalog["repositories"]) == 250 and catalog["truncated"] is True
+    assert pages_asked(github, "/user/repos") == [1, 2, 3]
 
 
 # --------------------------------------------------------------------------- #

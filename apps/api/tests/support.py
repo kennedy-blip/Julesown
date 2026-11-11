@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import unquote
@@ -217,6 +218,10 @@ class FakeGitHub:
         self.payloads: List[Tuple[str, str, Dict[str, Any]]] = []
         self.pauses: List[float] = []
         self.lost_answers: List[Tuple[str, "re.Pattern[str]", int]] = []
+        # GitHub names the last page of a list in a Link header. False: a server that does not.
+        self.send_link_header = True
+        self.queries: List[Tuple[str, str, Dict[str, str]]] = []  # every request with its query
+        self._serial = threading.RLock()
         self.transport = httpx.MockTransport(self._handle)
 
     # -- configuration ---------------------------------------------------
@@ -324,9 +329,19 @@ class FakeGitHub:
             files, repo["lazy_files"] = repo["lazy_files"], None
             self.remote.create(repo["full_name"], files, branch=repo["default_branch"])
 
-    def fail_next(self, method: str, path_pattern: str, status: int, body: Dict[str, Any], *, times: int = 1) -> None:
-        """Answer the next ``times`` matching requests with ``status`` and ``body``."""
-        self.failures.append([method.upper(), re.compile(path_pattern), status, body, times])
+    def fail_next(
+        self,
+        method: str,
+        path_pattern: str,
+        status: int,
+        body: Dict[str, Any],
+        *,
+        times: int = 1,
+        params: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Answer the next ``times`` matching requests with ``status`` and ``body``.
+        ``params`` narrows the match to requests with these query parameters."""
+        self.failures.append([method.upper(), re.compile(path_pattern), status, body, times, params or {}])
 
     def client(self, settings: Optional[Settings] = None, **overrides: Any) -> GitHubClient:
         options: Dict[str, Any] = {"transport": self.transport}
@@ -369,14 +384,40 @@ class FakeGitHub:
         }
 
     @staticmethod
-    def _page(request: httpx.Request, items: List[Any]) -> List[Any]:
-        """One page of a list, the way GitHub cuts it (30 per page unless asked, 100 at most)."""
+    def _page_numbers(request: httpx.Request) -> Tuple[int, int]:
         try:
             per_page = max(1, min(100, int(request.url.params.get("per_page", "30"))))
             page = max(1, int(request.url.params.get("page", "1")))
         except ValueError:
             per_page, page = 30, 1
+        return per_page, page
+
+    @classmethod
+    def _page(cls, request: httpx.Request, items: List[Any]) -> List[Any]:
+        """One page of a list, the way GitHub cuts it (30 per page unless asked, 100 at most)."""
+        per_page, page = cls._page_numbers(request)
         return items[(page - 1) * per_page : page * per_page]
+
+    def _paged(self, request: httpx.Request, items: List[Any], key: Optional[str] = None) -> httpx.Response:
+        """A page of ``items`` with the ``Link`` header GitHub sends along with
+        a list that has more than one page (``key``: the list is wrapped in an
+        object that also carries ``total_count``)."""
+        chunk = self._page(request, items)
+        response = self._json(200, {"total_count": len(items), key: chunk} if key else chunk)
+        per_page, page = self._page_numbers(request)
+        last = max(1, -(-len(items) // per_page))
+        if self.send_link_header and last > 1:
+
+            def url(number: int) -> str:
+                return str(request.url.copy_set_param("page", str(number)))
+
+            links = []
+            if page < last:
+                links += [f'<{url(page + 1)}>; rel="next"', f'<{url(last)}>; rel="last"']
+            if page > 1:
+                links += [f'<{url(page - 1)}>; rel="prev"', f'<{url(1)}>; rel="first"']
+            response.headers["link"] = ", ".join(links)
+        return response
 
     def _empty_conflict(self) -> httpx.Response:
         return self._json(409, {"message": "Git Repository is empty.", "status": "409"})
@@ -411,6 +452,13 @@ class FakeGitHub:
         self.lost_answers.append((method.upper(), re.compile(path_pattern), status))
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
+        # The client may ask for several pages at once; this stand-in answers
+        # one request at a time.
+        with self._serial:
+            self.queries.append((request.method.upper(), unquote(request.url.path), dict(request.url.params)))
+            return self._handle_one(request)
+
+    def _handle_one(self, request: httpx.Request) -> httpx.Response:
         method = request.method.upper()
         path = unquote(request.url.path)
         for index, (verb, pattern, status) in enumerate(self.lost_answers):
@@ -426,8 +474,12 @@ class FakeGitHub:
         self.requests.append((method, path))
 
         for index, failure in enumerate(self.failures):
-            verb, pattern, status, body, _times = failure
-            if verb == method and pattern.search(path):
+            verb, pattern, status, body, _times, wanted = failure
+            if (
+                verb == method
+                and pattern.search(path)
+                and all(request.url.params.get(name) == value for name, value in wanted.items())
+            ):
                 failure[4] -= 1
                 if failure[4] <= 0:
                     del self.failures[index]
@@ -477,7 +529,7 @@ class FakeGitHub:
                         "suspended_at": "2026-01-01T00:00:00Z" if meta["suspended"] else None,
                     }
                 )
-            return self._json(200, self._page(request, listed))
+            return self._paged(request, listed)
         match = re.fullmatch(r"/app/installations/(\d+)/access_tokens", path)
         if match and method == "POST":
             if kind != "jwt":
@@ -505,14 +557,12 @@ class FakeGitHub:
                 if self.installed.get(key) == token_info["installation_id"]
                 and (allowed is None or repo["full_name"].split("/", 1)[1] in allowed)
             ]
-            return self._json(
-                200, {"total_count": len(visible), "repositories": self._page(request, visible)}
-            )
+            return self._paged(request, visible, key="repositories")
         if path == "/user/repos" and method == "GET":
             listed = [self._repo_json(repo) for repo in self.repos.values()]
             if request.url.params.get("sort") == "pushed":
                 listed.sort(key=lambda repo: repo["pushed_at"] or "", reverse=True)
-            return self._json(200, self._page(request, listed))
+            return self._paged(request, listed)
 
         # ----- repository endpoints ------------------------------------
         match = re.match(r"^/repos/([^/]+)/([^/]+)(/.*)?$", path)

@@ -17,6 +17,7 @@ import json
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -40,6 +41,10 @@ PAGE_SIZE = 100
 MAX_LISTED_REPOSITORIES = 2000
 MAX_LISTED_INSTALLATIONS = 300
 _DESCRIPTION_CHARS = 140
+# Pages of a list that are requested at the same time once the first page has
+# said how many there are. A page of 100 repositories takes most of a second.
+LIST_CONCURRENCY = 4
+_LAST_PAGE_RE = re.compile(r'<[^<>]*[?&]page=(\d+)[^<>]*>\s*;\s*rel="last"')
 
 # Committing: text files travel inside the tree request (GitHub writes the blobs
 # itself), so a change of fifty files is one request instead of fifty. Larger and
@@ -739,44 +744,108 @@ class GitHubClient:
     ) -> Tuple[List[Any], Optional[int], bool, Optional[GitHubError]]:
         """Every page of a list endpoint, up to ``limit`` items.
 
+        The first page says how many pages there are (GitHub's own count, or
+        the ``Link`` header). The others are then requested a few at a time
+        instead of one after the other, so that a long list takes the time of
+        two or three requests rather than of all of them. Without that
+        information the pages are read one by one until a short one arrives.
+
         Returns ``(items, total, more, error)``: ``total`` is GitHub's own count
         when the endpoint reports one, ``more`` says that items were left out,
-        and ``error`` is what stopped the listing after its first page (the
-        pages read until then are returned; a failing first page raises).
+        and ``error`` is what kept a page after the first from being read (the
+        pages that could be read are returned; a failing first page raises).
         """
-        items: List[Any] = []
-        total: Optional[int] = None
-        page = 1
-        batch: List[Any] = []
-        while len(items) < limit:
+
+        def fetch(page: int) -> Tuple[List[Any], Optional[int], Optional[int]]:
+            """One page: its items, GitHub's total count and the number of the last page."""
+            response = self._send(
+                "GET",
+                path,
+                bearer=bearer,
+                action=action,
+                params={**(params or {}), "per_page": PAGE_SIZE, "page": page},
+            )
+            if response.status_code != 200:
+                raise self._error(response, action)
             try:
-                data = self._json(
-                    "GET",
-                    path,
-                    bearer=bearer,
-                    action=action,
-                    params={**(params or {}), "per_page": PAGE_SIZE, "page": page},
-                )
-            except GitHubError as exc:
-                if page == 1:
-                    raise
-                return items[:limit], total, True, exc
+                data = response.json()
+            except ValueError as exc:
+                raise GitHubError(
+                    f"GitHub returned an unreadable response while {action}.", code="github_error"
+                ) from exc
+            count: Optional[int] = None
             if items_key is not None:
                 raw = data.get(items_key) if isinstance(data, dict) else None
                 if isinstance(data, dict) and isinstance(data.get("total_count"), int):
-                    total = int(data["total_count"])
+                    count = int(data["total_count"])
             else:
                 raw = data
-            batch = raw if isinstance(raw, list) else []
-            items.extend(batch)
-            if len(batch) < PAGE_SIZE or (total is not None and len(items) >= total):
-                break
-            page += 1
+            last = _LAST_PAGE_RE.search(response.headers.get("link") or "")
+            return (raw if isinstance(raw, list) else []), count, (int(last.group(1)) if last else None)
+
+        max_pages = max(1, -(-limit // PAGE_SIZE))
+        items, total, last_page = fetch(1)
+        error: Optional[GitHubError] = None
+        pages: Optional[int] = None  # how many pages the list has, when known
         if total is not None:
+            pages = max(1, -(-total // PAGE_SIZE))
+        elif last_page is not None:
+            pages = last_page
+        # Read page by page and stopped by the limit after a full page: there may be more.
+        open_ended = len(items) == PAGE_SIZE and max_pages == 1 and pages is None
+
+        if len(items) == PAGE_SIZE and max_pages > 1:
+            if pages is not None:
+                wanted = list(range(2, min(pages, max_pages) + 1))
+                batches: Dict[int, List[Any]] = {}
+                failed: Dict[int, GitHubError] = {}
+
+                def attempt(page: int) -> None:
+                    try:
+                        batches[page] = fetch(page)[0]
+                        failed.pop(page, None)
+                    except GitHubError as exc:
+                        failed[page] = exc
+
+                if len(wanted) > 1:
+                    with ThreadPoolExecutor(max_workers=min(LIST_CONCURRENCY, len(wanted))) as pool:
+                        list(pool.map(attempt, wanted))
+                else:
+                    for page in wanted:
+                        attempt(page)
+                # A page refused while others were under way gets a second try on its own.
+                for page in sorted(failed):
+                    attempt(page)
+                for page in wanted:
+                    items.extend(batches.get(page, []))
+                if failed:
+                    error = failed[min(failed)]
+            else:
+                page = 2
+                while page <= max_pages:
+                    try:
+                        batch, count, _last = fetch(page)
+                    except GitHubError as exc:
+                        error = exc
+                        break
+                    if count is not None:
+                        total = count
+                    items.extend(batch)
+                    if len(batch) < PAGE_SIZE:
+                        break
+                    page += 1
+                else:
+                    open_ended = True
+
+        if error is not None:
+            more = True
+        elif total is not None:
             more = total > min(len(items), limit)
+        elif pages is not None:
+            more = pages > max_pages or len(items) > limit
         else:
-            more = len(items) > limit or (len(items) == limit and len(batch) == PAGE_SIZE)
-        return items[:limit], total, more, None
+            more = len(items) > limit or open_ended
+        return items[:limit], total, more, error
 
     @staticmethod
     def _repository_summary(repo: Dict[str, Any]) -> Dict[str, Any]:
