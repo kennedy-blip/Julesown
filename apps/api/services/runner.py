@@ -6,6 +6,12 @@
 Every step either really happens or the task fails with the reason. A task is
 only ever reported as having a pull request when GitHub returned the pull
 request that was just created.
+
+A repository without commits has no branch a pull request could be opened
+against. There the agent builds the project from scratch and the result becomes
+the repository's first commit on its default branch (outcome
+``initial_commit``). That is the only case in which a default branch is written
+to; in a repository that has commits the base branch is never touched.
 """
 from __future__ import annotations
 
@@ -21,7 +27,7 @@ from .github import GitHubClient, GitHubError, PullRequest, compare_url
 from .llm import ChatClient, LLMError, create_llm_client
 from .sandbox import ChangeSet, E2BWorkspace, RepoCheckout, SandboxError, Workspace
 from .store import TaskStore, branch_for_task
-from .verification import VerificationRun, is_docs_only
+from .verification import VerificationRun, has_no_code, is_docs_only
 
 logger = logging.getLogger("jules.runner")
 
@@ -111,6 +117,7 @@ def build_pr_body(
     base_branch: str,
     base_sha: str,
     llm_label: str,
+    new_project: bool = False,
 ) -> str:
     docs_only = is_docs_only(change.path for change in changeset.changes)
     lines: List[str] = ["## Summary", "", outcome.summary.strip() or "_The agent did not write a summary._", ""]
@@ -129,7 +136,9 @@ def build_pr_body(
     # What the change is based on: a reviewer can see at a glance whether the
     # agent looked at the code it describes or changes.
     lines.append("")
-    if outcome.files_read:
+    if new_project:
+        lines.append("The repository had no code yet: this pull request creates the project from scratch.")
+    elif outcome.files_read:
         shown = ", ".join(_code(path) for path in outcome.files_read[:20])
         more = len(outcome.files_read) - 20
         lines.append(f"Files the agent looked at: {shown}" + (f" and {more} more" if more > 0 else ""))
@@ -287,13 +296,44 @@ class TaskRunner:
                     "(contents and pull requests) or install the GitHub App on the repository."
                 )
             base_branch = task.get("branch") or repo.default_branch
-            if github.get_branch_sha(slug, base_branch) is None:
-                raise TaskFailed(
-                    f"Branch '{base_branch}' does not exist in {slug}. "
-                    f"The default branch is '{repo.default_branch}'."
+            try:
+                branch_exists = github.get_branch_sha(slug, base_branch) is not None
+                empty_repository = False
+            except GitHubError as exc:
+                if exc.code != "repo_empty":
+                    raise
+                branch_exists, empty_repository = False, True
+            head_branch: Optional[str]
+            if empty_repository:
+                # No commits, so no branch: the result becomes the first commit
+                # on the default branch instead of a pull request.
+                if base_branch != repo.default_branch:
+                    raise TaskFailed(
+                        f"{slug} is empty, so it has no branch '{base_branch}' to start from. Leave the "
+                        "base branch empty: the first commit is made on the default branch "
+                        f"'{repo.default_branch}'."
+                    )
+                head_branch = None
+                emit(
+                    "info",
+                    f"{slug} is empty: the agent builds the project from scratch and the result "
+                    f"becomes the first commit on {base_branch}",
                 )
-            head_branch = branch_for_task(task_id)
-            update(repository=slug, branch=base_branch, base_branch=base_branch, head_branch=head_branch)
+            else:
+                if not branch_exists:
+                    raise TaskFailed(
+                        f"Branch '{base_branch}' does not exist in {slug}. "
+                        f"The default branch is '{repo.default_branch}'."
+                    )
+                head_branch = branch_for_task(task_id)
+            update(
+                repository=slug,
+                repository_url=repo.html_url,
+                branch=base_branch,
+                base_branch=base_branch,
+                head_branch=head_branch,
+                empty_repository=empty_repository,
+            )
 
             # 3. Sandbox ------------------------------------------------------
             stage("sandbox", "Starting sandbox")
@@ -302,19 +342,39 @@ class TaskRunner:
             emit("info", f"Sandbox ready: {workspace.description}")
 
             # 4. Clone --------------------------------------------------------
-            stage("clone", f"Cloning {slug} ({base_branch})")
-            clone_token = github.clone_token(slug) if repo.private else None
-            redact.add(*github.secrets())
-            checkout = RepoCheckout.clone(
-                workspace,
-                clone_url=self.deps.clone_url_for(slug),
-                branch=base_branch,
-                token=clone_token,
-                timeout=max(20.0, min(120.0, deadline.remaining() - COMMIT_RESERVE_SECONDS)),
-            )
-            files, total_files = checkout.list_files(limit=200)
-            key_files = checkout.key_files()
-            emit("info", f"Cloned {slug}@{base_branch} at {checkout.base_sha[:10]} ({total_files} files)")
+            files: List[str] = []
+            total_files = 0
+            key_files: List[Any] = []
+            if empty_repository:
+                stage("clone", f"Setting up an empty work tree for {slug}")
+                checkout = RepoCheckout.init_empty(
+                    workspace, branch=base_branch, clone_url=self.deps.clone_url_for(slug)
+                )
+                emit("info", f"{slug} has no commits to clone: starting from an empty work tree on {base_branch}")
+            else:
+                stage("clone", f"Cloning {slug} ({base_branch})")
+                clone_token = github.clone_token(slug) if repo.private else None
+                redact.add(*github.secrets())
+                checkout = RepoCheckout.clone(
+                    workspace,
+                    clone_url=self.deps.clone_url_for(slug),
+                    branch=base_branch,
+                    token=clone_token,
+                    timeout=max(20.0, min(120.0, deadline.remaining() - COMMIT_RESERVE_SECONDS)),
+                )
+                files, total_files = checkout.list_files(limit=200)
+                key_files = checkout.key_files()
+                emit("info", f"Cloned {slug}@{base_branch} at {checkout.base_sha[:10]} ({total_files} files)")
+            # Nothing but a README, a licence or a .gitignore is not a project yet
+            # either: the task is to build one, not to change one.
+            new_project = empty_repository or has_no_code(files, total_files)
+            update(new_project=new_project)
+            if new_project and not empty_repository:
+                emit(
+                    "info",
+                    f"{slug} has no code yet (only {', '.join(files) or 'no files'}): "
+                    "the agent builds the project from scratch",
+                )
 
             # 5. Agent --------------------------------------------------------
             llm = self.deps.llm_factory(settings, lambda notice: emit("warn", notice))
@@ -329,6 +389,7 @@ class TaskRunner:
                 command_timeout=float(settings.command_timeout_seconds),
                 max_output_tokens=settings.max_output_tokens,
                 reserve_seconds=COMMIT_RESERVE_SECONDS,
+                new_project=new_project,
             )
             outcome = agent.run(
                 prompt=task["prompt"],
@@ -366,7 +427,9 @@ class TaskRunner:
                 )
                 emit(
                     "success",
-                    "Finished without changing any files, so no pull request was opened.",
+                    "Finished without creating any files, so nothing was pushed."
+                    if empty_repository
+                    else "Finished without changing any files, so no pull request was opened.",
                 )
                 return store.get(task_id) or task
             docs_only = is_docs_only(change.path for change in changeset.changes)
@@ -381,6 +444,21 @@ class TaskRunner:
             # 7. Commit + pull request ---------------------------------------
             title = outcome.pr_title or first_line(outcome.summary) or first_line(task["prompt"])
             title = redact(title) or "Changes by Jules"
+            if empty_repository:
+                self._push_first_commit(
+                    github=github,
+                    slug=slug,
+                    branch=base_branch,
+                    changeset=changeset,
+                    message=redact(build_commit_message(title, outcome, task_id)),
+                    tests_status=tests_status,
+                    docs_only=docs_only,
+                    stage=stage,
+                    update=update,
+                    emit=emit,
+                )
+                return store.get(task_id) or task
+            assert head_branch is not None
             commit = github.create_commit(
                 slug,
                 parent_sha=checkout.base_sha,
@@ -408,6 +486,7 @@ class TaskRunner:
                             base_branch=base_branch,
                             base_sha=checkout.base_sha,
                             llm_label=f"{llm.provider}/{llm.model}",
+                            new_project=new_project,
                         )
                     ),
                 )
@@ -465,6 +544,76 @@ class TaskRunner:
         return store.get(task_id) or task
 
     @staticmethod
+    def _push_first_commit(
+        *,
+        github: GitHubClient,
+        slug: str,
+        branch: str,
+        changeset: ChangeSet,
+        message: str,
+        tests_status: str,
+        docs_only: bool,
+        stage: Callable[[str, str], None],
+        update: Callable[..., None],
+        emit: Callable[[str, str], None],
+    ) -> None:
+        """Deliver the work to a repository that was empty: as its first commit."""
+        stage("push", f"Pushing the first commit to {branch}")
+        if not github.is_empty(slug, branch):
+            # Somebody committed while the agent worked. Their commit is not overwritten.
+            raise TaskFailed(
+                f"{slug} received its first commit while the task was running, so the result was not "
+                "pushed over it. Run the task again: it will now arrive as a pull request."
+            )
+        try:
+            commit = github.create_initial_commit(
+                slug,
+                branch=branch,
+                changes=changeset.changes,
+                message=message,
+                expected_tree_sha=changeset.tree_sha,
+            )
+        except GitHubError as exc:
+            if exc.code == "initial_commit_incomplete":
+                others = len(changeset.changes) - 1
+                raise TaskFailed(
+                    f"The first commit was created in {slug} with {exc.details.get('first_path')}, but "
+                    f"the other {others} file{'s' if others != 1 else ''} could not be pushed: "
+                    f"{exc.describe()} Run the task again - the repository is no longer empty, so the "
+                    "result will arrive as a pull request."
+                ) from exc
+            if exc.code == "repo_not_empty":
+                raise TaskFailed(
+                    f"{exc.message} Run the task again: it will now arrive as a pull request."
+                ) from exc
+            raise
+        commit_url = commit.get("html_url")
+        update(
+            status="completed",
+            stage="done",
+            outcome="initial_commit",
+            commit_sha=commit["sha"],
+            commit_url=commit_url if isinstance(commit_url, str) and commit_url.startswith("http") else None,
+            branch=commit["branch"],
+            base_branch=commit["branch"],
+            completed_at=time.time(),
+        )
+        count = len(changeset.changes)
+        emit(
+            "success",
+            f"First commit {commit['sha'][:10]} pushed to {commit['branch']} "
+            f"({count} file{'s' if count != 1 else ''})" + (f": {commit_url}" if commit_url else ""),
+        )
+        if tests_status == "failed":
+            emit(
+                "warn",
+                "The last test run failed, and the files were pushed anyway: an empty repository has "
+                "no pull request that could hold them back. Check the project before you rely on it.",
+            )
+        elif not docs_only and tests_status in ("no_tests", "not_run"):
+            emit("info", "The new project has no automated tests. Try it before you deploy it.")
+
+    @staticmethod
     def _log_outcome(record: Dict[str, Any], elapsed: float) -> None:
         """One line per task in the server log (on Vercel: the function log), so a
         run can be diagnosed there even when nobody was watching the dashboard.
@@ -472,7 +621,11 @@ class TaskRunner:
         try:
             completed = record.get("status") == "completed"
             if completed:
-                result = record.get("pr_url") or "no changes, no pull request"
+                result = (
+                    record.get("pr_url")
+                    or (record.get("outcome") == "initial_commit" and f"first commit {record.get('commit_sha')}")
+                    or "no changes, no pull request"
+                )
             else:
                 result = f"FAILED at stage '{record.get('stage')}': {record.get('error')}"
             logger.log(

@@ -19,6 +19,9 @@ from .github import FileChange
 
 DEFAULT_WORKDIR = "/home/user"
 GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat", "LC_ALL": "C.UTF-8"}
+# The tree without any entry. Git knows it without it being stored anywhere; it
+# is what a repository that has no commits yet is compared against.
+EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 # Untracked build/dependency output that must never end up in a pull request,
 # even when the target repository's own .gitignore forgets about it.
@@ -280,6 +283,15 @@ class RepoCheckout:
         self.directory = directory
         self.base_sha = ""
         self.base_tree_sha = ""
+        # True for a repository that had no commits: there is no base commit and
+        # everything in the work tree is new.
+        self.empty = False
+
+    @property
+    def diff_base(self) -> str:
+        """What the work tree is compared with: the cloned commit, or the empty
+        tree when the repository had none."""
+        return self.base_sha or EMPTY_TREE_SHA
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -332,10 +344,50 @@ class RepoCheckout:
         if not heads.ok or len(shas) != 2:
             raise SandboxError("The cloned repository has no commits to work from.")
         checkout.base_sha, checkout.base_tree_sha = shas[0], shas[1]
-
-        patterns = " ".join(shlex.quote(pattern) for pattern in JUNK_EXCLUDES)
-        checkout.git_shell(f"mkdir -p .git/info && printf '%s\\n' {patterns} >> .git/info/exclude")
+        checkout._exclude_junk()
         return checkout
+
+    @classmethod
+    def init_empty(
+        cls,
+        workspace: Workspace,
+        *,
+        branch: str,
+        clone_url: Optional[str] = None,
+        directory: Optional[str] = None,
+    ) -> "RepoCheckout":
+        """The work tree for a repository that has no commits yet.
+
+        There is nothing to clone, so the repository is created in place, on
+        the branch the first commit will be made on. Whatever is in the work
+        tree when the agent finishes becomes that first commit.
+        """
+        directory = directory or posixpath.join(workspace.workdir, "repo")
+        version = workspace.run("git --version", timeout=20.0, env=dict(GIT_ENV))
+        if not version.ok:
+            raise SandboxError(
+                "git is not available in the sandbox image. Use an E2B template that includes git."
+            )
+        quoted = shlex.quote(directory)
+        command = (
+            f"rm -rf {quoted} && mkdir -p {quoted} && cd {quoted} && git init --quiet . && "
+            f"git symbolic-ref HEAD {shlex.quote('refs/heads/' + branch)}"
+        )
+        if clone_url:
+            command += f" && git remote add origin {shlex.quote(clone_url)}"
+        result = workspace.run(command, env=dict(GIT_ENV), timeout=60.0)
+        if not result.ok:
+            detail = (result.stderr or result.stdout).strip()
+            raise SandboxError(f"Could not set up the empty repository: {detail[-600:] or 'no output'}")
+        checkout = cls(workspace, directory)
+        checkout.empty = True
+        checkout.base_tree_sha = EMPTY_TREE_SHA
+        checkout._exclude_junk()
+        return checkout
+
+    def _exclude_junk(self) -> None:
+        patterns = " ".join(shlex.quote(pattern) for pattern in JUNK_EXCLUDES)
+        self.git_shell(f"mkdir -p .git/info && printf '%s\\n' {patterns} >> .git/info/exclude")
 
     # ------------------------------------------------------------------ #
     def git(self, args: str, *, timeout: float = 60.0) -> CommandResult:
@@ -410,7 +462,7 @@ class RepoCheckout:
 
     def diff_stat(self) -> str:
         result = self.git_shell(
-            f"git add -A && git diff --cached --stat {shlex.quote(self.base_sha)} | tail -n 25"
+            f"git add -A && git diff --cached --stat {shlex.quote(self.diff_base)} | tail -n 25"
         )
         return result.stdout.strip() if result.ok else ""
 
@@ -420,8 +472,10 @@ class RepoCheckout:
 
         The comparison is against the commit that was cloned (not ``HEAD``), so
         the result is correct even if a command inside the sandbox committed.
+        For a repository that had no commits it is against the empty tree:
+        every file is an addition.
         """
-        base = shlex.quote(self.base_sha)
+        base = shlex.quote(self.diff_base)
         staged = self.git("add -A")
         if not staged.ok:
             raise SandboxError(f"git add failed: {staged.output()[-400:]}")
@@ -476,7 +530,7 @@ class RepoCheckout:
     def _attach_line_counts(self, changes: List[FileChange]) -> None:
         numstat = self.git_shell(
             "git diff --cached --numstat -z --no-renames "
-            f"{shlex.quote(self.base_sha)} | base64 | tr -d '\\n'"
+            f"{shlex.quote(self.diff_base)} | base64 | tr -d '\\n'"
         )
         if not numstat.ok:
             return

@@ -70,10 +70,25 @@ async def github_app_callback(request: Request):
 
 @router.get("/repos", dependencies=[Depends(require_access)])
 def list_repositories(deps: RunnerDeps = Depends(get_runner_deps)) -> Dict[str, Any]:
-    """Repositories the configured GitHub credentials can open pull requests on."""
+    """Every repository the configured GitHub credentials can work on.
+
+    All of them, most recently pushed first - not only the first page GitHub
+    returns. ``installations`` says, per account the GitHub App is installed
+    on, whether it covers all repositories or only selected ones, and where
+    that can be changed: a repository that is missing here is one the App has
+    not been given.
+    """
     settings = get_settings()
     mode = settings.github_auth_mode
-    result: Dict[str, Any] = {"auth_mode": mode, "repositories": [], "install_url": None, "error": None}
+    result: Dict[str, Any] = {
+        "auth_mode": mode,
+        "repositories": [],
+        "total": 0,
+        "truncated": False,
+        "installations": [],
+        "install_url": None,
+        "error": None,
+    }
     if mode == "none":
         result["error"] = "No GitHub credentials are configured."
         return result
@@ -81,7 +96,14 @@ def list_repositories(deps: RunnerDeps = Depends(get_runner_deps)) -> Dict[str, 
     try:
         if github.app_configured:
             result["install_url"] = github.app_install_url()
-        result["repositories"] = github.list_repositories()
+        catalog = github.repository_catalog()
+        result.update(
+            repositories=catalog["repositories"],
+            total=catalog["total"],
+            truncated=catalog["truncated"],
+            installations=catalog["installations"],
+            error=catalog["error"],
+        )
     except GitHubError as exc:
         result["error"] = exc.describe()
     finally:
@@ -102,6 +124,9 @@ def check_repository(
         "repository": repository,
         "default_branch": None,
         "private": None,
+        # True: the repository has no commits. A task then builds the project
+        # from scratch and its result becomes the first commit.
+        "empty": None,
         "auth_mode": settings.github_auth_mode,
         "code": None,
         "error": None,
@@ -127,12 +152,34 @@ def check_repository(
         )
         if info.archived:
             result.update(code="archived", error=f"{info.slug} is archived.")
-        elif info.can_push is False:
+            return result
+        if info.can_push is False:
             result.update(code="no_push_access", error=f"The configured token cannot push to {info.slug}.")
-        elif branch and github.get_branch_sha(info.slug, branch) is None:
+            return result
+        wanted = (branch or "").strip() or info.default_branch
+        try:
+            branch_exists = github.get_branch_sha(info.slug, wanted) is not None
+            result["empty"] = False
+        except GitHubError as exc:
+            if exc.code != "repo_empty":
+                raise
+            branch_exists = False
+            result["empty"] = True
+        if result["empty"]:
+            if wanted != info.default_branch:
+                result.update(
+                    code="branch_not_found",
+                    error=(
+                        f"{info.slug} is empty, so it has no branch '{wanted}'. Leave the base branch "
+                        f"empty: the first commit is made on '{info.default_branch}'."
+                    ),
+                )
+            else:
+                result["ok"] = True
+        elif not branch_exists:
             result.update(
                 code="branch_not_found",
-                error=f"Branch '{branch}' does not exist. The default branch is '{info.default_branch}'.",
+                error=f"Branch '{wanted}' does not exist. The default branch is '{info.default_branch}'.",
             )
         else:
             result["ok"] = True

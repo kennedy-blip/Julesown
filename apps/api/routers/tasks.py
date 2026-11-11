@@ -95,12 +95,17 @@ class TaskResponse(BaseModel):
     stage: Optional[str] = None
     logs: List[str] = []
     log_entries: List[LogEntry] = []
-    outcome: Optional[str] = None  # pull_request | no_changes
+    # pull_request | no_changes | initial_commit (the first commit of a repository that was empty)
+    outcome: Optional[str] = None
     pr_url: Optional[str] = None
     pr_number: Optional[int] = None
     head_branch: Optional[str] = None
     base_branch: Optional[str] = None
     commit_sha: Optional[str] = None
+    commit_url: Optional[str] = None  # the commit on GitHub, when the result was committed directly
+    repository_url: Optional[str] = None
+    empty_repository: Optional[bool] = None  # the repository had no commits when the task started
+    new_project: Optional[bool] = None  # it had no code: the agent built a project from scratch
     changed_files: List[Dict[str, Any]] = []
     docs_only: Optional[bool] = None  # the change only touches documentation files
     files_read: List[str] = []  # repository files the agent looked at
@@ -318,10 +323,50 @@ def _find_pull_request(task_id: str, repository: str, deps: RunnerDeps) -> "tupl
         github.close()
 
 
+def _find_first_commit(task_id: str, slug: str, deps: RunnerDeps) -> Optional[Dict[str, Any]]:
+    """The commit a task made directly to a repository that was empty, if any."""
+    settings = get_settings()
+    if settings.github_auth_mode == "none":
+        return None
+    github = deps.github_factory(settings)
+    try:
+        return github.find_task_commit(slug, task_id)
+    finally:
+        github.close()
+
+
+def _recovered_first_commit(task_id: str, slug: str, commit: Dict[str, Any]) -> Dict[str, Any]:
+    message = f"Recovered from GitHub: first commit {str(commit['sha'])[:10]}"
+    now = time.time()
+    return {
+        "task_id": task_id,
+        "repository": slug,
+        "branch": "",
+        "prompt": "",
+        "status": "completed",
+        "stage": "done",
+        "logs": [message],
+        "log_entries": [{"ts": now, "level": "success", "message": message}],
+        "outcome": "initial_commit",
+        "commit_sha": commit["sha"],
+        "commit_url": commit.get("html_url"),
+        "repository_url": f"https://github.com/{slug}",
+        "empty_repository": True,
+        "new_project": True,
+        "summary": commit.get("title") or None,
+        "recovered": True,
+        "created_at": now,
+        "completed_at": now,
+    }
+
+
 def _recover_from_github(task_id: str, repository: str, deps: RunnerDeps) -> Optional[Dict[str, Any]]:
     slug, pull_request = _find_pull_request(task_id, repository, deps)
     if pull_request is None:
-        return None
+        # No pull request: the task may have made the first commit of a
+        # repository that was empty.
+        commit = _find_first_commit(task_id, slug, deps)
+        return _recovered_first_commit(task_id, slug, commit) if commit else None
     state = _pull_request_state(pull_request)
     message = f"Recovered from GitHub: pull request #{pull_request.number} ({state})"
     now = time.time()
@@ -384,7 +429,7 @@ def get_task_status(
             "message": (
                 "This task is not known to the server instance that answered"
                 + (
-                    ", and no pull request from it exists on GitHub."
+                    ", and no pull request or commit from it exists on GitHub."
                     if repository
                     else ". Pass ?repository=owner/name to look for its pull request on GitHub."
                 )

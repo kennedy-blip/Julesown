@@ -5,6 +5,11 @@ clone of your GitHub repository inside an [E2B](https://e2b.dev) sandbox, runs t
 opens a **real pull request** with the result. A Next.js dashboard and a Python FastAPI backend are
 deployed together on [Vercel](https://vercel.com/) from this one repository.
 
+The dashboard lists **every repository** the configured GitHub credentials can work on, with a
+search box. A repository that is still **empty** works too: the agent builds the project from your
+description and pushes it as the repository's first commit, laid out so that it can be deployed on
+Vercel or another host afterwards.
+
 ---
 
 ## 🔁 What happens when you run a task
@@ -27,10 +32,14 @@ configuration check → GitHub access → E2B sandbox → git clone → agent lo
 6. **Pull request** – a pull request is opened from that branch. Its description contains the agent's
    summary, the changed files, the files the agent looked at and the real test results.
 
+An **empty repository** takes a different last step – see
+[Empty repositories and new projects](#-empty-repositories-and-new-projects).
+
 Nothing in this pipeline is simulated:
 
 - A pull request link is shown only when it is the URL GitHub returned for the pull request that was
-  just created. There are no placeholder or guessed links.
+  just created. There are no placeholder or guessed links. The same holds for the link to a first
+  commit.
 - If any step fails, the task is reported as **failed** with the reason (missing key, App not
   installed, rate limit, time budget…). If the agent changes nothing, the task finishes with
   **no changes** and no pull request.
@@ -63,6 +72,74 @@ shows you what it looked at:
 
 ---
 
+## 📚 Choosing a repository
+
+The **Repositories** panel shows all repositories the server's GitHub credentials can work on – every
+page GitHub returns, not just the first hundred – most recently pushed first. Archived repositories
+are listed and marked (they are read-only, so no task can run on them).
+
+- **Search** matches the name, the owner, the description and the language; several words must all
+  match. Names that start with what you typed come first, and a few letters in the right order
+  (`tsktr` for `Task-tracker`) are enough when nothing matches literally. Pasting a GitHub URL finds
+  its repository. `↑` `↓` move through the matches, `Enter` chooses, `Esc` clears.
+- **Not listed?** With a GitHub App the panel says, per account, whether the App covers *all
+  repositories* or only *selected* ones and links to the GitHub page where repositories are added.
+  You can also type `owner/name` and use it directly: the form then checks that repository and says
+  what is missing.
+- The list is read from GitHub when the dashboard opens; the reload button reads it again (for
+  example after you created a repository or changed the App's selection).
+
+---
+
+## 🌱 Empty repositories and new projects
+
+A repository without any commit has no branch, so there is nothing a pull request could be opened
+against. A task on such a repository builds the project **from your prompt** and its result becomes
+the repository's **first commit on its default branch**:
+
+```text
+configuration check → GitHub access → E2B sandbox → empty work tree → agent → first commit
+```
+
+- The dashboard tells you before you start: *"owner/name is empty. Jules will build the project from
+  your instructions and commit it to main as the first commit."* The result shows the commit GitHub
+  created (**First commit pushed**, history badge `PUSHED`).
+- This is the only case in which a default branch is written to. A repository that has commits always
+  gets a pull request, and if somebody pushes to the repository while the task is running, the task
+  fails instead of committing on top of their work. Nothing is ever force-pushed.
+- GitHub's Git Data API answers `409 Git Repository is empty` for such a repository, so the first
+  file is written with the Contents API (GitHub's documented way in) and the rest follows in a second
+  commit. The history therefore starts with `Initial commit` (the README) followed by the commit
+  that adds the project. The committed tree is compared with the sandbox's, exactly as for a pull
+  request.
+- From the next task on it is an ordinary repository: changes arrive as pull requests.
+
+**What the agent is asked to build.** In a repository without code – empty, or holding only what
+GitHub adds when a repository is created (README, licence, `.gitignore`) – the agent works from
+different instructions: build what the prompt asks for, complete rather than broad, in the layout the
+chosen stack expects so that a hosting platform (Vercel, Netlify, Render, GitHub Pages …) can deploy
+it without extra configuration:
+
+- a static site has `index.html` at the repository root; a Node project a `package.json` with the
+  scripts platforms run and only the dependencies it uses; a Python app a `requirements.txt`;
+- configuration comes from environment variables (the port from `PORT`), documented in
+  `.env.example`; no secrets, no hard-coded localhost addresses;
+- a `README.md` (what it is, how to run it, how to deploy it) and a `.gitignore` for the stack.
+
+Before the result is committed the platform checks what it can check for certain, and sends the
+agent back **once** if something is missing: no README, dependencies without a `.gitignore`, a
+`package.json` that is not valid JSON, a `.env` file that would be committed. Whether the project
+*works* is not something the platform can know; the result panel says which checks the agent ran.
+
+A repository that only has a README gets the same instructions, and – because it has commits – the
+result as a pull request.
+
+**Size.** A new project has to fit into one run (see [Limits](#️-limits-worth-knowing)). The agent is
+told how much time it has, and when the time is nearly used up it is asked once to wrap up, so that a
+run ends with a result that says what is missing rather than with a timeout that loses everything.
+
+---
+
 ## 🏗 Architecture
 
 ```text
@@ -73,8 +150,8 @@ shows you what it looked at:
 │   │   │   ├── page.tsx            # Dashboard: task form, live log, result
 │   │   │   ├── layout.tsx          # Root layout with the backend status badge
 │   │   │   └── not-found.tsx       # 404 page; forwards stray GitHub App redirects to the dashboard
-│   │   ├── components/             # TaskForm, LiveTerminal, PRStatusTracker, StageProgress, …
-│   │   └── lib/                    # API client (NDJSON stream), health store, session history, result wording
+│   │   ├── components/             # RepositoryPicker, TaskForm, LiveTerminal, PRStatusTracker, StageProgress, …
+│   │   └── lib/                    # API client (NDJSON stream), repository search, health store, session history, result wording
 │   └── api/                        # Python FastAPI backend (Vercel Python function)
 │       ├── main.py                 # App entrypoint
 │       ├── config.py               # Environment-driven settings and model defaults
@@ -85,12 +162,12 @@ shows you what it looked at:
 │       │   ├── webhooks.py         # GitHub webhook: `/jules` commands on issues
 │       │   └── health.py           # Liveness and configuration diagnostics
 │       ├── services/
-│       │   ├── runner.py           # The pipeline above, end to end
-│       │   ├── agent.py            # Tool-calling loop and tools
+│       │   ├── runner.py           # The pipeline above, end to end (pull request or first commit)
+│       │   ├── agent.py            # Tool-calling loop and tools; instructions for existing and for new projects
 │       │   ├── llm.py              # Groq / OpenAI / Anthropic clients
 │       │   ├── verification.py     # What a test command's result means; documentation-only changes
 │       │   ├── sandbox.py          # E2B sandbox adapter, clone and change collection
-│       │   ├── github.py           # GitHub App + token auth, commits, branches, pull requests
+│       │   ├── github.py           # GitHub App + token auth, repository listing, commits, branches, pull requests
 │       │   └── store.py            # In-memory task records
 │       ├── tests/                  # Test-suite (runs the whole pipeline offline)
 │       └── requirements.txt
@@ -155,7 +232,10 @@ With neither set, tasks are **locked** on Vercel / `ENVIRONMENT=production` and 
 2. Generate a private key and set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` (paste the whole PEM;
    literal `\n` sequences and base64 are accepted too).
 3. **Install the App on the repositories** Jules should work on. A task on a repository without the
-   installation fails with a link to install it. The dashboard lists the repositories it can access.
+   installation fails with a link to install it. When installing, GitHub asks for *All repositories*
+   or *Only select repositories*: with the second choice, a repository that was not selected does not
+   appear in the dashboard until it is added (*Settings → Applications → Configure*). The dashboard
+   says which of the two applies and links to that page.
 4. URLs, if you want GitHub to send people back to the dashboard after installing:
    - **Setup URL**: `https://<your-domain>/api/v1/github/setup`
    - **Callback URL**: `https://<your-domain>/api/v1/github/callback`
@@ -211,8 +291,8 @@ and every task leaves one summary line in the function logs (Vercel → your dep
 | `POST /api/v1/tasks` | Run a task in the background; poll `GET /api/v1/tasks/{id}`. |
 | `GET /api/v1/tasks/{id}?repository=owner/name` | Task status. When the answering server instance does not know the task, its pull request is looked up on GitHub. |
 | `GET /api/v1/tasks/{id}/pull-request?repository=owner/name` | The task's pull request as it is on GitHub right now: `open`, `merged` or `closed`. The dashboard uses it to keep the history up to date. |
-| `GET /api/v1/github/repos` | Repositories the configured credentials can open pull requests on. |
-| `GET /api/v1/github/check?repository=…&branch=…` | Check, without running anything, that a task could act on a repository. |
+| `GET /api/v1/github/repos` | Every repository the configured credentials can work on (all pages, up to 2,000), most recently pushed first, with `total`, `truncated` and, for a GitHub App, `installations` (account, `repository_selection`: `all` or `selected`, and where to change it). |
+| `GET /api/v1/github/check?repository=…&branch=…` | Check, without running anything, that a task could act on a repository. `empty: true` means it has no commits and a task will create its first commit. |
 | `GET /api/v1/health`, `GET /api/v1/health/env` | Liveness and configuration diagnostics. |
 | `POST /api/v1/webhooks/github` | GitHub webhook receiver. |
 
@@ -228,13 +308,19 @@ Fields of a task record that describe how far the result can be trusted:
 | `verification[]` | Every `run_tests` call: `command`, `exit_code`, `duration`, `outcome` (`passed`, `failed`, `timed_out`, `no_tests`) and, for `no_tests`, a `note` with the reason. |
 | `docs_only` | `true` when the change only touches documentation files. |
 | `files_read` | Repository files whose content the agent saw before it finished. |
+| `outcome` | `pull_request`, `no_changes`, or `initial_commit` (the repository was empty: `commit_sha` and `commit_url` name its first commit and there is no pull request). |
+| `empty_repository`, `new_project` | The repository had no commits / no code when the task started. |
 
 ---
 
 ## ⚠️ Limits worth knowing
 
 - **Scope of a task.** The time budget suits focused changes ("fix this failing test", "add input
-  validation to X"), not large refactorings.
+  validation to X"), not large refactorings. A project built from scratch has to be small for the
+  same reason: on a rate-limited model a run produces a handful of files, not an application with
+  dozens. Ask for a first version and extend it with follow-up tasks.
+- **Workflow files.** GitHub refuses files under `.github/workflows` from a GitHub App without the
+  *Workflows* permission, which fails the commit. The agent does not add CI workflows unless asked.
 - **Review before you merge.** The agent's summary and any documentation it writes are the model's
   words. The platform reports what it can observe (files read, commands run, test results); it does
   not verify that a description is accurate.
@@ -251,7 +337,7 @@ Fields of a task record that describe how far the result can be trusted:
   dependencies; the agent installs what the tests need, which costs time. Use `E2B_TEMPLATE` for a
   prepared image.
 - **Task history** is kept in the server's memory and in your browser. It is not a database; the
-  durable record of a task is its pull request. Whether a pull request has been merged or closed
+  durable record of a task is its pull request (or first commit). Whether a pull request has been merged or closed
   since is read from GitHub when the dashboard loads and when you return to its tab.
 - **Change size.** A task may change up to 300 files / 4 MB (1 MB per file). Dependency and build
   directories (`node_modules`, `.venv`, `__pycache__`, …) are never committed.

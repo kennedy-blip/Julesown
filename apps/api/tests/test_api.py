@@ -816,7 +816,15 @@ def test_repository_listing(client: TestClient, app_env, install_deps, github: F
 def test_repository_listing_without_credentials(client: TestClient, install_deps):
     install_deps(fix_add_script())
     body = client.get("/api/v1/github/repos").json()
-    assert body == {"auth_mode": "none", "repositories": [], "install_url": None, "error": "No GitHub credentials are configured."}
+    assert body == {
+        "auth_mode": "none",
+        "repositories": [],
+        "total": 0,
+        "truncated": False,
+        "installations": [],
+        "install_url": None,
+        "error": "No GitHub credentials are configured.",
+    }
 
 
 def test_repository_check(client: TestClient, token_env, install_deps, github: FakeGitHub):
