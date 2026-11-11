@@ -21,6 +21,7 @@ from .github import GitHubClient, GitHubError, PullRequest, compare_url
 from .llm import ChatClient, LLMError, create_llm_client
 from .sandbox import ChangeSet, E2BWorkspace, RepoCheckout, SandboxError, Workspace
 from .store import TaskStore, branch_for_task
+from .verification import VerificationRun, is_docs_only
 
 logger = logging.getLogger("jules.runner")
 
@@ -90,10 +91,16 @@ def format_file_listing(files: List[str], total: int) -> str:
     return f"Repository files ({total} tracked{note}):\n" + "\n".join(shown)
 
 
-def _verification_result(run: Any) -> str:
+def _verification_result(run: VerificationRun) -> str:
     if run.timed_out:
-        return "timed out"
-    return "passed" if run.exit_code == 0 else f"failed (exit {run.exit_code})"
+        return "⏱️ timed out"
+    if run.no_tests:
+        return "➖ no tests to run"
+    return "✅ passed" if run.exit_code == 0 else f"❌ failed (exit {run.exit_code})"
+
+
+def _code(text: str) -> str:
+    return "`" + text.replace("`", "'").replace("\n", " ") + "`"
 
 
 def build_pr_body(
@@ -105,6 +112,7 @@ def build_pr_body(
     base_sha: str,
     llm_label: str,
 ) -> str:
+    docs_only = is_docs_only(change.path for change in changeset.changes)
     lines: List[str] = ["## Summary", "", outcome.summary.strip() or "_The agent did not write a summary._", ""]
     lines += ["## Task", ""]
     lines += [f"> {line}" for line in task["prompt"].strip().splitlines()[:40]]
@@ -118,14 +126,29 @@ def build_pr_body(
     if len(changeset.changes) > 60:
         lines.append(f"- ... and {len(changeset.changes) - 60} more files")
 
+    # What the change is based on: a reviewer can see at a glance whether the
+    # agent looked at the code it describes or changes.
+    lines.append("")
+    if outcome.files_read:
+        shown = ", ".join(_code(path) for path in outcome.files_read[:20])
+        more = len(outcome.files_read) - 20
+        lines.append(f"Files the agent looked at: {shown}" + (f" and {more} more" if more > 0 else ""))
+    else:
+        lines.append(
+            "⚠️ The agent did not open any file of the repository before making this change. "
+            "Check what it wrote against the code."
+        )
+
     lines += ["", "## Verification", ""]
-    if outcome.verification:
+    runs = outcome.verification
+    tested = [run for run in runs if not run.no_tests]
+    if runs:
         lines += ["| Command | Result |", "| --- | --- |"]
-        for run in outcome.verification[-10:]:
+        for run in runs[-10:]:
             command = run.command.replace("|", "\\|").replace("`", "'").replace("\n", " ")
-            icon = "✅" if run.passed else "❌"
-            lines.append(f"| `{clip(command, 160, tail_share=0.0)}` | {icon} {_verification_result(run)} |")
-        last = outcome.verification[-1]
+            lines.append(f"| `{clip(command, 160, tail_share=0.0)}` | {_verification_result(run)} |")
+    if tested:
+        last = tested[-1]
         if last.output_tail.strip():
             output = last.output_tail.replace("```", "'''")
             lines += [
@@ -140,6 +163,12 @@ def build_pr_body(
             ]
         if not last.passed:
             lines += ["", "> ⚠️ The last verification run did not pass. Review before merging."]
+    elif runs:
+        # Test commands were run, but there was nothing for them to test.
+        note = f"This repository has no automated tests to run ({runs[-1].no_tests}), so the change is untested."
+        lines += ["", note + (" It only touches documentation." if docs_only else " Review before merging.")]
+    elif docs_only:
+        lines.append("No tests were run: this pull request only changes documentation.")
     else:
         lines.append("⚠️ The agent did not run any tests for this change. Review before merging.")
 
@@ -284,6 +313,7 @@ class TaskRunner:
                 timeout=max(20.0, min(120.0, deadline.remaining() - COMMIT_RESERVE_SECONDS)),
             )
             files, total_files = checkout.list_files(limit=200)
+            key_files = checkout.key_files()
             emit("info", f"Cloned {slug}@{base_branch} at {checkout.base_sha[:10]} ({total_files} files)")
 
             # 5. Agent --------------------------------------------------------
@@ -305,6 +335,7 @@ class TaskRunner:
                 repository=slug,
                 branch=base_branch,
                 file_listing=format_file_listing(files, total_files),
+                key_files=key_files,
             )
             tests_status = outcome.tests_status
             update(
@@ -312,16 +343,8 @@ class TaskRunner:
                 summary=redact(outcome.summary) or None,
                 tests_status=tests_status,
                 tests_passed={"passed": True, "failed": False}.get(tests_status),
-                verification=[
-                    {
-                        "command": redact(run.command),
-                        "exit_code": run.exit_code,
-                        "passed": run.passed,
-                        "timed_out": run.timed_out,
-                        "duration": round(run.duration, 1),
-                    }
-                    for run in outcome.verification
-                ],
+                verification=[run.as_record(redact) for run in outcome.verification],
+                files_read=[redact(path) for path in outcome.files_read],
             )
             if not outcome.finished:
                 self._note_discarded_work(checkout, emit)
@@ -346,7 +369,8 @@ class TaskRunner:
                     "Finished without changing any files, so no pull request was opened.",
                 )
                 return store.get(task_id) or task
-            update(changed_files=[change.summary() for change in changeset.changes])
+            docs_only = is_docs_only(change.path for change in changeset.changes)
+            update(changed_files=[change.summary() for change in changeset.changes], docs_only=docs_only)
             emit(
                 "info",
                 f"{len(changeset.changes)} file(s) changed: "
@@ -405,6 +429,14 @@ class TaskRunner:
             emit("success", f"Pull request #{pull_request.number} opened: {pull_request.html_url}")
             if tests_status == "failed":
                 emit("warn", "The last test run failed - the pull request says so. Review before merging.")
+            elif docs_only:
+                pass  # prose only: there is nothing a test run could have told us
+            elif tests_status == "no_tests":
+                emit(
+                    "warn",
+                    "This repository has no automated tests, so the change is untested - "
+                    "the pull request says so. Review before merging.",
+                )
             elif tests_status == "not_run":
                 emit("warn", "The agent did not run tests - the pull request says so.")
         except TaskFailed as exc:

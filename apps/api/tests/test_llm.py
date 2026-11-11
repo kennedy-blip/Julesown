@@ -199,7 +199,6 @@ def test_unsupported_optional_parameter_is_dropped_and_retried():
         (401, {}, {"message": "Invalid API Key"}, "auth", None),
         (403, {}, {"message": "Organization restricted", "code": "organization_restricted"}, "auth", None),
         (503, {}, {"message": "The model is overloaded", "code": "model_overloaded"}, "server", None),
-        (400, {}, {"message": "Failed to call a function.", "code": "tool_use_failed"}, "tool_format", None),
         (503, {}, {"message": "Service unavailable"}, "server", None),
         (400, {}, {"message": "messages.2.content must be a string"}, "bad_request", None),
     ],
@@ -212,6 +211,125 @@ def test_error_classification(status, headers, error, kind, retry_after):
     assert caught.value.status_code == status
     assert caught.value.retry_after == retry_after
     assert error["message"] in caught.value.message
+
+
+# What Groq answered in production when openai/gpt-oss-120b addressed a "tool"
+# that is really a channel of its output format (2026-11-11).
+REFUSED_REPLY = {
+    "message": (
+        "Tool call validation failed: tool call validation failed: attempted to call tool "
+        "'commentary' which was not in request.tools"
+    ),
+    "type": "invalid_request_error",
+    "code": "tool_use_failed",
+    "failed_generation": '{"name": "commentary", "arguments": {"text": "The project has no tests."}}',
+}
+
+
+@pytest.mark.parametrize(
+    "status, error, rejected_tool, failed_generation, fragment",
+    [
+        (
+            400,
+            REFUSED_REPLY,
+            "commentary",
+            REFUSED_REPLY["failed_generation"],
+            "it tried to call a tool named 'commentary', which does not exist",
+        ),
+        # Arguments that do not fit the tool's schema: the same code, no made-up tool.
+        (
+            400,
+            {
+                "message": (
+                    "Tool call validation failed: tool call validation failed: parameters for tool "
+                    "write_file did not match schema: errors: [missing properties: 'content']"
+                ),
+                "code": "tool_use_failed",
+            },
+            None,
+            None,
+            "Tool call validation failed: parameters for tool write_file did not match schema",
+        ),
+        (400, {"message": "Failed to call a function.", "code": "tool_use_failed"}, None, None, "Failed to call a function"),
+        # Recognised without the code too: by the generation it reports, or by its wording.
+        (
+            400,
+            {"message": "Invalid tool call generated", "failed_generation": {"reason": "Tool call arguments are not valid JSON"}},
+            None,
+            '{"reason": "Tool call arguments are not valid JSON"}',
+            "Invalid tool call generated",
+        ),
+        (422, {"message": "Failed to parse tool call arguments as JSON"}, None, None, "Failed to parse tool call"),
+    ],
+)
+def test_refused_replies_are_told_apart_from_bad_requests(status, error, rejected_tool, failed_generation, fragment):
+    """The provider refused what the *model* wrote; the request itself was fine.
+    The agent needs to know which, and what the model wrote, to recover."""
+    recorder = Recorder(lambda request, body: httpx.Response(status, json={"error": error}))
+    with pytest.raises(LLMError) as caught:
+        groq_client(recorder).complete(MESSAGES, TOOLS, max_output_tokens=100, timeout=30)
+    problem = caught.value
+    assert problem.kind == "tool_format" and problem.status_code == status
+    assert problem.rejected_tool == rejected_tool
+    assert problem.failed_generation == failed_generation
+    assert problem.message.startswith("groq refused the model's reply because it was not a valid tool call (")
+    assert fragment in problem.message
+    assert "validation failed: tool call validation failed" not in problem.message  # no stutter
+    assert len(recorder.bodies) == 1  # the client does not retry on its own
+
+
+def test_refused_reply_changes_the_sampling_of_the_next_request():
+    """Groq's guidance for refused tool calls is to retry with a different
+    temperature: the same request, sampled the same way, tends to fail again."""
+    answers = [
+        httpx.Response(400, json={"error": REFUSED_REPLY}),
+        httpx.Response(400, json={"error": REFUSED_REPLY}),
+        None,
+        None,
+    ]
+
+    def handler(request: httpx.Request, body: Dict[str, Any]) -> httpx.Response:
+        return answers.pop(0) or httpx.Response(200, json=chat_completion(body["model"], content="ok"))
+
+    recorder = Recorder(handler)
+    client = groq_client(recorder, optional_params={"temperature": 0.2})
+    for expected in ("tool_format", "tool_format", None, None):
+        try:
+            client.complete(MESSAGES, TOOLS, max_output_tokens=100, timeout=30)
+            assert expected is None
+        except LLMError as exc:
+            assert exc.kind == expected
+    # 0.2, then +0.2 for every refusal in a row, and back to normal after a usable reply.
+    assert [body["temperature"] for body in recorder.bodies] == [0.2, 0.4, 0.6, 0.2]
+
+    # It never exceeds 1.0, and a client without a configured temperature sends none.
+    hot_recorder = Recorder(lambda request, body: httpx.Response(400, json={"error": REFUSED_REPLY}))
+    hot = groq_client(hot_recorder, optional_params={"temperature": 0.9})
+    for _ in range(3):
+        with pytest.raises(LLMError):
+            hot.complete(MESSAGES, TOOLS, max_output_tokens=100, timeout=30)
+    assert [body["temperature"] for body in hot_recorder.bodies] == [0.9, 1.0, 1.0]
+    plain_recorder = Recorder(lambda request, body: httpx.Response(400, json={"error": REFUSED_REPLY}))
+    plain = groq_client(plain_recorder)
+    for _ in range(2):
+        with pytest.raises(LLMError):
+            plain.complete(MESSAGES, TOOLS, max_output_tokens=100, timeout=30)
+    assert all("temperature" not in body for body in plain_recorder.bodies)
+
+
+def test_temperature_the_api_rejects_is_dropped():
+    def handler(request: httpx.Request, body: Dict[str, Any]) -> httpx.Response:
+        if "temperature" in body:
+            return httpx.Response(
+                400,
+                json={"error": {"message": "Unsupported value: 'temperature' does not support 0.2 with this model.", "type": "invalid_request_error"}},
+            )
+        return httpx.Response(200, json=chat_completion(body["model"], content="fine"))
+
+    recorder = Recorder(handler)
+    client = groq_client(recorder, optional_params={"temperature": 0.2, "reasoning_effort": "low"})
+    assert client.complete(MESSAGES, TOOLS, max_output_tokens=100, timeout=30).content == "fine"
+    assert "temperature" not in recorder.bodies[1] and recorder.bodies[1]["reasoning_effort"] == "low"
 
 
 def test_malformed_tool_arguments_are_reported_not_raised():
@@ -338,6 +456,39 @@ def test_provider_selection_and_defaults(monkeypatch):
     assert create_llm_client(get_settings()).model == "qwen/qwen3.8-27b"
     monkeypatch.setenv("JULES_LLM_PROVIDER", "anthropic")
     assert create_llm_client(get_settings()).provider == "anthropic"
+
+
+@pytest.mark.parametrize(
+    "configured, sent",
+    [
+        (None, 0.2),  # our default: Groq's own default of 1.0 invites malformed tool calls
+        ("0", 0.0),
+        ("0.7", 0.7),
+        ("5", 2.0),
+        ("default", None),  # leave it to the provider
+        ("warm", 0.2),  # not a number: fall back to the default
+        ("nan", 0.2),
+    ],
+)
+def test_groq_sampling_temperature(monkeypatch, configured, sent):
+    monkeypatch.setenv("GROQ_API_KEY", "gsk")
+    if configured is not None:
+        monkeypatch.setenv("GROQ_TEMPERATURE", configured)
+    recorder = Recorder(lambda request, body: httpx.Response(200, json=chat_completion(body["model"], content="ok")))
+    client = create_llm_client(get_settings(), transport=recorder.transport)
+    client.complete(MESSAGES, TOOLS, max_output_tokens=100, timeout=30)
+    assert recorder.bodies[0].get("temperature") == sent
+    assert recorder.bodies[0]["reasoning_effort"] == "low"
+
+
+def test_openai_requests_carry_no_temperature(monkeypatch):
+    """OpenAI's reasoning models only accept their default temperature."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai")
+    monkeypatch.setenv("GROQ_TEMPERATURE", "0.3")  # belongs to another provider
+    recorder = Recorder(lambda request, body: httpx.Response(200, json=chat_completion(body["model"], content="ok")))
+    client = create_llm_client(get_settings(), transport=recorder.transport)
+    client.complete(MESSAGES, TOOLS, max_output_tokens=100, timeout=30)
+    assert "temperature" not in recorder.bodies[0]
 
 
 def test_placeholder_values_from_env_example_count_as_unset(monkeypatch):

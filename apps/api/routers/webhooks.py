@@ -131,8 +131,11 @@ def build_result_comment(task: Dict[str, Any]) -> str:
         tests = {
             "passed": "Tests passed in the sandbox.",
             "failed": "⚠️ The last test run failed - see the pull request.",
+            "no_tests": "The repository has no automated tests, so the change is untested.",
             "not_run": "⚠️ No tests were run.",
         }.get(task.get("tests_status") or "", "")
+        if task.get("docs_only") and task.get("tests_status") in ("not_run", "no_tests"):
+            tests = "The change only touches documentation, so no tests were needed."
         body = f"✅ I opened #{task['pr_number']}: {task['pr_url']}"
         return "\n\n".join(part for part in (body, summary, tests) if part) + footer
     if task.get("status") == "completed":

@@ -48,6 +48,20 @@ _NON_CHAT_RE = re.compile(
     re.IGNORECASE,
 )
 _RETRY_IN_RE = re.compile(r"try again in\s+(?:(\d+)m)?\s*([0-9.]+)\s*(ms|s)", re.IGNORECASE)
+# Groq validates every generated tool call and answers HTTP 400 (code
+# ``tool_use_failed``) when the model's reply is not a usable call.
+_TOOL_FORMAT_RE = re.compile(
+    r"tool call validation failed|failed to call a function|failed to parse tool call|invalid tool call",
+    re.IGNORECASE,
+)
+_REJECTED_TOOL_RE = re.compile(r"attempted to call tool '([^']{1,80})'", re.IGNORECASE)
+_REPEATED_PREFIX_RE = re.compile(r"^(?P<prefix>[^:]{4,60}):\s*(?P=prefix):\s*", re.IGNORECASE)
+
+# Sampling temperature for tool calling. Providers default to 1.0, which makes
+# malformed tool calls and invented content more likely; Groq's tool-use guide
+# recommends starting low and changing it when a generated call is refused.
+TOOL_FORMAT_TEMPERATURE_STEP = 0.2
+MAX_TEMPERATURE = 1.0
 
 
 class LLMError(Exception):
@@ -55,6 +69,12 @@ class LLMError(Exception):
 
     kinds: ``rate_limit``, ``too_large``, ``auth``, ``model_unavailable``,
     ``tool_format``, ``server``, ``network``, ``bad_request``.
+
+    ``tool_format`` means the *model's reply* was unusable (the provider refused
+    a tool call that names a tool it was never offered, or whose arguments do
+    not fit the schema). Nothing was executed. ``rejected_tool`` is the name the
+    model made up, if that was the problem, and ``failed_generation`` is what the
+    model wrote, when the provider reports it.
     """
 
     def __init__(
@@ -64,12 +84,16 @@ class LLMError(Exception):
         kind: str = "bad_request",
         status_code: Optional[int] = None,
         retry_after: Optional[float] = None,
+        rejected_tool: Optional[str] = None,
+        failed_generation: Optional[str] = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.kind = kind
         self.status_code = status_code
         self.retry_after = retry_after
+        self.rejected_tool = rejected_tool
+        self.failed_generation = failed_generation
 
 
 @dataclass
@@ -255,6 +279,10 @@ class OpenAICompatibleClient(_HttpProvider):
         # Parameters that only some models accept (e.g. reasoning_effort). If the
         # API rejects one by name it is dropped and the request is repeated.
         self._optional = dict(optional_params or {})
+        # Replies in a row that the provider refused as invalid tool calls. Each
+        # one raises the sampling temperature of the next request a little, so a
+        # retry is not a re-run of the request that just failed.
+        self._refused_replies = 0
 
     @staticmethod
     def _wire_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -275,14 +303,28 @@ class OpenAICompatibleClient(_HttpProvider):
                 "max_completion_tokens": int(max_output_tokens),
                 **self._optional,
             }
+            temperature = self._optional.get("temperature")
+            if isinstance(temperature, (int, float)) and self._refused_replies:
+                payload["temperature"] = round(
+                    min(
+                        MAX_TEMPERATURE,
+                        float(temperature) + TOOL_FORMAT_TEMPERATURE_STEP * self._refused_replies,
+                    ),
+                    2,
+                )
             if tools:
                 payload["tools"] = tools
                 payload["tool_choice"] = "auto"
             response = self._post("/chat/completions", payload, timeout)
             if response.status_code == 200:
-                return self._parse(response)
+                parsed = self._parse(response)
+                self._refused_replies = 0
+                return parsed
 
             error = self._error(response)
+            if error.kind == "tool_format":
+                self._refused_replies += 1
+                raise error
             if response.status_code in (400, 422):
                 # An optional parameter this model does not accept: drop it and retry.
                 rejected = [name for name in self._optional if name in error.message]
@@ -303,14 +345,22 @@ class OpenAICompatibleClient(_HttpProvider):
         except ValueError:
             body = {}
         detail = body.get("error") if isinstance(body, dict) else None
+        failed_generation: Optional[str] = None
         if isinstance(detail, dict):
             message = str(detail.get("message") or "")
             code = str(detail.get("code") or "")
+            generated = detail.get("failed_generation")
+            if generated:
+                failed_generation = generated if isinstance(generated, str) else json.dumps(generated)
         else:
             message = str(detail or (response.text or "")[:300])
             code = ""
         text = f"{self.provider} returned HTTP {status}: {message or 'no details'}"
         lowered = message.lower()
+        refused_reply = code == "tool_use_failed" or (
+            status in (400, 422)
+            and (failed_generation is not None or _TOOL_FORMAT_RE.search(message) is not None)
+        )
         # The key works but this model cannot be used with it: retired, never
         # existed, blocked for the project, or its terms were not accepted
         # (codes such as model_not_found, model_decommissioned,
@@ -328,8 +378,21 @@ class OpenAICompatibleClient(_HttpProvider):
             kind = "too_large"
         elif status == 429:
             kind = "rate_limit"
-        elif code == "tool_use_failed":
-            kind = "tool_format"
+        elif refused_reply:
+            # The request was fine; the model's *reply* was not a usable tool call.
+            match = _REJECTED_TOOL_RE.search(message)
+            rejected_tool = match.group(1) if match else None
+            if rejected_tool:
+                reason = f"it tried to call a tool named '{rejected_tool}', which does not exist"
+            else:
+                reason = _REPEATED_PREFIX_RE.sub(r"\g<prefix>: ", message).strip().rstrip(".") or "no details"
+            return LLMError(
+                f"{self.provider} refused the model's reply because it was not a valid tool call ({reason}).",
+                kind="tool_format",
+                status_code=status,
+                rejected_tool=rejected_tool,
+                failed_generation=failed_generation,
+            )
         elif status == 404 or model_problem:
             kind = "model_unavailable"
         elif status >= 500:
@@ -597,6 +660,25 @@ class AnthropicClient(_HttpProvider):
 # --------------------------------------------------------------------------- #
 # Factory
 # --------------------------------------------------------------------------- #
+DEFAULT_GROQ_TEMPERATURE = 0.2
+
+
+def _temperature_setting(raw: Optional[str], default: Optional[float]) -> Optional[float]:
+    """A sampling temperature from the environment: a number between 0 and 2,
+    ``default`` to leave it to the provider, or unset for our own default."""
+    if raw is None:
+        return default
+    if raw.strip().lower() == "default":
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if value != value:  # NaN
+        return default
+    return max(0.0, min(2.0, value))
+
+
 def create_llm_client(
     settings: Settings,
     *,
@@ -611,6 +693,12 @@ def create_llm_client(
         effort = (env_str("GROQ_REASONING_EFFORT", "low") or "low").lower()
         if effort != "default":
             optional["reasoning_effort"] = effort
+        # Groq samples at temperature 1.0 unless told otherwise. A low value makes
+        # the open models it hosts far less likely to produce a malformed tool
+        # call or to make things up. "default" omits the parameter.
+        temperature = _temperature_setting(env_str("GROQ_TEMPERATURE"), DEFAULT_GROQ_TEMPERATURE)
+        if temperature is not None:
+            optional["temperature"] = temperature
         return OpenAICompatibleClient(
             provider="groq",
             base_url=settings.groq_base_url,

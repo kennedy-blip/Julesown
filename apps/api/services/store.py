@@ -75,6 +75,8 @@ class TaskStore:
             "base_branch": None,
             "commit_sha": None,
             "changed_files": [],
+            "docs_only": None,
+            "files_read": [],
             "verification": [],
             "tests_status": None,
             "tests_passed": None,

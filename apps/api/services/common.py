@@ -66,6 +66,16 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text or "")
 
 
+_MARKDOWN_BOLD_RE = re.compile(r"\*\*(?=\S)(.+?)(?<=\S)\*\*")
+_MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE)
+
+
+def plain_text(text: str) -> str:
+    """Model prose for a plain-text log: Markdown bold markers and heading
+    hashes are dropped, everything else (including `code`) is left alone."""
+    return _MARKDOWN_HEADING_RE.sub("", _MARKDOWN_BOLD_RE.sub(r"\1", text or ""))
+
+
 def clip(text: str, limit: int, *, tail_share: float = 0.7) -> str:
     """Shorten ``text`` to about ``limit`` characters, keeping the start and
     (mostly) the end - the end of command output is usually the useful part."""
