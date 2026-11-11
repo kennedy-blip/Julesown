@@ -29,14 +29,27 @@ class TaskStatusResponse(BaseModel):
 # In-memory storage for demonstration and fast serverless execution state
 TASKS_DB: Dict[str, Dict[str, Any]] = {}
 
+def clean_repo_slug(raw_repo: str) -> str:
+    """Extracts clean owner/repo slug from repository string or URL."""
+    slug = (
+        raw_repo.replace("https://github.com/", "")
+        .replace("http://github.com/", "")
+        .replace(".git", "")
+        .strip("/")
+    )
+    return slug or "owner/repo"
+
 def execute_agent_task(task_id: str, repo: str, branch: str, prompt: str):
     """Background task runner executing the autonomous agent loop."""
     task = TASKS_DB.get(task_id)
     if not task:
         return
 
+    clean_repo = clean_repo_slug(repo)
+    default_pr_url = f"https://github.com/{clean_repo}/pulls"
+
     task["status"] = "running"
-    task["logs"].append(f"[{time.strftime('%X')}] 🚀 Task initiated for {repo}:{branch}")
+    task["logs"].append(f"[{time.strftime('%X')}] 🚀 Task initiated for {clean_repo}:{branch}")
 
     def log_handler(msg: str):
         task["logs"].append(f"[{time.strftime('%X')}] {msg}")
@@ -51,7 +64,7 @@ def execute_agent_task(task_id: str, repo: str, branch: str, prompt: str):
             task["status"] = "completed"
             task["tests_passed"] = True
             pr_info = result.get("pr_result") or {}
-            task["pr_url"] = pr_info.get("pr_url") or "https://github.com/example/repo/pull/1"
+            task["pr_url"] = pr_info.get("pr_url") or default_pr_url
             task["logs"].append(f"[{time.strftime('%X')}] 🎉 PR created: {task['pr_url']}")
         else:
             task["status"] = "failed"

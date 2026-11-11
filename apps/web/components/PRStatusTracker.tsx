@@ -88,8 +88,8 @@ export function PRStatusTracker({ prUrl, status, testsPassed, taskPrompt }: PRSt
           </div>
         </div>
 
-        {prUrl && (
-          <div className="pt-2">
+        {prUrl ? (
+          <div className="pt-2 space-y-1.5">
             <a
               href={prUrl}
               target="_blank"
@@ -100,6 +100,13 @@ export function PRStatusTracker({ prUrl, status, testsPassed, taskPrompt }: PRSt
               <span>Review Pull Request on GitHub</span>
               <ExternalLink className="w-3.5 h-3.5 ml-1" />
             </a>
+            <div className="text-[11px] font-mono text-slate-400 text-center truncate px-2">
+              {prUrl}
+            </div>
+          </div>
+        ) : (
+          <div className="pt-2 text-center text-xs text-slate-500 italic">
+            Waiting for Pull Request generation...
           </div>
         )}
       </div>
