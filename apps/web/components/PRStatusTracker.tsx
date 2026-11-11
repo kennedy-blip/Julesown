@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { GitPullRequest, CheckCircle2, XCircle, Clock, ExternalLink } from 'lucide-react';
+import { GitPullRequest, CheckCircle2, XCircle, Clock, ExternalLink, GitCompare } from 'lucide-react';
 
 interface PRStatusTrackerProps {
   prUrl: string | null;
@@ -20,6 +20,13 @@ export function PRStatusTracker({ prUrl, status, testsPassed, taskPrompt }: PRSt
     );
   }
 
+  // Derive repo pulls or compare links safely
+  const repoSlug = prUrl
+    ? prUrl.replace('https://github.com/', '').replace('/pulls', '').split('/')[0] +
+      '/' +
+      prUrl.replace('https://github.com/', '').replace('/pulls', '').split('/')[1]
+    : 'kennedy-blip/sql-hub';
+
   return (
     <div className="bg-[#0f172a] border border-slate-800 rounded-xl p-6 shadow-xl relative overflow-hidden">
       <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-800">
@@ -34,12 +41,12 @@ export function PRStatusTracker({ prUrl, status, testsPassed, taskPrompt }: PRSt
               Agent Executing
             </span>
           )}
-          {status === 'completed' && (
+          {status === 'completed' || status === 'success' ? (
             <span className="inline-flex items-center text-xs text-emerald-400 bg-emerald-400/10 px-2.5 py-1 rounded-full border border-emerald-400/20">
               <CheckCircle2 className="w-3.5 h-3.5 mr-1" />
               Ready for Review
             </span>
-          )}
+          ) : null}
           {status === 'failed' && (
             <span className="inline-flex items-center text-xs text-rose-400 bg-rose-400/10 px-2.5 py-1 rounded-full border border-rose-400/20">
               <XCircle className="w-3.5 h-3.5 mr-1" />
@@ -89,7 +96,7 @@ export function PRStatusTracker({ prUrl, status, testsPassed, taskPrompt }: PRSt
         </div>
 
         {prUrl ? (
-          <div className="pt-2 space-y-1.5">
+          <div className="pt-2 space-y-2">
             <a
               href={prUrl}
               target="_blank"
@@ -100,8 +107,18 @@ export function PRStatusTracker({ prUrl, status, testsPassed, taskPrompt }: PRSt
               <span>Review Pull Request on GitHub</span>
               <ExternalLink className="w-3.5 h-3.5 ml-1" />
             </a>
-            <div className="text-[11px] font-mono text-slate-400 text-center truncate px-2">
-              {prUrl}
+
+            <div className="flex items-center justify-between text-[11px] font-mono text-slate-400 bg-[#090d16] p-2 rounded-lg border border-slate-800">
+              <span className="truncate pr-2">Target: {repoSlug}</span>
+              <a
+                href={`https://github.com/${repoSlug}/pulls`}
+                target="_blank"
+                rel="noreferrer"
+                className="text-blue-400 hover:underline flex items-center gap-1 flex-shrink-0"
+              >
+                <GitCompare className="w-3 h-3" />
+                <span>All PRs</span>
+              </a>
             </div>
           </div>
         ) : (

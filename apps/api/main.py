@@ -21,14 +21,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Register routers
+# Register health router
 app.include_router(health.router)
+
+# Register webhooks router
 app.include_router(webhooks.router)
-app.include_router(tasks.router)
+
+# Register tasks router for both /api/v1/tasks and /api/tasks to guarantee zero 404s
+app.include_router(tasks.router, prefix="/api/v1/tasks")
+app.include_router(tasks.router, prefix="/api/tasks")
 
 @app.get("/api/health")
 async def legacy_health_check():
-    """Compatibility health check endpoint."""
+    """Direct /api/health endpoint mirroring /api/v1/health."""
     return {
         "status": "ok",
         "service": "jules-clone-api",

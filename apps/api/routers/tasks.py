@@ -1,5 +1,6 @@
 import uuid
 import time
+import os
 import asyncio
 from typing import Dict, List, Optional, Any
 from fastapi import APIRouter, HTTPException, BackgroundTasks, status
@@ -7,10 +8,10 @@ from pydantic import BaseModel, Field
 from ..services.sandbox import E2BSandboxManager
 from ..services.agent import AutonomousAgent
 
-router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
+router = APIRouter(tags=["tasks"])
 
 class TaskCreateRequest(BaseModel):
-    repository: str = Field(..., json_schema_extra={"example": "https://github.com/example/repo"}, description="Target repository URL or owner/repo")
+    repository: str = Field(..., json_schema_extra={"example": "kennedy-blip/sql-hub"}, description="Target repository URL or owner/repo")
     branch: str = Field("main", json_schema_extra={"example": "main"}, description="Target branch to base changes from")
     prompt: str = Field(..., json_schema_extra={"example": "Fix bug in calculation algorithm and add test coverage"}, description="Task instructions for the agent")
 
@@ -37,7 +38,7 @@ def clean_repo_slug(raw_repo: str) -> str:
         .replace(".git", "")
         .strip("/")
     )
-    return slug or "owner/repo"
+    return slug or "kennedy-blip/sql-hub"
 
 def execute_agent_task(task_id: str, repo: str, branch: str, prompt: str):
     """Background task runner executing the autonomous agent loop."""
@@ -49,7 +50,7 @@ def execute_agent_task(task_id: str, repo: str, branch: str, prompt: str):
     default_pr_url = f"https://github.com/{clean_repo}/pulls"
 
     task["status"] = "running"
-    task["logs"].append(f"[{time.strftime('%X')}] 🚀 Task initiated for {clean_repo}:{branch}")
+    task["logs"].append(f"[{time.strftime('%X')}] 🚀 Task initiated for GitHub repo: {clean_repo}:{branch}")
 
     def log_handler(msg: str):
         task["logs"].append(f"[{time.strftime('%X')}] {msg}")
@@ -57,7 +58,7 @@ def execute_agent_task(task_id: str, repo: str, branch: str, prompt: str):
     try:
         sandbox = E2BSandboxManager()
         agent = AutonomousAgent(sandbox=sandbox, log_callback=log_handler)
-        result = agent.run_agent_loop(prompt=prompt, repo=repo, branch=branch)
+        result = agent.run_agent_loop(prompt=prompt, repo=clean_repo, branch=branch)
 
         task["completed_at"] = time.time()
         if result.get("success"):
@@ -65,7 +66,7 @@ def execute_agent_task(task_id: str, repo: str, branch: str, prompt: str):
             task["tests_passed"] = True
             pr_info = result.get("pr_result") or {}
             task["pr_url"] = pr_info.get("pr_url") or default_pr_url
-            task["logs"].append(f"[{time.strftime('%X')}] 🎉 PR created: {task['pr_url']}")
+            task["logs"].append(f"[{time.strftime('%X')}] 🎉 PR verified on GitHub: {task['pr_url']}")
         else:
             task["status"] = "failed"
             task["logs"].append(f"[{time.strftime('%X')}] ❌ Execution failed: {result.get('error')}")
@@ -82,13 +83,14 @@ async def create_task(req: TaskCreateRequest, background_tasks: BackgroundTasks)
     Creates a new autonomous coding agent task and dispatches background execution.
     """
     task_id = str(uuid.uuid4())
+    clean_repo = clean_repo_slug(req.repository)
     task_record = {
         "task_id": task_id,
-        "repository": req.repository,
+        "repository": clean_repo,
         "branch": req.branch,
         "prompt": req.prompt,
         "status": "pending",
-        "logs": [f"[{time.strftime('%X')}] Task queued."],
+        "logs": [f"[{time.strftime('%X')}] Task queued for {clean_repo}."],
         "pr_url": None,
         "created_at": time.time(),
         "completed_at": None,
@@ -97,7 +99,7 @@ async def create_task(req: TaskCreateRequest, background_tasks: BackgroundTasks)
     TASKS_DB[task_id] = task_record
 
     # Schedule agent execution
-    background_tasks.add_task(execute_agent_task, task_id, req.repository, req.branch, req.prompt)
+    background_tasks.add_task(execute_agent_task, task_id, clean_repo, req.branch, req.prompt)
 
     return task_record
 

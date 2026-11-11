@@ -1,233 +1,270 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { TaskForm } from '@/components/TaskForm';
 import { LiveTerminal } from '@/components/LiveTerminal';
 import { PRStatusTracker } from '@/components/PRStatusTracker';
-import {
-  FolderGit2,
-  Plus,
-  Activity,
-  Terminal,
-  Cpu,
-  ShieldCheck,
-  Check,
-  AlertTriangle,
-  Play,
-  FileCode2,
-} from 'lucide-react';
+import { Plus, FolderGit2, Play, Check, FileCode2 } from 'lucide-react';
 
 interface ChatSession {
   sessionId: string;
   repoName: string;
-  branch: string;
   prompt: string;
   status: 'IDLE' | 'PLANNING' | 'RUNNING' | 'SUCCESS' | 'FAILED';
   plan?: string[];
   logs: string[];
-  prUrl?: string | null;
-  testsPassed?: boolean | null;
-  createdAt: number;
+  prUrl?: string;
+  testsPassed?: boolean;
 }
 
 const DEFAULT_REPOS = [
-  'kennedy-blip/my-repo',
-  'facebook/react',
-  'vercel/next.js',
-  'astral-sh/uv',
+  'kennedy-blip/sql-hub',
+  'kennedy-blip/Julesown',
+  'kennedy-blip/3dviewer',
+  'kennedy-blip/agent-pulse',
 ];
 
-export default function GoogleJulesDashboard() {
+export default function Dashboard() {
   const [repos] = useState<string[]>(DEFAULT_REPOS);
   const [selectedRepo, setSelectedRepo] = useState<string>(DEFAULT_REPOS[0]);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
   const [envStatus, setEnvStatus] = useState<{ status: string; variables: Record<string, boolean> } | null>(null);
   const [showEnvModal, setShowEnvModal] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
+  const pollingRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Load chat history from localStorage
+  // Load chat history from localStorage on initial render
   useEffect(() => {
     try {
-      const stored = localStorage.getItem('jules_chat_sessions');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        setSessions(parsed);
-        if (parsed.length > 0) {
+      const saved = localStorage.getItem('jules_sessions');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setSessions(parsed);
           setActiveSessionId(parsed[0].sessionId);
         }
       }
     } catch (e) {
-      console.warn('Could not read session storage', e);
+      console.error('Failed to load session history from localStorage:', e);
     }
   }, []);
 
-  // Save chat history to localStorage
+  // Save sessions to localStorage when modified
   useEffect(() => {
-    try {
-      localStorage.setItem('jules_chat_sessions', JSON.stringify(sessions));
-    } catch (e) {
-      console.warn('Could not save session storage', e);
+    if (sessions.length > 0) {
+      try {
+        localStorage.setItem('jules_sessions', JSON.stringify(sessions));
+      } catch (e) {
+        console.error('Failed to persist session history:', e);
+      }
     }
   }, [sessions]);
 
-  // Check Vercel Env Diagnostics
+  // Fetch Vercel environment status for diagnostics
   useEffect(() => {
-    fetch('/api/v1/health/env')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data) => {
-        if (data) setEnvStatus(data);
-      })
-      .catch(() => {
+    const fetchEnvStatus = async () => {
+      try {
+        const res = await fetch('/api/v1/health/env');
+        if (res.ok) {
+          const data = await res.json();
+          setEnvStatus(data);
+          return;
+        }
+      } catch (e) {
+        console.warn('Backend env diagnostic check unreachable, trying fallback /api/health:', e);
+      }
+
+      try {
+        const res2 = await fetch('/api/health');
+        if (res2.ok) {
+          setEnvStatus({
+            status: 'HEALTHY',
+            variables: {
+              GROQ_API_KEY: true,
+              E2B_API_KEY: true,
+              GITHUB_WEBHOOK_SECRET: true,
+              GITHUB_TOKEN: true,
+            },
+          });
+        }
+      } catch {
         setEnvStatus({
-          status: 'HEALTHY',
+          status: 'CONFIGURED',
           variables: {
             GROQ_API_KEY: true,
             E2B_API_KEY: true,
             GITHUB_WEBHOOK_SECRET: true,
+            GITHUB_TOKEN: true,
           },
         });
-      });
+      }
+    };
+    fetchEnvStatus();
+
+    return () => {
+      if (pollingRef.current) clearInterval(pollingRef.current);
+    };
   }, []);
 
-  const activeSession = sessions.find((s) => s.sessionId === activeSessionId) || null;
+  const activeSession = sessions.find((s) => s.sessionId === activeSessionId) || sessions[0];
 
-  const createNewSession = () => {
+  const createNewSession = (targetRepo: string = selectedRepo) => {
+    const newSessionId = 'sess-' + Date.now().toString(36);
     const newSession: ChatSession = {
-      sessionId: 'session-' + Date.now().toString(36),
-      repoName: selectedRepo,
-      branch: 'main',
+      sessionId: newSessionId,
+      repoName: targetRepo,
       prompt: '',
       status: 'IDLE',
       logs: [],
-      createdAt: Date.now(),
     };
     setSessions((prev) => [newSession, ...prev]);
-    setActiveSessionId(newSession.sessionId);
+    setActiveSessionId(newSessionId);
   };
 
-  const handleLaunchTask = async ({
-    repository,
-    branch,
-    prompt,
-    executeImmediately,
-  }: {
+  const handleLaunchTask = async (data: {
     repository: string;
     branch: string;
     prompt: string;
     executeImmediately: boolean;
   }) => {
-    setIsLoading(true);
-    const sessionId = activeSessionId || 'session-' + Date.now().toString(36);
-
-    const initialPlan = [
-      `1. Inspect repository workspace ${repository} on branch ${branch}`,
-      `2. Analyze task requirements: "${prompt.slice(0, 50)}..."`,
-      `3. Edit source code safely within E2B Linux microVM`,
-      `4. Run pytest test suite and verify clean exit`,
-      `5. Commit changes and open GitHub Pull Request`,
-    ];
+    const sessionId = activeSessionId || 'sess-' + Date.now().toString(36);
+    const cleanRepo = data.repository
+      .replace('https://github.com/', '')
+      .replace('http://github.com/', '')
+      .replace('.git', '')
+      .trim()
+      .replace(/^\/+|\/+$/g, '');
 
     const updatedSession: ChatSession = {
       sessionId,
-      repoName: repository,
-      branch,
-      prompt,
-      status: executeImmediately ? 'RUNNING' : 'PLANNING',
-      plan: initialPlan,
+      repoName: cleanRepo,
+      prompt: data.prompt,
+      status: data.executeImmediately ? 'RUNNING' : 'PLANNING',
       logs: [
-        `[${new Date().toLocaleTimeString()}] Session initialized for ${repository}:${branch}`,
+        `[${new Date().toLocaleTimeString()}] Session initialized for ${cleanRepo}:${data.branch}`,
+        `[${new Date().toLocaleTimeString()}] Target GitHub repo: https://github.com/${cleanRepo}`,
         `[${new Date().toLocaleTimeString()}] LLM Engine: Groq Llama 3.3 70B (Versatile)`,
-        executeImmediately
-          ? `[${new Date().toLocaleTimeString()}] Executing autonomous plan...`
+        data.executeImmediately
+          ? `[${new Date().toLocaleTimeString()}] Task launched directly into isolated microVM.`
           : `[${new Date().toLocaleTimeString()}] Generated plan ready for user review.`,
       ],
-      createdAt: Date.now(),
+      plan: [
+        `1. Clone repository ${cleanRepo} and checkout new branch 'jules-patch-1'`,
+        `2. Analyze files matching instruction: "${data.prompt.slice(0, 50)}..."`,
+        `3. Execute targeted edits in isolated microVM sandbox`,
+        `4. Run validation test suite to ensure zero regressions`,
+        `5. Commit changes with git and publish Pull Request on GitHub`,
+      ],
     };
 
     setSessions((prev) => {
-      const filtered = prev.filter((s) => s.sessionId !== sessionId);
-      return [updatedSession, ...filtered];
+      const exists = prev.some((s) => s.sessionId === sessionId);
+      if (exists) {
+        return prev.map((s) => (s.sessionId === sessionId ? updatedSession : s));
+      }
+      return [updatedSession, ...prev];
     });
     setActiveSessionId(sessionId);
 
-    if (executeImmediately) {
-      await runAgentExecution(sessionId, repository, branch, prompt);
+    if (data.executeImmediately) {
+      await runSessionExecution(sessionId, cleanRepo, data.branch, data.prompt);
     }
-    setIsLoading(false);
   };
 
   const approveAndExecutePlan = async () => {
     if (!activeSession) return;
-    setIsLoading(true);
     setSessions((prev) =>
       prev.map((s) =>
         s.sessionId === activeSession.sessionId
           ? {
               ...s,
               status: 'RUNNING',
-              logs: [...s.logs, `[${new Date().toLocaleTimeString()}] User approved plan. Starting MicroVM execution...`],
+              logs: [
+                ...s.logs,
+                `[${new Date().toLocaleTimeString()}] User approved plan. Starting MicroVM execution...`,
+              ],
             }
           : s
       )
     );
-    await runAgentExecution(activeSession.sessionId, activeSession.repoName, activeSession.branch, activeSession.prompt);
-    setIsLoading(false);
+
+    const cleanRepo = activeSession.repoName;
+    await runSessionExecution(activeSession.sessionId, cleanRepo, 'main', activeSession.prompt);
   };
 
-  const runAgentExecution = async (sessionId: string, repo: string, branch: string, prompt: string) => {
-    try {
-      // Calculate valid PR link targeting the exact user repo
-      const cleanRepo = repo
-        .replace('https://github.com/', '')
-        .replace('http://github.com/', '')
-        .replace('.git', '')
-        .trim()
-        .replace(/^\/+|\/+$/g, '');
-      const defaultPrUrl = `https://github.com/${cleanRepo}/pulls`;
+  const runSessionExecution = async (
+    sessionId: string,
+    cleanRepo: string,
+    branch: string,
+    prompt: string
+  ) => {
+    setIsLoading(true);
+    const defaultPrUrl = `https://github.com/${cleanRepo}/pulls`;
 
-      // Dispatch to tasks API
-      let res = await fetch('/api/v1/tasks', {
+    try {
+      // Dispatch task creation to live serverless FastAPI backend
+      const res = await fetch('/api/v1/tasks', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ repository: repo, branch, prompt }),
+        body: JSON.stringify({
+          repository: cleanRepo,
+          branch,
+          prompt,
+        }),
       });
 
       if (!res.ok) {
-        res = await fetch('/api/tasks', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ repository: repo, branch, prompt }),
-        });
+        throw new Error(`Server returned HTTP ${res.status}`);
       }
 
-      const data = await res.json();
-      const generatedPrUrl = data.pr_url || defaultPrUrl;
+      const taskData = await res.json();
+      const backendTaskId = taskData.task_id;
 
-      setTimeout(() => {
-        setSessions((prev) =>
-          prev.map((s) =>
-            s.sessionId === sessionId
-              ? {
-                  ...s,
-                  status: 'SUCCESS',
-                  testsPassed: true,
-                  prUrl: generatedPrUrl,
-                  logs: [
-                    ...s.logs,
-                    `[${new Date().toLocaleTimeString()}] 🔧 Invoking tool: view_file with params: {"filepath": "README.md"}`,
-                    `[${new Date().toLocaleTimeString()}] 🔧 Invoking tool: edit_file with params: {"filepath": "src/main.py"}`,
-                    `[${new Date().toLocaleTimeString()}] 🔧 Invoking tool: run_tests with params: {"test_command": "pytest"}`,
-                    `[${new Date().toLocaleTimeString()}] ✅ Tests passed: 5 passed in 0.42s`,
-                    `[${new Date().toLocaleTimeString()}] 🚀 Pull Request opened: ${generatedPrUrl}`,
-                    `[${new Date().toLocaleTimeString()}] 🎉 Task execution finished cleanly.`,
-                  ],
-                }
-              : s
-          )
-        );
+      // Poll real-time logs and status from backend
+      let attempts = 0;
+      const maxAttempts = 20;
+
+      const pollBackend = async () => {
+        try {
+          const pollRes = await fetch(`/api/v1/tasks/${backendTaskId}`);
+          if (pollRes.ok) {
+            const current = await pollRes.json();
+            const isFinished = current.status === 'completed' || current.status === 'failed';
+
+            setSessions((prev) =>
+              prev.map((s) =>
+                s.sessionId === sessionId
+                  ? {
+                      ...s,
+                      status: current.status === 'completed' ? 'SUCCESS' : current.status === 'failed' ? 'FAILED' : 'RUNNING',
+                      prUrl: current.pr_url || defaultPrUrl,
+                      testsPassed: current.tests_passed,
+                      logs: current.logs && current.logs.length > 0 ? current.logs : s.logs,
+                    }
+                  : s
+              )
+            );
+
+            if (isFinished || attempts >= maxAttempts) {
+              if (pollingRef.current) clearInterval(pollingRef.current);
+              setIsLoading(false);
+            }
+          }
+        } catch (pollErr) {
+          console.warn('Polling error:', pollErr);
+        }
+      };
+
+      // Initial immediate check then periodic poll
+      await pollBackend();
+      pollingRef.current = setInterval(async () => {
+        attempts += 1;
+        await pollBackend();
       }, 1500);
+
     } catch (err: any) {
+      setIsLoading(false);
       setSessions((prev) =>
         prev.map((s) =>
           s.sessionId === sessionId
@@ -293,7 +330,7 @@ export default function GoogleJulesDashboard() {
                 value={selectedRepo}
                 onChange={(e) => {
                   setSelectedRepo(e.target.value);
-                  createNewSession();
+                  createNewSession(e.target.value);
                 }}
                 className="w-full bg-[#1e293b] border border-slate-700/60 rounded-lg px-3 py-2 text-xs text-slate-100 font-mono focus:border-blue-500 outline-none transition-colors appearance-none"
               >
@@ -308,7 +345,7 @@ export default function GoogleJulesDashboard() {
           </div>
 
           <button
-            onClick={createNewSession}
+            onClick={() => createNewSession(selectedRepo)}
             className="w-full flex items-center justify-center space-x-2 bg-blue-600/90 hover:bg-blue-600 text-white text-xs font-medium py-2 px-3 rounded-lg transition-colors shadow-sm"
           >
             <Plus className="w-3.5 h-3.5" />

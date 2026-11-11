@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { GitBranch, GitFork, Play, Sparkles, FileText, CheckCircle2 } from 'lucide-react';
+import { GitBranch, GitFork, Play, Sparkles, FileText } from 'lucide-react';
 
 interface TaskFormProps {
   onSubmit: (task: { repository: string; branch: string; prompt: string; executeImmediately: boolean }) => void;
@@ -10,10 +10,9 @@ interface TaskFormProps {
 }
 
 export function TaskForm({ onSubmit, isLoading, selectedRepo }: TaskFormProps) {
-  const [repository, setRepository] = useState(selectedRepo || 'kennedy-blip/my-repo');
+  const [repository, setRepository] = useState(selectedRepo || 'kennedy-blip/sql-hub');
   const [branch, setBranch] = useState('main');
-  const [prompt, setPrompt] = useState('Build feature and verify all tests pass with pytest');
-  const [requiresPlan, setRequiresPlan] = useState(false);
+  const [prompt, setPrompt] = useState('Inspect repository, implement feature improvements, and verify all tests pass');
 
   React.useEffect(() => {
     if (selectedRepo) setRepository(selectedRepo);
@@ -42,13 +41,13 @@ export function TaskForm({ onSubmit, isLoading, selectedRepo }: TaskFormProps) {
           <div className="md:col-span-2">
             <label className="block text-xs font-medium text-slate-400 mb-1 flex items-center gap-1.5">
               <GitFork className="w-3 h-3 text-slate-500" />
-              Repository
+              Target GitHub Repository
             </label>
             <input
               type="text"
               value={repository}
               onChange={(e) => setRepository(e.target.value)}
-              placeholder="e.g. owner/repo"
+              placeholder="e.g. kennedy-blip/sql-hub"
               className="w-full bg-[#090d16] border border-slate-800 focus:border-blue-500 rounded-lg px-3 py-2 text-xs text-slate-100 placeholder-slate-500 outline-none transition-colors font-mono"
               required
             />

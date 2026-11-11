@@ -39,7 +39,7 @@ def test_github_webhook_ping():
 
 def test_create_task_and_get_status():
     payload = {
-        "repository": "https://github.com/org/sample-repo",
+        "repository": "kennedy-blip/sql-hub",
         "branch": "main",
         "prompt": "Fix typo in readme and run tests"
     }
@@ -47,7 +47,7 @@ def test_create_task_and_get_status():
     assert response.status_code == 201
     created_task = response.json()
     assert "task_id" in created_task
-    assert created_task["repository"] == payload["repository"]
+    assert created_task["repository"] == "kennedy-blip/sql-hub"
 
     # Poll status
     task_id = created_task["task_id"]
@@ -58,6 +58,6 @@ def test_create_task_and_get_status():
 def test_sandbox_and_agent_execution():
     sandbox = E2BSandboxManager()
     agent = AutonomousAgent(sandbox=sandbox)
-    result = agent.run_agent_loop(prompt="Add unit tests", repo="my/repo", branch="main")
+    result = agent.run_agent_loop(prompt="Add unit tests", repo="kennedy-blip/sql-hub", branch="main")
     assert result["success"] is True
     assert "pr_result" in result

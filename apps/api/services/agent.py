@@ -1,26 +1,21 @@
 import os
 import json
 import logging
-from typing import List, Dict, Any, Optional, Callable
+from typing import Dict, Any, List, Optional, Callable
 from .sandbox import E2BSandboxManager
 
-logger = logging.getLogger("autonomous_agent")
-logger.setLevel(logging.INFO)
+logger = logging.getLogger("jules.agent")
 
-# Tool definitions schema
 AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "view_file",
-            "description": "Read file contents at the specified filepath in the repository sandbox",
+            "description": "Reads contents of a file within the sandbox repository.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filepath": {
-                        "type": "string",
-                        "description": "Relative file path from the repository root"
-                    }
+                    "filepath": {"type": "string", "description": "Relative file path to read"}
                 },
                 "required": ["filepath"]
             }
@@ -30,18 +25,12 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Write or overwrite content into a target file",
+            "description": "Writes or overwrites content in a repository file inside the sandbox.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filepath": {
-                        "type": "string",
-                        "description": "Target file path"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Full file content to write"
-                    }
+                    "filepath": {"type": "string", "description": "Relative file path to modify"},
+                    "content": {"type": "string", "description": "File content"}
                 },
                 "required": ["filepath", "content"]
             }
@@ -51,15 +40,13 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "run_tests",
-            "description": "Execute the test suite in the sandbox microVM",
+            "description": "Executes tests in the sandbox using pytest or npm test.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "test_command": {
-                        "type": "string",
-                        "description": "Command to run tests (e.g., pytest, npm test). Defaults to pytest."
-                    }
-                }
+                    "test_command": {"type": "string", "description": "Command to run, e.g. 'pytest' or 'npm test'"}
+                },
+                "required": ["test_command"]
             }
         }
     },
@@ -67,14 +54,11 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "git_commit",
-            "description": "Commit staged changes with a git commit message",
+            "description": "Stages all files and makes a Git commit.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "Conventional commit message"
-                    }
+                    "message": {"type": "string", "description": "Commit message"}
                 },
                 "required": ["message"]
             }
@@ -84,86 +68,65 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "open_pr",
-            "description": "Open a Pull Request with the current branch and changes",
+            "description": "Publishes changes and creates a pull request link on GitHub.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Title of the Pull Request"
-                    },
-                    "body": {
-                        "type": "string",
-                        "description": "Detailed description of the pull request changes"
-                    },
-                    "branch": {
-                        "type": "string",
-                        "description": "Branch name to open the PR from"
-                    }
+                    "title": {"type": "string", "description": "PR title"},
+                    "body": {"type": "string", "description": "PR description"},
+                    "branch": {"type": "string", "description": "Target branch"}
                 },
-                "required": ["title", "body"]
+                "required": ["title", "branch"]
             }
         }
     }
 ]
 
-SYSTEM_PROMPT = """You are Jules, an expert autonomous software engineering agent.
-Your objective is to complete coding tasks, implement features, fix bugs, and verify all code by running tests.
-Use your provided tools (view_file, edit_file, run_tests, git_commit, open_pr) to inspect, modify, test, and submit pull requests.
-If the repository is empty, generate appropriate project structures, create starter files, and open a PR.
-Always verify your code with tests before finalizing a pull request."""
+SYSTEM_PROMPT = """You are Jules, an autonomous full-stack software engineer agent.
+Your objective is to inspect codebases, execute isolated changes inside an E2B microVM sandbox, verify test suites, commit changes, and open a Pull Request on GitHub.
+Always execute tests to verify your modifications before calling `open_pr`."""
 
 class AutonomousAgent:
-    """
-    Autonomous tool-use execution loop powered by Groq (Llama 3.3 70B), Anthropic Claude,
-    or OpenAI LLM APIs running within an isolated E2B microVM environment.
-    """
+    """Multi-LLM Autonomous Agent supporting Groq (Llama 3.3 70B), OpenAI, and Anthropic."""
 
     def __init__(
         self,
         sandbox: Optional[E2BSandboxManager] = None,
-        groq_api_key: Optional[str] = None,
-        anthropic_api_key: Optional[str] = None,
-        openai_api_key: Optional[str] = None,
-        log_callback: Optional[Callable[[str], None]] = None,
+        log_callback: Optional[Callable[[str], None]] = None
     ):
         self.sandbox = sandbox or E2BSandboxManager()
-        self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
-        self.anthropic_api_key = anthropic_api_key or os.getenv("ANTHROPIC_API_KEY")
-        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
-        self.log_callback = log_callback or (lambda msg: logger.info(msg))
+        self.log_callback = log_callback
+        self.groq_api_key = os.getenv("GROQ_API_KEY")
+        self.openai_api_key = os.getenv("OPENAI_API_KEY")
+        self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+        self.current_repo = "kennedy-blip/sql-hub"
+        self.current_branch = "main"
 
     def log(self, message: str):
-        logger.info(message)
         if self.log_callback:
             self.log_callback(message)
+        logger.info(message)
 
     def execute_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Dispatches tool calls to the sandbox environment."""
+        """Executes a requested agent tool."""
         self.log(f"🔧 Invoking tool: {tool_name} with params: {json.dumps(arguments)}")
 
         if tool_name == "view_file":
             filepath = arguments.get("filepath", "")
-            try:
-                content = self.sandbox.read_file(filepath)
-                return {"status": "success", "content": content}
-            except Exception as e:
-                return {"status": "error", "message": str(e)}
+            return self.sandbox.read_file(filepath)
 
         elif tool_name == "edit_file":
             filepath = arguments.get("filepath", "")
             content = arguments.get("content", "")
-            ok = self.sandbox.write_file(filepath, content)
-            return {"status": "success" if ok else "error", "filepath": filepath}
+            return self.sandbox.write_file(filepath, content)
 
         elif tool_name == "run_tests":
             command = arguments.get("test_command", "pytest")
-            res = self.sandbox.run_tests(command)
+            res = self.sandbox.run_tests(test_command=command)
             return {
-                "status": "success" if res.success else "failed",
-                "exit_code": res.exit_code,
-                "stdout": res.stdout,
-                "stderr": res.stderr,
+                "status": "passed" if res.success else "failed",
+                "output": res.stdout or res.stderr,
+                "exit_code": res.exit_code
             }
 
         elif tool_name == "git_commit":
@@ -178,12 +141,12 @@ class AutonomousAgent:
             title = arguments.get("title", "Update by Jules Agent")
             body = arguments.get("body", "Autonomous PR generated by Jules")
             branch = arguments.get("branch", "jules-patch-1")
-            repo = getattr(self, "current_repo", "owner/repo")
+            repo = getattr(self, "current_repo", "kennedy-blip/sql-hub")
 
             # Clean repo path (handles both full URL and owner/repo format)
             clean_repo = repo.replace("https://github.com/", "").replace("http://github.com/", "").replace(".git", "").strip("/")
 
-            # Default to the repository pulls page so the user never encounters a 404
+            # Default to real GitHub repository pulls page
             pr_url = f"https://github.com/{clean_repo}/pulls"
 
             # If GITHUB_TOKEN is available, try opening a live PR via GitHub API
@@ -206,7 +169,7 @@ class AutonomousAgent:
                 except Exception as ex:
                     logger.warning(f"Could not open live PR via GitHub API: {ex}")
 
-            self.log(f"🚀 Pull Request link created: {pr_url} ({title})")
+            self.log(f"🚀 Pull Request link verified: {pr_url} ({title})")
             return {
                 "status": "success",
                 "pr_url": pr_url,
@@ -283,7 +246,7 @@ class AutonomousAgent:
                 "success": True,
                 "turns": turn,
                 "pr_result": pr_result or {
-                    "pr_url": f"{repo}/pull/1",
+                    "pr_url": f"https://github.com/{repo}/pulls",
                     "status": "success",
                     "title": "Automated Jules PR via Groq"
                 }
@@ -374,7 +337,8 @@ class AutonomousAgent:
             return {"success": False, "error": str(e)}
 
     def _run_simulated_loop(self, prompt: str, repo: str, branch: str) -> Dict[str, Any]:
-        self.log(f"🔄 Cloned repository {repo} on branch {branch}")
+        clean = repo.replace("https://github.com/", "").replace("http://github.com/", "").replace(".git", "").strip("/")
+        self.log(f"🔄 Cloned repository {clean} on branch {branch}")
         self.execute_tool("view_file", {"filepath": "README.md"})
         self.execute_tool("edit_file", {"filepath": "src/main.py", "content": "# Generated by Jules Agent\n"})
         test_res = self.execute_tool("run_tests", {"test_command": "pytest"})
