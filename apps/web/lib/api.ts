@@ -6,7 +6,13 @@
  */
 
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
-export type TestsStatus = 'passed' | 'failed' | 'not_run';
+/**
+ * passed / failed - the last test run that really tested something
+ * no_tests        - a test command was run, but the project has no tests
+ * not_run         - no test command was run
+ */
+export type TestsStatus = 'passed' | 'failed' | 'no_tests' | 'not_run';
+export type VerificationOutcome = 'passed' | 'failed' | 'timed_out' | 'no_tests';
 export type TaskOutcome = 'pull_request' | 'no_changes';
 
 export interface LogEntry {
@@ -28,6 +34,10 @@ export interface VerificationRun {
   passed: boolean;
   timed_out: boolean;
   duration: number;
+  /** Not present in results saved by earlier versions of the app. */
+  outcome?: VerificationOutcome;
+  /** Why the command had nothing to test (when outcome is 'no_tests'). */
+  note?: string;
 }
 
 export interface TaskRecord {
@@ -44,6 +54,10 @@ export interface TaskRecord {
   base_branch: string | null;
   commit_sha: string | null;
   changed_files: ChangedFile[];
+  /** The change only touches documentation files (null until the changes are known). */
+  docs_only?: boolean | null;
+  /** Repository files the agent looked at (not present in results saved by earlier versions). */
+  files_read?: string[];
   verification: VerificationRun[];
   tests_status: TestsStatus | null;
   summary: string | null;
@@ -57,6 +71,20 @@ export interface TaskRecord {
   completed_at: number | null;
   logs?: string[];
   log_entries?: LogEntry[];
+}
+
+/** What became of a pull request: still open, merged, or closed without a merge. */
+export type PullRequestState = 'open' | 'merged' | 'closed';
+
+export interface PullRequestStatus {
+  task_id: string;
+  repository: string;
+  number: number;
+  url: string;
+  state: PullRequestState;
+  title: string;
+  head_branch: string;
+  base_branch: string;
 }
 
 export interface HealthEnv {
@@ -237,6 +265,15 @@ export function fetchTask(taskId: string, repository: string): Promise<TaskRecor
   const query = params.toString();
   return getJson<TaskRecord>(
     `/api/v1/tasks/${encodeURIComponent(taskId)}${query ? `?${query}` : ''}`,
+    true
+  );
+}
+
+/** The pull request a task opened, as it is on GitHub right now. */
+export function fetchPullRequestStatus(taskId: string, repository: string): Promise<PullRequestStatus> {
+  const params = new URLSearchParams({ repository });
+  return getJson<PullRequestStatus>(
+    `/api/v1/tasks/${encodeURIComponent(taskId)}/pull-request?${params.toString()}`,
     true
   );
 }

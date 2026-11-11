@@ -10,6 +10,7 @@ import {
   ApiError,
   checkRepository,
   describeError,
+  fetchPullRequestStatus,
   fetchRepositories,
   fetchTask,
   getAccessKey,
@@ -20,7 +21,7 @@ import {
 } from '@/lib/api';
 import type { LogEntry, RepoListing, StreamEvent, TaskRecord } from '@/lib/api';
 import { readinessOf, refreshHealth, useHealth } from '@/lib/health';
-import { loadSessions, newSessionId, saveSessions, sessionBadge } from '@/lib/sessions';
+import { loadSessions, newSessionId, pullRequestCanChange, saveSessions, sessionBadge } from '@/lib/sessions';
 import type { Session, SessionBadge } from '@/lib/sessions';
 
 const MAX_SESSIONS = 30;
@@ -28,6 +29,10 @@ const MAX_SESSIONS = 30;
  *  (a little longer than the longest run the backend allows). */
 const AUTO_RECHECK_WINDOW_MS = 7 * 60 * 1000;
 const AUTO_RECHECK_INTERVAL_MS = 15 * 1000;
+/** A pull request's state is asked from GitHub at most this often per task... */
+const PR_STATE_MIN_INTERVAL_MS = 20 * 1000;
+/** ...and when the page loads only for this many of the most recent tasks. */
+const PR_STATE_STARTUP_LIMIT = 8;
 
 const GITHUB_APP_NOTICES: Record<string, string> = {
   installed:
@@ -115,6 +120,8 @@ function applyLookup(session: Session, found: TaskRecord): Session {
 const BADGE_STYLES: Record<SessionBadge, string> = {
   RUNNING: 'bg-amber-500/10 text-amber-400 border border-amber-500/20',
   'PR OPENED': 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20',
+  MERGED: 'bg-purple-500/10 text-purple-300 border border-purple-500/30',
+  'PR CLOSED': 'bg-slate-700/40 text-slate-300 border border-slate-600/50',
   'NO CHANGES': 'bg-slate-700/40 text-slate-300 border border-slate-600/50',
   FAILED: 'bg-rose-500/10 text-rose-400 border border-rose-500/20',
   UNKNOWN: 'bg-amber-500/10 text-amber-300 border border-amber-500/20',
@@ -151,6 +158,10 @@ export default function Dashboard() {
   const sessionsRef = useRef<Session[]>([]);
   const launching = useRef(false);
   const autoRecheckBusy = useRef(false);
+  // Pull request lookups: when each session was last asked about, and the queue
+  // that keeps them one at a time.
+  const prStateAsked = useRef<Record<string, number>>({});
+  const prStateQueue = useRef<Promise<void>>(Promise.resolve());
 
   const updateSessions = useCallback((change: (previous: Session[]) => Session[]) => {
     setSessions((previous) => {
@@ -358,6 +369,77 @@ export default function Dashboard() {
   }, [storageLoaded, canCallApi, recheck]);
 
   // ------------------------------------------------------------------
+  // What became of the pull requests (merged? closed?)
+  // ------------------------------------------------------------------
+  // A task ends with "pull request opened". Whether it was merged afterwards is
+  // only known to GitHub, so it is asked: once when the page loads (for the most
+  // recent tasks), and for the task on screen whenever the user comes back to
+  // this tab or selects it. There is no polling.
+  const refreshPullRequests = useCallback(
+    (ids: string[]) => {
+      const work = async () => {
+        for (const id of ids) {
+          const session = sessionsRef.current.find((item) => item.id === id);
+          if (!session || !pullRequestCanChange(session) || !session.task) continue;
+          const asked = prStateAsked.current[id] || 0;
+          if (Date.now() - asked < PR_STATE_MIN_INTERVAL_MS) continue;
+          prStateAsked.current[id] = Date.now();
+          try {
+            const found = await fetchPullRequestStatus(
+              session.task.task_id,
+              session.task.repository || session.repository
+            );
+            patchSession(id, (item) => ({
+              ...item,
+              pullRequest: { state: found.state, checkedAt: Date.now() },
+            }));
+          } catch (error) {
+            // Not being able to ask is not worth a message: the task's own result
+            // stays as it is. Without access, stop (and ask again once there is).
+            if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+              delete prStateAsked.current[id];
+              return;
+            }
+          }
+        }
+      };
+      // One lookup at a time, in the order they were asked for.
+      prStateQueue.current = prStateQueue.current.then(work, work);
+    },
+    [patchSession]
+  );
+
+  useEffect(() => {
+    if (!storageLoaded || !canCallApi || githubAuthMode === 'none') return;
+    // Debounced like the repository list: no request per keystroke of an access key.
+    const timer = window.setTimeout(
+      () => {
+        const ids = sessionsRef.current
+          .filter(pullRequestCanChange)
+          .slice(0, PR_STATE_STARTUP_LIMIT)
+          .map((session) => session.id);
+        if (ids.length > 0) refreshPullRequests(ids);
+      },
+      accessMode === 'key' ? 800 : 0
+    );
+    return () => window.clearTimeout(timer);
+  }, [storageLoaded, canCallApi, githubAuthMode, accessMode, accessKey, refreshPullRequests]);
+
+  useEffect(() => {
+    if (!storageLoaded || !canCallApi || githubAuthMode === 'none' || !activeId) return;
+    const check = () => {
+      if (document.visibilityState === 'visible') refreshPullRequests([activeId]);
+    };
+    check(); // the task was just selected
+    window.addEventListener('focus', check);
+    document.addEventListener('visibilitychange', check);
+    return () => {
+      window.removeEventListener('focus', check);
+      document.removeEventListener('visibilitychange', check);
+    };
+  }, [storageLoaded, canCallApi, githubAuthMode, activeId, refreshPullRequests]);
+
+  // ------------------------------------------------------------------
   // Running a task
   // ------------------------------------------------------------------
   const runningSession = sessions.find((session) => session.state === 'running') || null;
@@ -370,6 +452,7 @@ export default function Dashboard() {
     if (!looksLikeRepository(repository) || !prompt) return;
 
     launching.current = true;
+    setNotice(null); // a one-off confirmation (GitHub App installed) has done its job by now
     const id = newSessionId();
     const now = Date.now();
     const session: Session = {
