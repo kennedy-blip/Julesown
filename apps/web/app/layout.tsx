@@ -1,9 +1,11 @@
 import type { Metadata } from 'next';
+import { SystemStatus } from '@/components/SystemStatus';
 import './globals.css';
 
 export const metadata: Metadata = {
   title: 'Jules - Autonomous Coding Agent',
-  description: 'Full-stack autonomous software engineering platform powered by E2B microVMs and LLMs.',
+  description:
+    'Describe a change, and an LLM agent makes it in an E2B sandbox clone of your GitHub repository and opens a pull request.',
 };
 
 export default function RootLayout({
@@ -20,22 +22,19 @@ export default function RootLayout({
               <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center font-bold text-white shadow-lg shadow-blue-500/30">
                 J
               </div>
-              <span className="font-semibold text-lg tracking-tight text-white">
-                Project Jules <span className="text-xs uppercase bg-blue-500/20 text-blue-400 border border-blue-500/30 px-2 py-0.5 rounded-full ml-1">Clone</span>
+              <span className="font-semibold text-base sm:text-lg tracking-tight text-white whitespace-nowrap">
+                Project Jules <span className="hidden sm:inline text-xs uppercase bg-blue-500/20 text-blue-400 border border-blue-500/30 px-2 py-0.5 rounded-full ml-1">Clone</span>
               </span>
             </div>
             <div className="flex items-center space-x-4 text-sm text-slate-400">
-              <span className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                <span className="w-2 h-2 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span>
-                E2B Sandbox Ready
-              </span>
+              <SystemStatus />
               <a
-                href="https://github.com"
+                href="/api/docs"
                 target="_blank"
                 rel="noreferrer"
-                className="hover:text-white transition-colors text-xs font-medium text-slate-300"
+                className="hidden sm:inline hover:text-white transition-colors text-xs font-medium text-slate-300 whitespace-nowrap"
               >
-                GitHub Docs
+                API docs
               </a>
             </div>
           </div>
