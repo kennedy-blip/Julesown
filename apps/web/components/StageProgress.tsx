@@ -33,11 +33,23 @@ const EMPTY_REPOSITORY_STAGES: Stage[] = [
   { id: 'push', label: 'First commit', title: "Commit the files to the repository's default branch" },
 ];
 
+/** More work on a pull request that exists: the result is a commit added to it. */
+const FOLLOW_UP_STAGES: Stage[] = [
+  STAGES[0],
+  { id: 'github', label: 'GitHub', title: 'Confirm write access, read the pull request and what its checks say' },
+  STAGES[2],
+  { id: 'clone', label: 'Clone', title: "Clone the pull request's branch into the sandbox" },
+  STAGES[4],
+  { id: 'commit', label: 'Commit', title: 'Collect the changed files' },
+  { id: 'pull_request', label: 'Update PR', title: 'Add the commit to the pull request' },
+];
+
 type StepState = 'pending' | 'active' | 'done' | 'failed' | 'skipped' | 'unknown';
 
-function stagesFor(task: TaskRecord | null): Stage[] {
+function stagesFor(task: TaskRecord | null, followUp: boolean): Stage[] {
   const emptyRepository = !!task && (task.empty_repository === true || task.outcome === 'initial_commit');
-  return emptyRepository ? EMPTY_REPOSITORY_STAGES : STAGES;
+  if (emptyRepository) return EMPTY_REPOSITORY_STAGES;
+  return followUp || (!!task && (!!task.pull_request || task.outcome === 'pr_updated')) ? FOLLOW_UP_STAGES : STAGES;
 }
 
 function stepStates(stages: Stage[], task: TaskRecord | null, state: SessionState): StepState[] {
@@ -45,9 +57,14 @@ function stepStates(stages: Stage[], task: TaskRecord | null, state: SessionStat
   const current = stages.findIndex((item) => item.id === stage);
   const last = stages[stages.length - 1].id;
 
+  // A task about failed checks ends right after GitHub was asked when nothing has failed.
+  const endedEarly = !!task && task.outcome === 'no_changes' && !task.sandbox && !task.recovered;
+  const githubStep = stages.findIndex((item) => item.id === 'github');
+
   return stages.map((item, index) => {
     if (state === 'completed' || stage === 'done') {
       const noChanges = task ? task.outcome === 'no_changes' : false;
+      if (endedEarly && index > githubStep) return 'skipped';
       if (noChanges && (item.id === 'commit' || item.id === last)) return 'skipped';
       // A record recovered from GitHub only proves that the result exists there.
       if (task && task.recovered && item.id !== last) return 'skipped';
@@ -88,8 +105,17 @@ function StepIcon({ state }: { state: StepState }) {
   }
 }
 
-export function StageProgress({ task, state }: { task: TaskRecord | null; state: SessionState }) {
-  const stages = stagesFor(task);
+export function StageProgress({
+  task,
+  state,
+  followUp = false,
+}: {
+  task: TaskRecord | null;
+  state: SessionState;
+  /** The task adds to an existing pull request (known before the server says so). */
+  followUp?: boolean;
+}) {
+  const stages = stagesFor(task, followUp);
   const states = stepStates(stages, task, state);
   return (
     <ol className="flex flex-wrap gap-1.5" aria-label="Task progress" data-testid="stage-progress">
@@ -99,7 +125,7 @@ export function StageProgress({ task, state }: { task: TaskRecord | null; state:
           title={item.title}
           data-stage={item.id}
           data-state={states[index]}
-          className={`inline-flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-mono ${STEP_STYLES[states[index]]}`}
+          className={`inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md border text-[11px] font-medium ${STEP_STYLES[states[index]]}`}
         >
           <StepIcon state={states[index]} />
           <span>{item.label}</span>

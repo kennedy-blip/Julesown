@@ -3,6 +3,7 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { describeError, fetchHealth } from './api';
 import type { HealthEnv } from './api';
+import { hasProviderKey, useSettings } from './settings';
 
 /**
  * Backend readiness, shared by the header badge and the dashboard so both show
@@ -61,11 +62,34 @@ export function useHealth(): HealthState {
   return state;
 }
 
-export function readinessOf(state: HealthState): Readiness {
+/**
+ * What is still missing to run a task from this browser. A model provider key
+ * is the one thing the browser can bring along: one kept here is sent with
+ * each task, so the server does not need its own.
+ */
+export function stillMissing(data: HealthEnv, browserHasModelKey: boolean): string[] {
+  const needs = data.needs;
+  if (!needs) return data.missing || [];
+  const missing: string[] = [];
+  if (needs.llm && !browserHasModelKey) missing.push(needs.llm);
+  if (needs.sandbox) missing.push(needs.sandbox);
+  if (needs.github) missing.push(needs.github);
+  return missing;
+}
+
+export function readinessOf(state: HealthState, browserHasModelKey = false): Readiness {
   if (state.phase === 'loading') return 'loading';
   if (state.phase === 'unreachable') return 'unreachable';
   const mode = state.data.access ? state.data.access.mode : 'open';
   if (mode === 'locked') return 'locked';
   const ready = typeof state.data.ready === 'boolean' ? state.data.ready : state.data.status === 'HEALTHY';
-  return ready ? 'ready' : 'incomplete';
+  if (ready) return 'ready';
+  return state.data.needs && stillMissing(state.data, browserHasModelKey).length === 0 ? 'ready' : 'incomplete';
+}
+
+/** Readiness as this browser sees it: its own provider keys count. */
+export function useReadiness(): Readiness {
+  const health = useHealth();
+  const settings = useSettings();
+  return readinessOf(health, hasProviderKey(settings));
 }

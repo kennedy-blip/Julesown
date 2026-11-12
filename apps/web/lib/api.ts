@@ -4,6 +4,8 @@
  * All URLs are relative: on Vercel the API is served from the same origin, and
  * in local development Next.js proxies /api/* to the backend (next.config.mjs).
  */
+import { getSettings, providerKeyHeaders, taskOptions } from './settings';
+import type { ProviderId } from './settings';
 
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
 /**
@@ -15,10 +17,29 @@ export type TestsStatus = 'passed' | 'failed' | 'no_tests' | 'not_run';
 export type VerificationOutcome = 'passed' | 'failed' | 'timed_out' | 'no_tests';
 /**
  * pull_request   - the change is on a branch and GitHub opened a pull request for it
+ * pr_updated     - the change was added, as a commit, to a pull request that existed
  * initial_commit - the repository was empty: the result is its first commit
  * no_changes     - the agent finished without changing (or creating) any file
  */
-export type TaskOutcome = 'pull_request' | 'no_changes' | 'initial_commit';
+export type TaskOutcome = 'pull_request' | 'pr_updated' | 'no_changes' | 'initial_commit';
+
+/** What one model provider did during a run. */
+export interface ProviderUsage {
+  provider: string;
+  model: string;
+  requests?: number;
+  failures?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  /** Why the provider was not used again in the run, if it was taken out. */
+  out?: string | null;
+}
+
+export interface FailedCheck {
+  name: string;
+  kind: 'check_run' | 'status' | string;
+  url?: string | null;
+}
 
 export interface LogEntry {
   ts: number; // unix seconds
@@ -76,6 +97,22 @@ export interface TaskRecord {
   error: string | null;
   llm_provider: string | null;
   llm_model: string | null;
+  /** Every provider configured for the run ("provider / model"), first choice first. */
+  llm_chain?: string[];
+  llm_usage?: ProviderUsage[];
+  /** More work on a pull request that existed: its number. */
+  pull_request?: number | null;
+  fix_checks?: boolean;
+  continue_work?: boolean;
+  failed_checks?: FailedCheck[];
+  /** The agent was stopped before it was done; what it had changed was delivered anyway. */
+  unfinished?: boolean;
+  /** timeout | llm_error | max_turns */
+  stop_reason?: string | null;
+  /** Why the agent was stopped, in words. */
+  unfinished_reason?: string | null;
+  /** bot | coauthor | user, as it was applied to the commit. */
+  commit_authorship?: string | null;
   sandbox: string | null;
   recovered: boolean;
   created_at: number;
@@ -88,6 +125,20 @@ export interface TaskRecord {
 /** What became of a pull request: still open, merged, or closed without a merge. */
 export type PullRequestState = 'open' | 'merged' | 'closed';
 
+/** failure | pending | success | none (no checks) | unknown (may not be read). */
+export type ChecksState = 'failure' | 'pending' | 'success' | 'none' | 'unknown';
+
+/** What CI says about a commit. */
+export interface ChecksSummary {
+  sha: string;
+  state: ChecksState;
+  failing: Array<FailedCheck & { conclusion?: string; summary?: string; app?: string }>;
+  failed: number;
+  passed: number;
+  pending: number;
+  notes: string[];
+}
+
 export interface PullRequestStatus {
   task_id: string;
   repository: string;
@@ -97,6 +148,21 @@ export interface PullRequestStatus {
   title: string;
   head_branch: string;
   base_branch: string;
+  head_sha?: string;
+  /** The pull request is still marked as unfinished work. */
+  unfinished?: boolean;
+  checks?: ChecksSummary | null;
+}
+
+export interface ProviderInfo {
+  id: ProviderId;
+  label: string;
+  /** The server has a key for it in its environment. */
+  configured: boolean;
+  /** The model the server uses unless told otherwise. */
+  model: string;
+  key_variable: string;
+  model_variable: string;
 }
 
 export interface HealthEnv {
@@ -104,12 +170,67 @@ export interface HealthEnv {
   ready: boolean;
   missing: string[];
   variables: Record<string, boolean>;
-  llm: { provider: string; model: string } | null;
+  llm: {
+    provider: string;
+    model: string;
+    chain?: Array<{ provider: string; model: string }>;
+    fallback?: boolean;
+  } | null;
+  /** How the server chooses among providers, whether or not it has a key for any. */
+  llm_preferences?: { order: string[]; first_choice: string | null; fallback: boolean };
+  providers?: ProviderInfo[];
+  commits?: { authorship: string; author_configured: boolean; author_name: string | null };
+  automation?: { ci_autofix: boolean; ci_autofix_attempts: number; keep_unfinished_work: boolean };
+  /** What the server itself still lacks, by kind: a description, or null when it is there. */
+  needs?: { llm: string | null; sandbox: string | null; github: string | null };
   github: { auth_mode: 'app' | 'token' | 'none' };
+  webhooks?: { secret_configured: boolean };
   access: { mode: 'open' | 'key' | 'locked' };
   limits?: { task_budget_seconds: number; max_agent_turns: number };
   environment?: string;
   region?: string | null;
+}
+
+/** The answer of trying a provider key out. */
+export interface ProviderTest {
+  provider: string;
+  model: string | null;
+  ok: boolean;
+  /** The model called the test tool - what the agent needs it to do. */
+  tool_call: boolean;
+  latency_ms: number | null;
+  kind: string | null;
+  message: string;
+  key_source?: 'request' | 'server' | null;
+}
+
+export interface GitHubIdentity {
+  ok: boolean;
+  login: string;
+  name: string | null;
+  email: string | null;
+  avatar_url?: string | null;
+  html_url?: string | null;
+  error: string | null;
+}
+
+export interface AutomationStatus {
+  auth_mode: string;
+  ci_autofix: boolean;
+  attempts: number;
+  webhook_secret: boolean;
+  webhook_path: string;
+  app: { name?: string | null; slug?: string | null; settings_url?: string | null; permissions_url?: string | null } | null;
+  events: Array<{ id: string; label: string; subscribed: boolean | null }>;
+  permissions: Array<{ id: string; label: string; granted: boolean }>;
+  ready: boolean;
+  error: string | null;
+}
+
+export interface CommitChecks extends Partial<ChecksSummary> {
+  ok: boolean;
+  repository: string;
+  error: string | null;
 }
 
 export interface RepoSummary {
@@ -295,11 +416,14 @@ export function checkRepository(repository: string, branch: string): Promise<Rep
 /**
  * Look a task up. When the server instance that answers does not know the task
  * (serverless instances do not share memory), the backend searches GitHub for
- * the pull request the task opened, which is why the repository is passed.
+ * what the task left there, which is why the repository is passed: the pull
+ * request it opened, the first commit it made or - for a task that added to an
+ * existing pull request, whose number is then needed - the commit it added.
  */
-export function fetchTask(taskId: string, repository: string): Promise<TaskRecord> {
+export function fetchTask(taskId: string, repository: string, pullRequest?: number | null): Promise<TaskRecord> {
   const params = new URLSearchParams();
   if (repository) params.set('repository', repository);
+  if (repository && pullRequest) params.set('pull_request', String(pullRequest));
   const query = params.toString();
   return getJson<TaskRecord>(
     `/api/v1/tasks/${encodeURIComponent(taskId)}${query ? `?${query}` : ''}`,
@@ -307,19 +431,74 @@ export function fetchTask(taskId: string, repository: string): Promise<TaskRecor
   );
 }
 
-/** The pull request a task opened, as it is on GitHub right now. */
-export function fetchPullRequestStatus(taskId: string, repository: string): Promise<PullRequestStatus> {
+/**
+ * The pull request a task opened or added to, as it is on GitHub right now -
+ * its state and what CI says about its head commit. `number` is needed for a
+ * task that added to an existing pull request (it has no branch of its own).
+ */
+export function fetchPullRequestStatus(
+  taskId: string,
+  repository: string,
+  number?: number | null
+): Promise<PullRequestStatus> {
   const params = new URLSearchParams({ repository });
+  if (number) params.set('number', String(number));
   return getJson<PullRequestStatus>(
     `/api/v1/tasks/${encodeURIComponent(taskId)}/pull-request?${params.toString()}`,
     true
   );
 }
 
+/** What CI says about a commit or the head of a branch. */
+export function fetchChecks(repository: string, ref: string): Promise<CommitChecks> {
+  const params = new URLSearchParams({ repository, ref });
+  return getJson<CommitChecks>(`/api/v1/github/checks?${params.toString()}`, true);
+}
+
+/** Name and commit address (noreply) of a GitHub account. */
+export function fetchIdentity(login: string): Promise<GitHubIdentity> {
+  const params = new URLSearchParams({ login });
+  return getJson<GitHubIdentity>(`/api/v1/github/identity?${params.toString()}`, true);
+}
+
+export function fetchAutomation(): Promise<AutomationStatus> {
+  return getJson<AutomationStatus>('/api/v1/github/automation', true);
+}
+
+/**
+ * Try a provider out with one small request. The key typed into the dashboard
+ * is sent along (only that provider's); without one the server's own is tried.
+ */
+export async function testProvider(provider: ProviderId, key: string, model: string): Promise<ProviderTest> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    ...authHeaders(),
+  };
+  const trimmed = key.trim();
+  if (trimmed && /^[\x21-\x7e]+$/.test(trimmed)) headers[`X-${provider}-Key`] = trimmed;
+  const body: Record<string, string> = { provider };
+  if (model.trim()) body.model = model.trim();
+  const res = await fetch('/api/v1/llm/test', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    cache: 'no-store',
+  });
+  if (!res.ok) throw await toApiError(res);
+  return (await res.json()) as ProviderTest;
+}
+
 export interface TaskRequest {
   repository: string;
   branch: string; // '' = the repository's default branch
   prompt: string;
+  /** Add the work to this open pull request instead of opening a new one. */
+  pullRequest?: number | null;
+  /** The task is to fix the failed checks (of the pull request, or of the branch). */
+  fixChecks?: boolean;
+  /** The task finishes work an earlier run left unfinished. */
+  continueWork?: boolean;
 }
 
 /**
@@ -335,8 +514,17 @@ export async function streamTask(
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal
 ): Promise<boolean> {
-  const body: Record<string, string> = { repository: request.repository, prompt: request.prompt };
-  if (request.branch.trim()) body.branch = request.branch.trim();
+  const settings = getSettings();
+  const body: Record<string, unknown> = {
+    repository: request.repository,
+    prompt: request.prompt,
+    // Which provider to start with and how the commit is attributed.
+    ...taskOptions(settings),
+  };
+  if (request.pullRequest) body.pull_request = request.pullRequest;
+  else if (request.branch.trim()) body.branch = request.branch.trim();
+  if (request.fixChecks) body.fix_checks = true;
+  if (request.continueWork) body.continue_work = true;
 
   const res = await fetch('/api/v1/tasks/stream', {
     method: 'POST',
@@ -344,6 +532,8 @@ export async function streamTask(
       'Content-Type': 'application/json',
       Accept: 'application/x-ndjson',
       ...authHeaders(),
+      // Provider keys kept in this browser: used by the backend for this task only.
+      ...providerKeyHeaders(settings),
     },
     body: JSON.stringify(body),
     cache: 'no-store',
@@ -414,6 +604,15 @@ export function pullRequestUrl(task: Pick<TaskRecord, 'pr_url'> | null | undefin
 }
 
 const COMMIT_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/commit\/[0-9a-f]{40}$/;
+
+/** The link to the commit a task added to an existing pull request, or null. */
+export function addedCommitUrl(
+  task: Pick<TaskRecord, 'outcome' | 'commit_url'> | null | undefined
+): string | null {
+  if (!task || task.outcome !== 'pr_updated') return null;
+  const url = task.commit_url;
+  return typeof url === 'string' && COMMIT_URL.test(url) ? url : null;
+}
 
 /**
  * The link to the first commit of a repository that was empty, or null.

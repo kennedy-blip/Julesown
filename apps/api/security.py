@@ -11,11 +11,17 @@ deployment that must not be available to anyone who finds the URL, so:
 from __future__ import annotations
 
 import hmac
-from typing import Optional
+from typing import Dict, Optional
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, Request, status
 
-from .config import get_settings
+from .config import LLM_PROVIDERS, get_settings
+
+# Headers in which a caller can send its own model-provider keys along with a
+# request ("bring your own key"). The dashboard keeps such keys in the browser
+# and sends them only with the requests that need them.
+PROVIDER_KEY_HEADERS = {name: f"x-{name}-key" for name in LLM_PROVIDERS}
+MAX_KEY_LENGTH = 512
 
 LOCKED_MESSAGE = (
     "Task execution is locked on this deployment. Set the JULES_ACCESS_KEY environment variable "
@@ -83,3 +89,18 @@ def require_json_body(content_type: Optional[str] = Header(None)) -> None:
                 "message": "Send the task as JSON with the header Content-Type: application/json.",
             },
         )
+
+
+def provider_keys(request: Request) -> Dict[str, str]:
+    """Model-provider API keys sent with this request, by provider.
+
+    They are used for this one request, take precedence over the server's own
+    keys, and are neither stored nor logged. A value that cannot be a key
+    (blank, absurdly long, with spaces or control characters) is ignored.
+    """
+    found: Dict[str, str] = {}
+    for provider, header in PROVIDER_KEY_HEADERS.items():
+        value = (request.headers.get(header) or "").strip()
+        if value and len(value) <= MAX_KEY_LENGTH and value.isprintable() and " " not in value:
+            found[provider] = value
+    return found

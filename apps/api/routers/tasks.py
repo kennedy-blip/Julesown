@@ -20,13 +20,14 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
 from ..config import Settings, get_settings, platform_seconds_remaining
 from ..dependencies import get_runner_deps, get_task_runner
-from ..security import require_access, require_json_body
+from ..security import provider_keys, require_access, require_json_body
+from ..services.ci import UNFINISHED_PREFIX
 from ..services.github import GitHubError, PullRequest, parse_repository, validate_branch_name
 from ..services.runner import RunnerDeps, TaskRunner, pull_request_for_task
 from ..services.store import branch_for_task, normalize_task_id, task_store
@@ -41,6 +42,30 @@ HEARTBEAT_SECONDS = 10.0
 # --------------------------------------------------------------------------- #
 # Schemas
 # --------------------------------------------------------------------------- #
+class LLMOptions(BaseModel):
+    """Which model providers this task uses. Keys travel in headers, not here."""
+
+    primary: Optional[str] = Field(
+        None, description="Provider to start with (groq, gemini, openrouter, openai, anthropic). Omit for the server's order."
+    )
+    fallback: Optional[bool] = Field(
+        None, description="Carry on with the other configured providers when the one in use reaches a limit or fails."
+    )
+    order: Optional[List[str]] = Field(None, description="Order in which the remaining providers are tried.")
+    models: Optional[Dict[str, str]] = Field(None, description="Model per provider, e.g. {\"gemini\": \"gemini-flash-latest\"}.")
+
+
+class CommitOptions(BaseModel):
+    """Who the task's commit is attributed to."""
+
+    mode: Optional[str] = Field(
+        None,
+        description="bot: the GitHub App (default). coauthor: the App, with a Co-authored-by line for the person. user: the person is the author.",
+    )
+    name: Optional[str] = Field(None, max_length=100)
+    email: Optional[str] = Field(None, max_length=200)
+
+
 class TaskCreateRequest(BaseModel):
     repository: str = Field(
         ...,
@@ -53,11 +78,28 @@ class TaskCreateRequest(BaseModel):
         json_schema_extra={"example": "main"},
     )
     prompt: str = Field(
-        ...,
+        "",
         max_length=8000,
-        description="What the agent should do.",
+        description="What the agent should do. Optional when fix_checks is set.",
         json_schema_extra={"example": "Fix the failing date parsing test and add a regression test"},
     )
+    pull_request: Optional[int] = Field(
+        None,
+        gt=0,
+        description="Number of an open pull request to add the work to, instead of opening a new one.",
+    )
+    fix_checks: bool = Field(
+        False,
+        description=(
+            "Fix the failed checks (CI, deployment) of the pull request - or, without pull_request, of the "
+            "branch, in which case the fix arrives as a new pull request."
+        ),
+    )
+    continue_work: bool = Field(
+        False, description="This task finishes work that an earlier run left unfinished."
+    )
+    llm: Optional[LLMOptions] = None
+    commit: Optional[CommitOptions] = None
 
     @field_validator("repository")
     @classmethod
@@ -74,10 +116,15 @@ class TaskCreateRequest(BaseModel):
     @field_validator("prompt")
     @classmethod
     def _check_prompt(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _check_combination(self) -> "TaskCreateRequest":
+        if not self.prompt and not self.fix_checks:
             raise ValueError("Describe the task for the agent.")
-        return cleaned
+        if self.pull_request and self.branch:
+            raise ValueError("A task on a pull request works on that pull request's branch: leave branch empty.")
+        return self
 
 
 class LogEntry(BaseModel):
@@ -95,7 +142,8 @@ class TaskResponse(BaseModel):
     stage: Optional[str] = None
     logs: List[str] = []
     log_entries: List[LogEntry] = []
-    # pull_request | no_changes | initial_commit (the first commit of a repository that was empty)
+    # pull_request | pr_updated (a commit added to an existing pull request) | no_changes |
+    # initial_commit (the first commit of a repository that was empty)
     outcome: Optional[str] = None
     pr_url: Optional[str] = None
     pr_number: Optional[int] = None
@@ -118,6 +166,20 @@ class TaskResponse(BaseModel):
     error: Optional[str] = None
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
+    # Every provider configured for the run ("provider / model"), first choice first.
+    llm_chain: List[str] = []
+    # What each provider did: requests answered, failures, tokens.
+    llm_usage: List[Dict[str, Any]] = []
+    # More work on an existing pull request: its number. The result is added to it.
+    pull_request: Optional[int] = None
+    fix_checks: bool = False
+    continue_work: bool = False
+    failed_checks: List[Dict[str, Any]] = []
+    # The agent was stopped before it was done; what it had changed was delivered anyway.
+    unfinished: bool = False
+    stop_reason: Optional[str] = None  # timeout | llm_error | max_turns
+    unfinished_reason: Optional[str] = None  # why it was stopped, in words
+    commit_authorship: Optional[str] = None  # bot | coauthor | user, as applied
     sandbox: Optional[str] = None
     source: str = "api"
     recovered: bool = False
@@ -228,6 +290,44 @@ class PullRequestStatus(BaseModel):
     title: str = ""
     head_branch: str = ""
     base_branch: str = ""
+    head_sha: str = ""
+    unfinished: bool = False  # still marked as unfinished work
+    # What CI says about the head commit (see /github/checks); None when it could not be read.
+    checks: Optional[Dict[str, Any]] = None
+
+
+def task_extras(req: TaskCreateRequest) -> Dict[str, Any]:
+    """What a task record says about the kind of task it is."""
+    return {
+        "pull_request": req.pull_request,
+        "fix_checks": req.fix_checks,
+        "continue_work": req.continue_work,
+        # For a fix, the prompt shown is a description; what the user added is kept apart.
+        "instructions": req.prompt if req.fix_checks else "",
+    }
+
+
+def display_prompt(req: TaskCreateRequest) -> str:
+    if not req.fix_checks:
+        return req.prompt
+    where = f"pull request #{req.pull_request}" if req.pull_request else f"branch {req.branch or 'default'}"
+    return f"Fix the failed checks of {where}" + (f"\n\n{req.prompt}" if req.prompt else "")
+
+
+def runner_for(runner: TaskRunner, req: TaskCreateRequest, keys: Dict[str, str]) -> TaskRunner:
+    """The runner with this request's own choices applied: the API keys the
+    browser sent, its preferred provider, the commit identity. They apply to
+    this task only and are never stored."""
+    llm = req.llm
+    settings = runner.settings.with_overrides(
+        api_keys=keys,
+        models=llm.models if llm else None,
+        primary=llm.primary if llm else None,
+        fallback=llm.fallback if llm else None,
+        order=llm.order if llm else None,
+        commit=req.commit.model_dump() if req.commit else None,
+    )
+    return runner if settings is runner.settings else TaskRunner(settings, runner.store, runner.deps)
 
 
 def _without_logs(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -247,9 +347,13 @@ async def create_task(
     req: TaskCreateRequest,
     background_tasks: BackgroundTasks,
     runner: TaskRunner = Depends(get_task_runner),
+    keys: Dict[str, str] = Depends(provider_keys),
 ):
     """Create a task and run it in the background. Poll ``GET /{task_id}`` for progress."""
-    record = task_store.create(repository=req.repository, branch=req.branch, prompt=req.prompt)
+    runner = runner_for(runner, req, keys)
+    record = task_store.create(
+        repository=req.repository, branch=req.branch, prompt=display_prompt(req), extra=task_extras(req)
+    )
     task_store.log(record["task_id"], "info", f"Task queued for {req.repository}")
     background_tasks.add_task(
         runner.run, record["task_id"], budget_seconds=resolve_budget(runner.settings)
@@ -271,9 +375,22 @@ async def create_task(
         }
     },
 )
-async def stream_task(req: TaskCreateRequest, runner: TaskRunner = Depends(get_task_runner)):
-    """Create a task, run it within this request and stream its progress."""
-    record = task_store.create(repository=req.repository, branch=req.branch, prompt=req.prompt)
+async def stream_task(
+    req: TaskCreateRequest,
+    runner: TaskRunner = Depends(get_task_runner),
+    keys: Dict[str, str] = Depends(provider_keys),
+):
+    """Create a task, run it within this request and stream its progress.
+
+    API keys for model providers can be sent along in the headers ``X-Groq-Key``,
+    ``X-Gemini-Key``, ``X-OpenRouter-Key``, ``X-OpenAI-Key`` and
+    ``X-Anthropic-Key``. They are used for this task only, take precedence over
+    the server's own keys and are never stored or logged.
+    """
+    runner = runner_for(runner, req, keys)
+    record = task_store.create(
+        repository=req.repository, branch=req.branch, prompt=display_prompt(req), extra=task_extras(req)
+    )
     task_id = record["task_id"]
     budget = resolve_budget(runner.settings)
 
@@ -354,13 +471,70 @@ def _recovered_first_commit(task_id: str, slug: str, commit: Dict[str, Any]) -> 
         "empty_repository": True,
         "new_project": True,
         "summary": commit.get("title") or None,
+        "unfinished": str(commit.get("title") or "").startswith(UNFINISHED_PREFIX),
         "recovered": True,
         "created_at": now,
         "completed_at": now,
     }
 
 
-def _recover_from_github(task_id: str, repository: str, deps: RunnerDeps) -> Optional[Dict[str, Any]]:
+def _recover_follow_up(task_id: str, repository: str, number: int, deps: RunnerDeps) -> Optional[Dict[str, Any]]:
+    """The commit a task added to an existing pull request, if it got that far.
+
+    Such a task has no branch of its own to be found by: its commit is on the
+    pull request's branch, and carries the task's id.
+    """
+    slug = parse_repository(repository)
+    settings = get_settings()
+    if settings.github_auth_mode == "none":
+        return None
+    github = deps.github_factory(settings)
+    try:
+        try:
+            pull_request = github.get_pull_request(slug, number)
+        except GitHubError as exc:
+            if exc.code != "pull_request_not_found":
+                raise
+            return None
+        # From the head commit rather than the branch: that one is deleted when
+        # the pull request is merged, the commits stay.
+        commit = github.find_task_commit(slug, task_id, start=pull_request.head_sha or pull_request.head_branch)
+    finally:
+        github.close()
+    if commit is None:
+        return None
+    message = f"Recovered from GitHub: commit {str(commit['sha'])[:10]} on pull request #{pull_request.number}"
+    now = time.time()
+    return {
+        "task_id": task_id,
+        "repository": slug,
+        "branch": pull_request.head_branch,
+        "prompt": "",
+        "status": "completed",
+        "stage": "done",
+        "logs": [message],
+        "log_entries": [{"ts": now, "level": "success", "message": message}],
+        "outcome": "pr_updated",
+        "pull_request": pull_request.number,
+        "pr_url": pull_request.html_url,
+        "pr_number": pull_request.number,
+        "commit_sha": commit["sha"],
+        "commit_url": commit.get("html_url"),
+        "head_branch": pull_request.head_branch,
+        "base_branch": pull_request.base_branch,
+        "summary": commit.get("title") or None,
+        "unfinished": pull_request.title.startswith(UNFINISHED_PREFIX),
+        "recovered": True,
+        "created_at": now,
+        "completed_at": now,
+    }
+
+
+def _recover_from_github(
+    task_id: str, repository: str, deps: RunnerDeps, number: Optional[int] = None
+) -> Optional[Dict[str, Any]]:
+    if number:
+        return _recover_follow_up(task_id, repository, number, deps)
     slug, pull_request = _find_pull_request(task_id, repository, deps)
     if pull_request is None:
         # No pull request: the task may have made the first commit of a
@@ -385,6 +559,7 @@ def _recover_from_github(task_id: str, repository: str, deps: RunnerDeps) -> Opt
         "head_branch": pull_request.head_branch or branch_for_task(task_id),
         "base_branch": pull_request.base_branch,
         "summary": pull_request.title or None,
+        "unfinished": pull_request.title.startswith(UNFINISHED_PREFIX),
         "recovered": True,
         "created_at": now,
         "completed_at": now,
@@ -401,6 +576,14 @@ def get_task_status(
             "instance, its pull request is looked up on GitHub instead."
         ),
     ),
+    pull_request: Optional[int] = Query(
+        None,
+        gt=0,
+        description=(
+            "For a task that added to an existing pull request: its number. Such a task has no "
+            "branch of its own, so its commit is looked for on that pull request."
+        ),
+    ),
     deps: RunnerDeps = Depends(get_runner_deps),
 ):
     """Status and logs of a task."""
@@ -411,7 +594,7 @@ def get_task_status(
 
     if normalized and repository:
         try:
-            recovered = _recover_from_github(normalized, repository, deps)
+            recovered = _recover_from_github(normalized, repository, deps, pull_request)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail={"code": "invalid_request", "message": str(exc)})
         except GitHubError as exc:
@@ -442,20 +625,49 @@ def get_task_status(
 def get_task_pull_request(
     task_id: str,
     repository: str = Query(..., description="owner/name of the task's repository."),
+    number: Optional[int] = Query(
+        None,
+        gt=0,
+        description=(
+            "The pull request's number, if known. Needed for a task that added to an existing pull "
+            "request: that one is not on a branch named after the task."
+        ),
+    ),
     deps: RunnerDeps = Depends(get_runner_deps),
 ):
-    """The pull request a task opened, as it is on GitHub right now.
+    """The pull request a task opened or added to, as it is on GitHub right now.
 
     A task record says "pull request opened" forever; whether it has been
-    merged or closed since is only known to GitHub. The pull request is found
-    through the task's branch name, so this works on any server instance.
+    merged or closed since - and whether its checks pass - is only known to
+    GitHub. Without ``number`` the pull request is found through the task's
+    branch name, so this works on any server instance.
     """
     normalized = normalize_task_id(task_id)
     pull_request: Optional[PullRequest] = None
     slug = repository
+    checks: Optional[Dict[str, Any]] = None
     if normalized:
         try:
-            slug, pull_request = _find_pull_request(normalized, repository, deps)
+            slug = parse_repository(repository)
+            settings = get_settings()
+            if settings.github_auth_mode != "none":
+                github = deps.github_factory(settings)
+                try:
+                    if number:
+                        try:
+                            pull_request = github.get_pull_request(slug, number)
+                        except GitHubError as exc:
+                            if exc.code != "pull_request_not_found":
+                                raise
+                    else:
+                        pull_request = pull_request_for_task(github, slug, normalized)
+                    if pull_request is not None and pull_request.state == "open" and pull_request.head_sha:
+                        try:
+                            checks = github.checks_for(slug, pull_request.head_sha)
+                        except GitHubError:
+                            checks = None  # the pull request's state is still worth reporting
+                finally:
+                    github.close()
         except ValueError as exc:
             raise HTTPException(status_code=422, detail={"code": "invalid_request", "message": str(exc)})
         except GitHubError as exc:
@@ -480,6 +692,9 @@ def get_task_pull_request(
         title=pull_request.title,
         head_branch=pull_request.head_branch,
         base_branch=pull_request.base_branch,
+        head_sha=pull_request.head_sha,
+        unfinished=pull_request.title.startswith(UNFINISHED_PREFIX),
+        checks=checks,
     )
 
 

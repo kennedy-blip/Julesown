@@ -19,7 +19,7 @@ from .config import SERVICE_VERSION, env_str, load_local_env
 
 load_local_env()
 
-from .routers import github, health, tasks, webhooks  # noqa: E402  (after the environment is loaded)
+from .routers import github, health, llm, tasks, webhooks  # noqa: E402  (after the environment is loaded)
 
 app = FastAPI(
     title="Jules Agent Platform API",
@@ -55,6 +55,7 @@ if _cors_origins:
 app.include_router(health.router)
 app.include_router(webhooks.router)
 app.include_router(github.router)
+app.include_router(llm.router)
 app.include_router(tasks.router, prefix="/api/v1/tasks")
 # Unversioned alias kept for older clients.
 app.include_router(tasks.router, prefix="/api/tasks", include_in_schema=False)

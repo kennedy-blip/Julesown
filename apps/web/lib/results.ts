@@ -92,7 +92,9 @@ export function summarizeTests(task: TaskRecord | null, state: SessionState): Te
         tone: 'bad',
         label: 'Last run failed',
         advice:
-          "The agent's last test run failed. The pull request says so too. Review it carefully before merging.",
+          task && task.outcome === 'pr_updated'
+            ? "The agent's last test run failed. Its comment on the pull request says so too. Check the commit it added before merging."
+            : "The agent's last test run failed. The pull request says so too. Review it carefully before merging.",
       };
     case 'no_tests':
       // A test command ran but had nothing to test (for example npm's placeholder

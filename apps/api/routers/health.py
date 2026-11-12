@@ -7,12 +7,23 @@ from typing import Any, Dict
 
 from fastapi import APIRouter
 
-from ..config import SERVICE_NAME, SERVICE_VERSION, env_str, get_settings
+from ..config import (
+    LLM_PROVIDERS,
+    PROVIDER_KEY_VARIABLES,
+    PROVIDER_LABELS,
+    PROVIDER_MODEL_VARIABLES,
+    SERVICE_NAME,
+    SERVICE_VERSION,
+    env_str,
+    get_settings,
+)
 
 router = APIRouter(prefix="/api/v1/health", tags=["health"])
 
 REPORTED_VARIABLES = (
     "GROQ_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "E2B_API_KEY",
@@ -49,14 +60,61 @@ async def health_env_check():
     """
     settings = get_settings()
     variables = {name: bool(env_str(name)) for name in REPORTED_VARIABLES}
+    variables["GEMINI_API_KEY"] = bool(settings.gemini_api_key)  # GOOGLE_API_KEY counts too
     missing = settings.missing_requirements()
     provider = settings.llm_provider
+    chain = settings.llm_chain
+    identity = settings.commit_identity
     return {
         "status": "HEALTHY" if not missing else "INCOMPLETE",
         "ready": not missing,
         "missing": missing,
+        # The same by kind (llm, sandbox, github): what is missing, or null.
+        # A model key is the one thing a caller can bring along with a task
+        # (see the X-...-Key headers), so the dashboard treats it separately.
+        "needs": settings.needs(),
         "variables": variables,
-        "llm": {"provider": provider, "model": settings.llm_model} if provider else None,
+        "llm": {
+            "provider": provider,
+            "model": settings.llm_model,
+            # Every provider a task can use, first choice first. With more than
+            # one, a task carries on with the next when one reaches its limit.
+            "chain": [{"provider": name, "model": settings.model_for(name)} for name in chain],
+            "fallback": settings.llm_fallback,
+        }
+        if provider
+        else None,
+        # How providers are chosen, whether or not the server has a key for
+        # any: the dashboard works out from it what a task will use once the
+        # keys kept in the browser are counted in.
+        "llm_preferences": {
+            "order": settings.llm_preference,
+            "first_choice": settings.llm_provider_override,
+            "fallback": settings.llm_fallback,
+        },
+        # What the dashboard needs to offer the providers: their names, the
+        # server's default models and whether the server has a key for them.
+        "providers": [
+            {
+                "id": name,
+                "label": PROVIDER_LABELS[name],
+                "configured": bool(settings.api_key_for(name)),
+                "model": settings.model_for(name),
+                "key_variable": PROVIDER_KEY_VARIABLES[name],
+                "model_variable": PROVIDER_MODEL_VARIABLES[name],
+            }
+            for name in LLM_PROVIDERS
+        ],
+        "commits": {
+            "authorship": identity["mode"],
+            "author_configured": bool(identity["name"] and identity["email"]),
+            "author_name": identity["name"],
+        },
+        "automation": {
+            "ci_autofix": settings.ci_autofix,
+            "ci_autofix_attempts": settings.ci_autofix_attempts,
+            "keep_unfinished_work": settings.keep_unfinished_work,
+        },
         "github": {"auth_mode": settings.github_auth_mode},
         "sandbox": {"configured": bool(settings.e2b_api_key), "provider": "e2b"},
         "webhooks": {"secret_configured": bool(settings.github_webhook_secret)},

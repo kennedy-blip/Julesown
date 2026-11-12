@@ -5,6 +5,7 @@ import { Archive, Check, ExternalLink, GitFork, Loader2, Lock, RefreshCw, Search
 import { looksLikeRepository, normalizeRepository } from '@/lib/api';
 import type { AppInstallation, RepoListing, RepoSummary } from '@/lib/api';
 import { searchRepositories, timeAgo } from '@/lib/repoSearch';
+import { Panel } from './ui';
 
 interface RepositoryPickerProps {
   /** The repositories the backend's GitHub credentials can work on; null while not loaded. */
@@ -137,20 +138,23 @@ export function RepositoryPicker({ listing, loading, error, selected, onSelect, 
   }
 
   return (
-    <div className="space-y-1.5" data-testid="repository-picker">
-      <div className="flex items-center justify-between gap-2">
-        <label htmlFor="repository-search" className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+    <Panel
+      icon={<GitFork className="w-4 h-4 text-slate-400" />}
+      title={
+        <span className="inline-flex items-center gap-2">
           Repositories
           {listing && (
             <span
-              className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700/60 text-[10px] font-mono text-slate-300 normal-case tracking-normal"
+              className="px-1.5 py-0.5 rounded-md bg-slate-800 border border-slate-700/60 text-[11px] font-mono font-normal text-slate-300"
               data-testid="repo-count"
               title={`${plural(total, 'repository', 'repositories')} Jules can work on`}
             >
               {total.toLocaleString('en-US')}
             </span>
           )}
-        </label>
+        </span>
+      }
+      aside={
         <button
           type="button"
           onClick={onRefresh}
@@ -158,19 +162,22 @@ export function RepositoryPicker({ listing, loading, error, selected, onSelect, 
           title="Load the list again from GitHub"
           aria-label="Reload the repository list"
           data-testid="repo-refresh"
-          className="text-slate-500 hover:text-slate-200 disabled:opacity-40 disabled:hover:text-slate-500 transition-colors"
+          className="p-1.5 rounded-md text-slate-400 hover:text-slate-200 hover:bg-slate-800 disabled:opacity-40 disabled:hover:text-slate-400 disabled:hover:bg-transparent transition-colors"
         >
-          <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+          <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
         </button>
-      </div>
-
+      }
+      bodyClassName="p-4 space-y-2.5"
+      data-testid="repository-picker"
+    >
       <div className="relative">
-        <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-2.5 pointer-events-none" />
+        <Search className="w-4 h-4 text-slate-500 absolute left-3 top-2.5 pointer-events-none" />
         <input
           id="repository-search"
           ref={inputRef}
           type="text"
           role="combobox"
+          aria-label="Search repositories"
           aria-expanded={shown.length > 0}
           aria-controls="repository-options"
           aria-autocomplete="list"
@@ -191,7 +198,7 @@ export function RepositoryPicker({ listing, loading, error, selected, onSelect, 
           autoCorrect="off"
           spellCheck={false}
           data-testid="repo-search"
-          className="w-full bg-[#1e293b] border border-slate-700/60 rounded-lg pl-8 pr-8 py-2 text-xs text-slate-100 placeholder-slate-500 font-mono focus:border-blue-500 outline-none transition-colors disabled:opacity-60"
+          className="w-full h-9 bg-[#0b1220] border border-slate-700/70 hover:border-slate-600 focus:border-blue-500 focus:ring-1 focus:ring-blue-500/40 rounded-lg pl-9 pr-8 text-[13px] text-slate-100 placeholder-slate-500 font-mono outline-none transition-colors disabled:opacity-60"
         />
         {query && (
           <button
@@ -204,7 +211,7 @@ export function RepositoryPicker({ listing, loading, error, selected, onSelect, 
             data-testid="repo-search-clear"
             className="absolute right-2 top-2 p-0.5 text-slate-500 hover:text-slate-200"
           >
-            <X className="w-3.5 h-3.5" />
+            <X className="w-4 h-4" />
           </button>
         )}
       </div>
@@ -215,10 +222,10 @@ export function RepositoryPicker({ listing, loading, error, selected, onSelect, 
         role="listbox"
         aria-label="Repositories"
         data-testid="repo-list"
-        className="max-h-[264px] overflow-y-auto rounded-lg border border-slate-800/80 bg-[#0b1220] divide-y divide-slate-800/60"
+        className="max-h-[272px] overflow-y-auto rounded-lg border border-slate-800 bg-[#0b1220] divide-y divide-slate-800/70"
       >
         {!listing ? (
-          <div className="px-3 py-4 text-center text-[11px] text-slate-500" data-testid="repo-list-empty">
+          <div className="px-3 py-6 text-center text-xs text-slate-500" data-testid="repo-list-empty">
             {loading ? (
               <span className="inline-flex items-center gap-1.5">
                 <Loader2 className="w-3 h-3 animate-spin" /> Loading repositories…
@@ -228,7 +235,7 @@ export function RepositoryPicker({ listing, loading, error, selected, onSelect, 
             )}
           </div>
         ) : shown.length === 0 ? (
-          <div className="px-3 py-4 text-center text-[11px] text-slate-500 space-y-2" data-testid="repo-list-empty">
+          <div className="px-3 py-6 text-center text-xs text-slate-500 space-y-2" data-testid="repo-list-empty">
             <p>{repositories.length === 0 ? 'No repositories found.' : summary}</p>
             {canUseTyped && (
               <button
@@ -265,7 +272,7 @@ export function RepositoryPicker({ listing, loading, error, selected, onSelect, 
                 onMouseMove={() => {
                   if (index !== active) setActive(index);
                 }}
-                className={`flex items-center gap-2 px-2.5 py-1.5 text-xs cursor-pointer select-none ${
+                className={`flex items-center gap-2 px-2.5 h-[34px] text-xs cursor-pointer select-none ${
                   isSelected
                     ? 'bg-blue-500/15'
                     : index === active
@@ -305,7 +312,7 @@ export function RepositoryPicker({ listing, loading, error, selected, onSelect, 
         )}
       </div>
 
-      <div className="text-[11px] text-slate-500 space-y-1" data-testid="repo-listing-status">
+      <div className="text-[11px] leading-relaxed text-slate-500 space-y-1" data-testid="repo-listing-status">
         {listing && repositories.length > 0 && shown.length > 0 && <p data-testid="repo-summary">{summary}</p>}
         {listing && shown.length > 0 && canUseTyped && (
           <p>
@@ -351,6 +358,6 @@ export function RepositoryPicker({ listing, loading, error, selected, onSelect, 
           <p>Listed from the configured GITHUB_TOKEN. You can also type any repository it can push to.</p>
         )}
       </div>
-    </div>
+    </Panel>
   );
 }
