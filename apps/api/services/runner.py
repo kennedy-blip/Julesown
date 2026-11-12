@@ -19,9 +19,11 @@ instructions): then the agent starts from that pull request's branch and its
 commit is added to it (outcome ``pr_updated``). The branch only ever moves
 forward; if somebody pushed to it in the meantime, nothing is pushed over that.
 
-When the agent is stopped by the clock or by its model provider after it has
-changed files, that work is delivered all the same, marked as unfinished - it
-is not thrown away. A follow-up task can finish it.
+When the agent stops before the task is done - the clock, its model provider,
+the turn limit, or its own verdict that it cannot complete the task - after it
+has changed files, that work is delivered all the same, marked as unfinished.
+It is not thrown away. The task record then carries a ``handoff``: where the
+work stands, for the follow-up task that finishes it.
 """
 from __future__ import annotations
 
@@ -33,12 +35,18 @@ from typing import Any, Callable, Dict, List, Optional
 from ..config import Settings
 from .agent import AgentOutcome, CodingAgent
 from .ci import (
+    CONTINUE_NOTE,
+    GAVE_UP,
     UNFINISHED_PREFIX,
     build_fix_prompt,
     build_follow_up_prompt,
-    CONTINUE_NOTE,
+    build_handoff,
+    continue_note,
     describe_failed_checks,
+    failure_note,
+    handoff_from_commit,
     names_of,
+    standing_instructions,
 )
 from .common import Deadline, Redactor, clip, first_line
 from .github import GitHubClient, GitHubError, PullRequest, compare_url, noreply_address
@@ -51,9 +59,10 @@ logger = logging.getLogger("jules.runner")
 
 # Time kept back from the agent so the commit and pull request can still be made.
 COMMIT_RESERVE_SECONDS = 25.0
-# Why the agent stopped, for the cases in which what it had done is still worth
-# keeping: it was interrupted, it did not say the work is unusable.
-SALVAGEABLE_STOPS = ("timeout", "llm_error", "max_turns")
+# Why the agent stopped without finishing. In each of these cases what it had
+# changed is kept: interrupted work can be continued, and work the agent gave
+# up on is for its owner to judge - with the agent's explanation next to it.
+SALVAGEABLE_STOPS = ("timeout", "llm_error", "max_turns", "gave_up")
 # Below this much time left nothing is pushed any more: a half-made push is
 # worse than none.
 MIN_SECONDS_TO_DELIVER = 8.0
@@ -143,15 +152,22 @@ def build_pr_body(
     llm_label: str,
     new_project: bool = False,
     unfinished: Optional[str] = None,
+    continue_by_comment: bool = False,
 ) -> str:
     docs_only = is_docs_only(change.path for change in changeset.changes)
     lines: List[str] = []
     if unfinished:
+        # Where GitHub reaches this server, a comment is all it takes.
+        finish = (
+            "Comment `/jules continue` on this pull request to have it finished"
+            if continue_by_comment
+            else "A follow-up task can finish it"
+        )
         lines += [
             "> [!WARNING]",
-            f"> **Unfinished.** The agent was stopped before it was done: {unfinished.strip()}",
+            f"> **Unfinished.** {_unfinished_sentence(unfinished)}",
             "> What it had changed until then is in this pull request so that the work is not lost. "
-            "It may not build or pass its tests. A follow-up task can finish it; do not merge it as it is.",
+            f"It may not build or pass its tests. {finish}; do not merge it as it is.",
             "",
         ]
     lines += ["## Summary", "", outcome.summary.strip() or "_The agent did not write a summary._", ""]
@@ -240,11 +256,27 @@ def build_commit_message(
     if summary and summary != title:
         parts += ["", clip(summary, 2000, tail_share=0.0)]
     if unfinished:
-        parts += ["", f"Unfinished: the agent was stopped before it was done. {clip(unfinished, 500, tail_share=0.0)}"]
+        lead = "" if _gave_up(unfinished) else "the agent was stopped before it was done. "
+        parts += ["", "Unfinished: " + lead + clip(unfinished, 500, tail_share=0.0)]
+        # What still has to be fixed: the run that continues this reads it here.
+        still_failing = failure_note(outcome.last_failure)
+        if still_failing:
+            parts += ["", still_failing]
     # Trailers form the last paragraph: that is where git and GitHub look for
     # them ("Co-authored-by" is how GitHub credits a second author).
     parts += ["", f"Task-Id: {task_id}"] + list(trailers or [])
     return "\n".join(parts)
+
+
+def _gave_up(unfinished: str) -> bool:
+    """The agent stopped by itself (as opposed to being interrupted)."""
+    return unfinished.startswith(GAVE_UP)
+
+
+def _unfinished_sentence(unfinished: str) -> str:
+    """Why the work is unfinished, as a sentence for a pull request."""
+    text = unfinished.strip()
+    return text if _gave_up(text) else f"The agent was stopped before it was done: {text}"
 
 
 def resolve_commit_identity(settings: Settings, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -289,12 +321,20 @@ def resolve_commit_identity(settings: Settings, task: Dict[str, Any]) -> Dict[st
     }
 
 
-def models_used(llm: ChatClient) -> List[Dict[str, Any]]:
-    """Which providers answered during the run and how often."""
+def models_used(llm: ChatClient, served: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
+    """Which models answered during the run and how often.
+
+    A pool of models keeps the count itself. A single client does not: for it
+    ``served`` - the models the agent saw answer under a router's or an alias's
+    name - is all there is to add.
+    """
     usage = getattr(llm, "usage", None)
     if callable(usage):
         return [item for item in usage() if item.get("requests") or item.get("failures")]
-    return [{"provider": llm.provider, "model": llm.model}]
+    record: Dict[str, Any] = {"provider": llm.provider, "model": llm.model}
+    if served:
+        record["served"] = dict(served)
+    return [record]
 
 
 def build_follow_up_comment(
@@ -306,10 +346,13 @@ def build_follow_up_comment(
     changeset: ChangeSet,
     unfinished: Optional[str],
     fixed_checks: Optional[str],
+    continue_by_comment: bool = False,
 ) -> str:
     """The comment that tells a pull request what was just pushed to it."""
     where = f"[`{commit_sha[:10]}`]({commit_url})" if commit_url else f"`{commit_sha[:10]}`"
-    if unfinished:
+    if unfinished and _gave_up(unfinished):
+        head = f"⚠️ I pushed {where}, but I could not complete the task" + unfinished.strip()[len(GAVE_UP) :]
+    elif unfinished:
         head = f"⚠️ I pushed {where}, but I was stopped before I was done: {unfinished.strip()}"
     elif fixed_checks:
         head = f"🔧 I pushed {where} to fix the failed checks ({fixed_checks})."
@@ -326,6 +369,8 @@ def build_follow_up_comment(
     if tested:
         last = tested[-1]
         lines += ["", f"Last test run in the sandbox: `{clip(last.command, 120, tail_share=0.0)}` - {_verification_result(last)}"]
+    if unfinished and continue_by_comment:
+        lines += ["", "Comment `/jules continue` to have it finished."]
     lines += ["", f"<sub>Jules Clone · task `{task['task_id']}`</sub>"]
     return "\n".join(lines)
 
@@ -418,6 +463,8 @@ class TaskRunner:
             pull_number = task.get("pull_request")
             fix_checks = bool(task.get("fix_checks"))
             continuing = bool(task.get("continue_work"))
+            # Where the run this task continues had got to, if it said (see build_handoff).
+            previous_handoff = str(task.get("previous_handoff") or "") if continuing else ""
             # The pull request this task adds to, if it is more work on one that exists.
             target: Optional[PullRequest] = None
             empty_repository = False
@@ -543,9 +590,12 @@ class TaskRunner:
                         base=target.base_branch,
                         checks_text=checks_text,
                         continuing=continuing,
+                        handoff=previous_handoff,
                     )
             elif continuing:
-                agent_prompt = f"{task['prompt']}\n\n{CONTINUE_NOTE}"
+                agent_prompt = f"{task['prompt']}\n\n{continue_note(previous_handoff)}"
+            if continuing and previous_handoff:
+                emit("info", "Continuing from what the previous run reported when it stopped")
 
             # 3. Sandbox ------------------------------------------------------
             stage("sandbox", "Starting sandbox")
@@ -577,6 +627,13 @@ class TaskRunner:
                 files, total_files = checkout.list_files(limit=200)
                 key_files = checkout.key_files()
                 emit("info", f"Cloned {slug}@{base_branch} at {checkout.base_sha[:10]} ({total_files} files)")
+                if continuing and not previous_handoff and CONTINUE_NOTE in agent_prompt:
+                    # Nobody passed on where the earlier run had got to (the task was
+                    # started on GitHub, or from another browser): its commit says.
+                    previous_handoff = redact(handoff_from_commit(checkout.head_message()))
+                    if previous_handoff:
+                        agent_prompt = agent_prompt.replace(CONTINUE_NOTE, continue_note(previous_handoff), 1)
+                        emit("info", "Continuing from what the commit of the previous run says about where it stopped")
             # Nothing but a README, a licence or a .gitignore is not a project yet
             # either: the task is to build one, not to change one.
             new_project = empty_repository or has_no_code(files, total_files)
@@ -587,6 +644,12 @@ class TaskRunner:
                     f"{slug} has no code yet (only {', '.join(files) or 'no files'}): "
                     "the agent builds the project from scratch",
                 )
+
+            # The owner's own rules for every task, after the task itself.
+            guidelines = standing_instructions(settings.task_guidelines, str(task.get("guidelines") or ""))
+            if guidelines:
+                agent_prompt = f"{agent_prompt}\n\n{redact(guidelines)}"
+                emit("info", "Standing instructions are added to the task")
 
             # 5. Agent --------------------------------------------------------
             llm = self.deps.llm_factory(settings, lambda notice: emit("warn", notice))
@@ -615,7 +678,7 @@ class TaskRunner:
                 key_files=key_files,
             )
             tests_status = outcome.tests_status
-            used = models_used(llm)
+            used = models_used(llm, outcome.served)
             answered = [f"{item['provider']}/{item['model']}" for item in used if item.get("requests", 1)]
             update(
                 llm_provider=llm.provider,
@@ -633,7 +696,7 @@ class TaskRunner:
             if not outcome.finished:
                 reason = outcome.error or "The agent stopped before finishing."
                 if outcome.stop_reason == "gave_up":
-                    reason = f"The agent reported that it could not complete the task: {reason}"
+                    reason = f"{GAVE_UP}: {reason}"
                 if (
                     settings.keep_unfinished_work
                     and outcome.stop_reason in SALVAGEABLE_STOPS
@@ -648,11 +711,22 @@ class TaskRunner:
                     self._note_discarded_work(checkout, emit)
                     raise TaskFailed(reason)
                 unfinished = redact(reason)
-                update(unfinished=True, stop_reason=outcome.stop_reason, unfinished_reason=unfinished)
+                update(
+                    unfinished=True,
+                    stop_reason=outcome.stop_reason,
+                    unfinished_reason=unfinished,
+                    handoff=redact(
+                        build_handoff(summary=outcome.summary, reason=reason, last_failure=outcome.last_failure)
+                    ),
+                )
                 emit(
                     "warn",
-                    f"The agent was stopped before it was done ({unfinished.rstrip('.')}). What it "
-                    "changed until then is kept and delivered marked as unfinished.",
+                    (
+                        f"{unfinished.rstrip('.')}. "
+                        if outcome.stop_reason == "gave_up"
+                        else f"The agent was stopped before it was done ({unfinished.rstrip('.')}). "
+                    )
+                    + "What it changed until then is kept and delivered marked as unfinished.",
                 )
             else:
                 emit("info", f"Agent finished after {outcome.turns} model turns")
@@ -676,6 +750,10 @@ class TaskRunner:
                     if target
                     else "Finished without changing any files, so no pull request was opened.",
                 )
+                if target is not None and continuing and target.title.startswith(UNFINISHED_PREFIX):
+                    # Asked to finish the work, the agent found nothing left to
+                    # do: the pull request is complete as it is.
+                    self._clear_unfinished_mark(github, slug, target, redact(outcome.summary), task_id, emit)
                 return store.get(task_id) or task
             docs_only = is_docs_only(change.path for change in changeset.changes)
             update(changed_files=[change.summary() for change in changeset.changes], docs_only=docs_only)
@@ -687,7 +765,12 @@ class TaskRunner:
             )
 
             # 7. Commit + pull request ---------------------------------------
-            title = outcome.pr_title or first_line(outcome.summary) or first_line(task["prompt"])
+            if unfinished:
+                # What the agent wrote when it stopped is an account of where the
+                # work stands, not a title: without one, the task names the work.
+                title = outcome.pr_title or first_line(task["prompt"]) or first_line(outcome.summary)
+            else:
+                title = outcome.pr_title or first_line(outcome.summary) or first_line(task["prompt"])
             title = redact(title) or "Changes by Jules"
             if unfinished:
                 title = UNFINISHED_PREFIX + title
@@ -743,6 +826,7 @@ class TaskRunner:
                     stage=stage,
                     update=update,
                     emit=emit,
+                    continue_by_comment=bool(settings.github_webhook_secret),
                 )
                 return store.get(task_id) or task
             github.create_branch(slug, head_branch, commit["sha"])
@@ -766,6 +850,7 @@ class TaskRunner:
                             llm_label=", ".join(answered) or f"{llm.provider}/{llm.model}",
                             new_project=new_project,
                             unfinished=unfinished,
+                            continue_by_comment=bool(settings.github_webhook_secret),
                         )
                     ),
                 )
@@ -897,9 +982,9 @@ class TaskRunner:
         if unfinished:
             emit(
                 "warn",
-                "The project is unfinished: the agent was stopped before it was done, and what it had "
-                "built was pushed so that the work is not lost. It may not build yet. Run another task "
-                "on this repository to have it completed - that one arrives as a pull request.",
+                "The project is unfinished: what the agent had built when it stopped was pushed so "
+                "that the work is not lost. It may not build yet. Run another task on this repository "
+                "to have it completed - that one arrives as a pull request.",
             )
         elif tests_status == "failed":
             emit(
@@ -926,6 +1011,7 @@ class TaskRunner:
         stage: Callable[[str, str], None],
         update: Callable[..., None],
         emit: Callable[[str, str], None],
+        continue_by_comment: bool = False,
     ) -> None:
         """Deliver the work as a new commit on the branch of an existing pull request."""
         sha = commit["sha"]
@@ -968,6 +1054,7 @@ class TaskRunner:
                         changeset=changeset,
                         unfinished=unfinished,
                         fixed_checks=fixed_checks,
+                        continue_by_comment=continue_by_comment,
                     )
                 ),
             )
@@ -987,6 +1074,29 @@ class TaskRunner:
             emit("warn", "The work is still unfinished. Start another follow-up on the pull request to have it completed.")
         elif fixed_checks:
             emit("info", "GitHub runs the checks again for the new commit; their result shows on the pull request.")
+
+    @staticmethod
+    def _clear_unfinished_mark(
+        github: GitHubClient,
+        slug: str,
+        target: PullRequest,
+        summary: str,
+        task_id: str,
+        emit: Callable[[str, str], None],
+    ) -> None:
+        """Take the "[Unfinished]" mark off a pull request that a follow-up task
+        looked at and found complete."""
+        try:
+            github.update_pull_request(slug, target.number, title=target.title[len(UNFINISHED_PREFIX) :])
+            lines = ["✅ I went over this pull request to finish it and found nothing left to do: it is no longer marked as unfinished."]
+            if summary.strip():
+                lines += ["", summary.strip()]
+            lines += ["", f"<sub>Jules Clone · task `{task_id}`</sub>"]
+            github.create_issue_comment(slug, target.number, "\n".join(lines))
+        except GitHubError as exc:
+            emit("warn", f"The pull request could not be updated: {exc.describe()}")
+            return
+        emit("info", f"Pull request #{target.number} is no longer marked as unfinished")
 
     @staticmethod
     def _log_outcome(record: Dict[str, Any], elapsed: float) -> None:

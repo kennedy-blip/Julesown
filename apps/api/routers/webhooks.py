@@ -7,7 +7,8 @@ in an issue (when opening it) or in an issue comment, for example::
 
 The same line in a comment on a *pull request* asks for more work on that pull
 request: the result is added to its branch. ``/jules fix the checks`` (or just
-``/jules``) there asks for its failed checks to be fixed.
+``/jules``) there asks for its failed checks to be fixed, and ``/jules
+continue`` for work that a run left unfinished to be completed.
 
 Failed checks are also acted on unasked, for pull requests the agent opened
 itself (branches named ``jules/...``): when GitHub reports that a check suite,
@@ -56,6 +57,12 @@ FIX_CHECKS_RE = re.compile(
     r"(?:ci|checks?|builds?|tests?|deployments?|pipelines?)\W*$",
     re.IGNORECASE,
 )
+# "/jules continue", "/jules finish it", "/jules carry on": complete what a run left unfinished.
+CONTINUE_RE = re.compile(
+    r"^(?:please\s+)?(?:continue|carry\s+on|go\s+on|keep\s+going|resume|"
+    r"finish(?:\s+(?:it|this|that|the\s+(?:work|task|job|rest)))?)\W*$",
+    re.IGNORECASE,
+)
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
 # Branches the agent creates for its pull requests. Checks are only fixed
 # unasked on these: other people's branches are theirs to fix.
@@ -91,6 +98,8 @@ class Trigger:
     # Set for a comment on a pull request: the work is added to that pull request.
     pull_request: Optional[int] = None
     fix_checks: bool = False
+    # "/jules continue": the task completes what an earlier run left unfinished.
+    continue_work: bool = False
 
 
 @dataclass
@@ -203,15 +212,22 @@ def extract_trigger(event: str, payload: Dict[str, Any]) -> Tuple[Optional[Trigg
     author = str((source.get("user") or {}).get("login") or "unknown")
     author_id = (source.get("user") or {}).get("id")
     instructions = (match.group(1) + "\n" + text[match.end() :]).strip()
+    # "/jules continue": finish what was left unfinished. Lines after it are further instructions.
+    continuing = CONTINUE_RE.match(match.group(1).strip()) is not None
+    if continuing:
+        instructions = text[match.end() :].strip()
     if on_pull_request:
         # More work on this pull request. Without instructions, or when asked
         # to, that means fixing its failed checks.
-        fix_checks = not instructions or FIX_CHECKS_RE.match(instructions) is not None
-        prompt = (
-            f"Fix the failed checks of pull request #{issue_number}"
-            if fix_checks
-            else f"Instructions from @{author} on pull request #{issue_number}: {instructions}"
-        )
+        fix_checks = not continuing and (not instructions or FIX_CHECKS_RE.match(instructions) is not None)
+        if continuing:
+            prompt = f"Finish the work on pull request #{issue_number} that was left unfinished." + (
+                f"\n\nInstructions from @{author}: {instructions}" if instructions else ""
+            )
+        elif fix_checks:
+            prompt = f"Fix the failed checks of pull request #{issue_number}"
+        else:
+            prompt = f"Instructions from @{author} on pull request #{issue_number}: {instructions}"
         return (
             Trigger(
                 repository=repository,
@@ -221,6 +237,7 @@ def extract_trigger(event: str, payload: Dict[str, Any]) -> Tuple[Optional[Trigg
                 requester_id=author_id if isinstance(author_id, int) else None,
                 pull_request=issue_number,
                 fix_checks=fix_checks,
+                continue_work=continuing,
             ),
             "",
         )
@@ -243,6 +260,7 @@ def extract_trigger(event: str, payload: Dict[str, Any]) -> Tuple[Optional[Trigg
             prompt=prompt[:8000],
             requested_by=author,
             requester_id=author_id if isinstance(author_id, int) else None,
+            continue_work=continuing,
         ),
         "",
     )
@@ -251,6 +269,23 @@ def extract_trigger(event: str, payload: Dict[str, Any]) -> Tuple[Optional[Trigg
 def build_result_comment(task: Dict[str, Any]) -> str:
     footer = f"\n\n<sub>Jules Clone · task `{task['task_id']}`</sub>"
     summary = (task.get("summary") or "").strip()
+    if task.get("status") == "completed" and task.get("unfinished") and task.get("outcome") in ("pull_request", "initial_commit"):
+        # Work that was cut short is not announced as done.
+        reason = (task.get("unfinished_reason") or "The agent stopped before it was done.").strip()
+        if task.get("outcome") == "pull_request":
+            body = (
+                f"⚠️ I opened #{task['pr_number']} ({task['pr_url']}), but the work in it is unfinished: {reason}"
+                f"\n\nComment `/jules continue` on #{task['pr_number']} to have it finished; do not merge it as it is."
+            )
+        else:
+            where = task.get("commit_url") or f"commit `{str(task.get('commit_sha') or '')[:10]}`"
+            branch = task.get("base_branch") or "the default branch"
+            body = (
+                f"⚠️ The repository was empty, so I committed what I had built directly to `{branch}` ({where}) "
+                f"- but the project is unfinished: {reason}"
+                "\n\nComment `/jules continue` here to have it finished; the rest arrives as a pull request."
+            )
+        return "\n\n".join(part for part in (body, summary) if part) + footer
     if task.get("status") == "completed" and task.get("outcome") == "pull_request":
         tests = {
             "passed": "Tests passed in the sandbox.",
@@ -476,6 +511,7 @@ async def github_webhook_endpoint(
             "issue_number": trigger.issue_number,
             "pull_request": trigger.pull_request,
             "fix_checks": trigger.fix_checks,
+            "continue_work": trigger.continue_work,
             # Commits can be attributed to whoever asked for the work.
             "requested_by": {"login": trigger.requested_by, "id": trigger.requester_id},
         },

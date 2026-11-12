@@ -1288,6 +1288,9 @@ def _seconds(value: Any) -> Optional[float]:
 # How long a provider is passed over after a failure that says nothing about
 # when it will work again.
 COOLDOWN_UNKNOWN_RATE_LIMIT = 30.0
+# A router picks a model for every request. When the one it picked is throttled
+# upstream, the next request gets another pick: no need to stay away for long.
+COOLDOWN_ROUTER_PICK = 3.0
 COOLDOWN_TOO_LARGE = 60.0
 COOLDOWN_UNREACHABLE = 20.0
 COOLDOWN_REFUSED_REPLIES = 30.0
@@ -1296,6 +1299,26 @@ COOLDOWN_REFUSED_REPLIES = 30.0
 REFUSED_REPLIES_BEFORE_SWITCH = 2
 _OUT_FOR_THE_RUN = ("auth", "quota", "model_unavailable", "bad_request", "blocked")
 _SWITCH_KINDS = ("rate_limit", "too_large", "server", "network", "tool_format") + _OUT_FOR_THE_RUN
+# What takes a provider out with every one of its models: the key or the account.
+_OUT_FOR_THE_PROVIDER = ("auth", "quota")
+# How long a model is waited for (see FailoverClient.patience): the longest when
+# nobody else could take over, the shortest for one that has not answered yet
+# in this run while another is ready - a provider that accepts a request and
+# then hangs must not cost a third of the run.
+PATIENCE_ALONE = 90.0
+PATIENCE_UNPROVEN = 45.0
+
+
+def is_router(model: str) -> bool:
+    """A name that stands for a choice made per request: OpenRouter's own
+    routers (``openrouter/free``, ``openrouter/auto``)."""
+    return model.startswith("openrouter/")
+
+
+def _counts_as_free(client: Any) -> bool:
+    """OpenRouter's free allowance is one per account, shared by every free model."""
+    model = str(getattr(client, "model", "") or "")
+    return getattr(client, "provider", "") == "openrouter" and (model == "openrouter/free" or model.endswith(":free"))
 
 
 @dataclass
@@ -1308,6 +1331,10 @@ class _Slot:
     failures: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    slowest: float = 0.0  # the longest it took to answer in this run, in seconds
+    # The models that answered, when the configured one is a router or an alias
+    # that chooses (openrouter/free, gemini-flash-latest): name -> answers.
+    served: Dict[str, int] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -1327,6 +1354,10 @@ class FailoverClient:
 
     When every provider is waiting for its rate limit, the error carries the
     shortest of those waits, and the provider it belongs to is used next.
+
+    A provider can be in the pool more than once, with different models
+    (limits are counted per model). Each entry stands on its own, except that
+    a rejected key or an empty account takes out all entries of that provider.
     """
 
     def __init__(self, clients: Sequence[ChatClient], *, clock: Callable[[], float] = time.monotonic) -> None:
@@ -1370,9 +1401,32 @@ class FailoverClient:
                 "input_tokens": slot.input_tokens,
                 "output_tokens": slot.output_tokens,
                 "out": slot.out,
+                **({"served": dict(slot.served)} if slot.served else {}),
             }
             for slot in self._slots
         ]
+
+    def patience(self) -> float:
+        """Seconds the model in use is worth waiting for with the next request.
+
+        Without streaming, a model that is writing a long reply and one that
+        accepted the request and hangs look the same until the answer is
+        there. So the wait depends on what there is to go by: a model that has
+        answered in this run gets a multiple of the longest it took so far; one
+        that has not is given up on sooner - provided somebody else is ready to
+        take over, or will be by then. With nobody else, waiting is all there is.
+        """
+        now = self._clock()
+        current = self._slots[self._active]
+        others = [slot for slot in self._slots if slot is not current and slot.out is None]
+        if not others:
+            return PATIENCE_ALONE
+        base = PATIENCE_UNPROVEN
+        if current.requests:
+            base = max(PATIENCE_UNPROVEN, min(PATIENCE_ALONE, 3.0 * current.slowest + 10.0))
+        # Giving up on this one before another is free would only add a wait.
+        free_in = max(0.0, min(slot.ready_at for slot in others) - now)
+        return min(PATIENCE_ALONE, max(base, free_in + 15.0))
 
     def close(self) -> None:
         for slot in self._slots:
@@ -1390,6 +1444,7 @@ class FailoverClient:
         timeout: float,
     ) -> LLMResponse:
         slot = self._slots[self._active]
+        started = self._clock()
         try:
             response = slot.client.complete(
                 messages, tools, max_output_tokens=max_output_tokens, timeout=timeout
@@ -1401,10 +1456,13 @@ class FailoverClient:
             raise
         slot.requests += 1
         slot.refused_in_a_row = 0
+        slot.slowest = max(slot.slowest, self._clock() - started)
         usage = response.usage or {}
         slot.input_tokens += _count(usage, "prompt_tokens", "input_tokens")
         slot.output_tokens += _count(usage, "completion_tokens", "output_tokens")
         response.provider = response.provider or slot.client.provider
+        if response.model and response.model != slot.client.model:
+            slot.served[response.model] = slot.served.get(response.model, 0) + 1
         return response
 
     # ------------------------------------------------------------------ #
@@ -1414,6 +1472,14 @@ class FailoverClient:
         if kind == "rate_limit":
             if exc.daily:
                 slot.out = "its daily limit is used up"
+                if _counts_as_free(slot.client):
+                    # Counted per account, not per model: the other free models are out too.
+                    for other in self._slots:
+                        if other.out is None and _counts_as_free(other.client):
+                            other.out = slot.out
+            elif exc.retry_after is None and is_router(slot.client.model) and "upstream" in exc.message.lower():
+                # The model the router picked is throttled, not the account.
+                slot.ready_at = now + COOLDOWN_ROUTER_PICK
             else:
                 slot.ready_at = now + max(1.0, exc.retry_after or COOLDOWN_UNKNOWN_RATE_LIMIT)
         elif kind in _OUT_FOR_THE_RUN:
@@ -1422,6 +1488,11 @@ class FailoverClient:
                 "quota": "its account has no credit left",
                 "model_unavailable": "its model is not available",
             }.get(kind, "it refused the request")
+            if kind in _OUT_FOR_THE_PROVIDER:
+                # The key or the account: no other model of this provider will work either.
+                for other in self._slots:
+                    if other.out is None and other.client.provider == slot.client.provider:
+                        other.out = slot.out
         elif kind == "too_large":
             slot.ready_at = now + COOLDOWN_TOO_LARGE
         elif kind in ("server", "network"):
@@ -1516,10 +1587,13 @@ def build_provider_client(
     settings: Settings,
     provider: str,
     *,
+    model: Optional[str] = None,
     transport: Optional[httpx.BaseTransport] = None,
     on_notice: Optional[Notice] = None,
 ) -> ChatClient:
-    """The client for one provider, configured from ``settings``."""
+    """The client for one provider, configured from ``settings``, for
+    ``model`` or - without one - the first model configured for the provider."""
+    model = model or settings.model_for(provider) or ""
     if provider == "groq":
         optional: Dict[str, Any] = {}
         # Reasoning tokens count against Groq's per-minute token limits (8k on
@@ -1537,7 +1611,7 @@ def build_provider_client(
             provider="groq",
             base_url=settings.groq_base_url,
             api_key=settings.groq_api_key or "",
-            model=settings.groq_model,
+            model=model,
             model_env_var="GROQ_MODEL",
             model_preferences=GROQ_MODEL_PREFERENCES,
             optional_params=optional,
@@ -1556,7 +1630,7 @@ def build_provider_client(
             provider="openai",
             base_url=settings.openai_base_url,
             api_key=settings.openai_api_key or "",
-            model=settings.openai_model,
+            model=model,
             model_env_var="OPENAI_MODEL",
             model_preferences=OPENAI_MODEL_PREFERENCES,
             optional_params=optional,
@@ -1577,7 +1651,7 @@ def build_provider_client(
             provider="openrouter",
             base_url=settings.openrouter_base_url,
             api_key=settings.openrouter_api_key or "",
-            model=settings.openrouter_model,
+            model=model,
             model_env_var="OPENROUTER_MODEL",
             optional_params=optional,
             output_tokens_param="max_tokens",
@@ -1595,7 +1669,7 @@ def build_provider_client(
         return GeminiClient(
             base_url=settings.gemini_base_url,
             api_key=settings.gemini_api_key or "",
-            model=settings.gemini_model,
+            model=model,
             model_preferences=GEMINI_MODEL_PREFERENCES,
             thinking_level=_thinking_level(env_str("GEMINI_THINKING_LEVEL")),
             transport=transport,
@@ -1605,7 +1679,7 @@ def build_provider_client(
         return AnthropicClient(
             base_url=settings.anthropic_base_url,
             api_key=settings.anthropic_api_key or "",
-            model=settings.anthropic_model,
+            model=model,
             model_preferences=ANTHROPIC_MODEL_PREFERENCES,
             transport=transport,
             on_notice=on_notice,
@@ -1619,10 +1693,11 @@ def create_llm_client(
     transport: Optional[httpx.BaseTransport] = None,
     on_notice: Optional[Notice] = None,
 ) -> ChatClient:
-    """The client a task talks to: the first provider of the chain, with the
-    other configured ones behind it as fallbacks."""
-    chain = settings.llm_chain
-    if not chain:
+    """The client a task talks to: the first model of the first provider, with
+    the other configured providers and models behind it as fallbacks (in the
+    order of ``Settings.llm_slots``)."""
+    slots = settings.llm_slots
+    if not slots:
         raise LLMError(
             "No LLM provider is configured. Set "
             + ", ".join(PROVIDER_KEY_VARIABLES[name] for name in LLM_PROVIDERS[:-1])
@@ -1630,7 +1705,8 @@ def create_llm_client(
             kind="auth",
         )
     clients = [
-        build_provider_client(settings, name, transport=transport, on_notice=on_notice) for name in chain
+        build_provider_client(settings, name, model=model, transport=transport, on_notice=on_notice)
+        for name, model in slots
     ]
     return clients[0] if len(clients) == 1 else FailoverClient(clients)
 
@@ -1667,6 +1743,8 @@ def probe_provider(
 
     This is the same kind of request the agent makes, so a key that passes can
     run tasks: the key is accepted, the model exists and it calls tools.
+    When the provider is given several models, each one is tried: the result
+    describes the first, and ``models`` lists them all.
     Never raises; a failure is described in the result.
     """
     label = PROVIDER_LABELS.get(provider, provider)
@@ -1685,28 +1763,54 @@ def probe_provider(
     if not settings.api_key_for(provider):
         result.update(kind="no_key", message=f"No API key for {label} was sent or is set on the server.")
         return result
+    tried: List[Dict[str, Any]] = []
+    for model in settings.models_for(provider):
+        if tried and tried[0]["kind"] in _OUT_FOR_THE_PROVIDER:
+            break  # the key or the account: the other models would say the same
+        tried.append(_probe_model(settings, provider, model, label, transport, timeout))
+    result.update(tried[0])
+    if len(settings.models_for(provider)) > 1:
+        result["models"] = tried
+    return result
+
+
+def _probe_model(
+    settings: Settings,
+    provider: str,
+    model: str,
+    label: str,
+    transport: Optional[httpx.BaseTransport],
+    timeout: float,
+) -> Dict[str, Any]:
+    """One test request to one model of a provider."""
+    outcome: Dict[str, Any] = {"model": model, "ok": False, "tool_call": False, "latency_ms": None, "kind": None, "message": ""}
     notices: List[str] = []
-    client = build_provider_client(settings, provider, transport=transport, on_notice=notices.append)
+    client = build_provider_client(settings, provider, model=model, transport=transport, on_notice=notices.append)
     started = time.monotonic()
     try:
         response = client.complete(_PROBE_MESSAGES, [_PROBE_TOOL], max_output_tokens=1024, timeout=timeout)
     except LLMError as exc:
-        result.update(kind=exc.kind, message=exc.message, model=client.model)
-        return result
+        outcome.update(kind=exc.kind, message=exc.message, model=client.model)
+        return outcome
     finally:
         client.close()
     called = any(call.name == "confirm" for call in response.tool_calls)
-    result.update(
+    # A router or an alias answers with the model it chose.
+    chosen = response.model if response.model and response.model != client.model else ""
+    who = f"{client.model} (answered by {chosen})" if chosen else client.model
+    outcome.update(
         ok=True,
         tool_call=called,
         latency_ms=int((time.monotonic() - started) * 1000),
         model=client.model,
         message=(
-            f"{label} accepted the key and {client.model} called the test tool."
+            f"{label} accepted the key and {who} called the test tool."
             if called
-            else f"{label} accepted the key, but {client.model} answered in text instead of calling the "
+            else f"{label} accepted the key, but {who} answered in text instead of calling the "
             "test tool. The agent needs a model that calls tools reliably."
         )
         + (" " + " ".join(notices) if notices else ""),
     )
-    return result
+    if chosen:
+        outcome["answered_by"] = chosen
+    return outcome

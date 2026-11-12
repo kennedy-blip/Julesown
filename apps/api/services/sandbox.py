@@ -385,6 +385,13 @@ class RepoCheckout:
         checkout._exclude_junk()
         return checkout
 
+    def head_message(self) -> str:
+        """The message of the commit the work starts from ("" when there is none)."""
+        if self.empty:
+            return ""
+        result = self.git("log -1 --format=%B")
+        return result.stdout.strip() if result.ok else ""
+
     def _exclude_junk(self) -> None:
         patterns = " ".join(shlex.quote(pattern) for pattern in JUNK_EXCLUDES)
         self.git_shell(f"mkdir -p .git/info && printf '%s\\n' {patterns} >> .git/info/exclude")

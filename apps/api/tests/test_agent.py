@@ -15,6 +15,7 @@ from apps.api.services.agent import (
     CodingAgent,
     compact_history,
     history_size,
+    outline_of,
 )
 from apps.api.services.common import Deadline, Redactor, clip, plain_text
 from apps.api.services.llm import LLMError, LLMResponse, ToolCall
@@ -944,9 +945,84 @@ def test_compact_history_keeps_task_and_recent_messages():
     assert messages[0]["content"] == "system" and messages[1]["content"] == "the task"
     assert len(messages[3]["content"]) < 300 and "dropped to save context" in messages[3]["content"]
     shortened = json.loads(messages[2]["tool_calls"][0]["function"]["arguments"])
-    assert shortened["path"] == "a.py" and "characters omitted" in shortened["content"]
+    # A file the agent wrote is replaced by a note about it, not cut off mid-way.
+    assert shortened["path"] == "a.py" and shortened["content"].startswith("[1 lines, written to a.py as sent.")
+    assert "read_file shows the file" in shortened["content"] and len(shortened["content"]) < 400
     assert messages[5]["content"] == big  # inside the protected recent window
     assert history_size(messages) <= 7000
+
+
+def test_files_written_a_while_ago_are_kept_as_an_outline():
+    """Every request repeats the conversation. A project of many files would
+    be sent over and over; what a later file needs from an earlier one is what
+    that one declares."""
+    component = (
+        "import React from 'react';\n\n"
+        "export interface CardProps {\n  title: string;\n  children: React.ReactNode;\n}\n\n"
+        "export function Card({ title, children }: CardProps) {\n"
+        + "  // filler\n" * 150
+        + "  return <section>{children}</section>;\n}\n\n"
+        "export const Badge = ({ label }: { label: string }) => <span>{label}</span>;\n"
+    )
+
+    def write(call_id: str, path: str, content: str):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "write_file", "arguments": json.dumps({"path": path, "content": content})}}],
+            "_gemini_parts": [{"functionCall": {"name": "write_file"}}],
+        }
+
+    def result(call_id: str, path: str):
+        return {"role": "tool", "tool_call_id": call_id, "content": f"Wrote {path} (160 lines)."}
+
+    small = '{"name": "demo", "scripts": {"build": "vite build"}}\n'
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "the task"},
+        write("1", "package.json", small), result("1", "package.json"),
+        write("2", "src/ui.tsx", component), result("2", "src/ui.tsx"),
+        write("3", "src/more.tsx", component), result("3", "src/more.tsx"),
+        write("4", "src/App.tsx", component), result("4", "src/App.tsx"),
+    ]
+    before = history_size(messages)
+    # Below the soft budget nothing is touched...
+    assert compact_history(messages, budget=100_000, soft_budget=before + 1) is False
+    # ...above it the oldest large file goes first, and only as many as needed.
+    assert compact_history(messages, budget=100_000, soft_budget=before - 100, keep_recent=2) is True
+    first = json.loads(messages[4]["tool_calls"][0]["function"]["arguments"])
+    assert first["path"] == "src/ui.tsx"
+    assert first["content"].startswith("[162 lines, written to src/ui.tsx as sent.")
+    # What other files need to know about it is still there.
+    for declared in ("export interface CardProps {", "export function Card({ title, children }: CardProps) {", "export const Badge"):
+        assert declared in first["content"]
+    assert "// filler" not in first["content"] and len(first["content"]) < 600
+    # Provider-native copies of the call would still hold the whole file.
+    assert "_gemini_parts" not in messages[4] and "_gemini_parts" in messages[6]
+    # A small file stays as it is (a manifest is short and everything depends on it)...
+    assert json.loads(messages[2]["tool_calls"][0]["function"]["arguments"])["content"] == small
+    # ...and so do the files that were not needed to get under the budget, and the newest one.
+    assert json.loads(messages[6]["tool_calls"][0]["function"]["arguments"])["content"] == component
+    assert json.loads(messages[8]["tool_calls"][0]["function"]["arguments"])["content"] == component
+    # Tool results are not touched by this.
+    assert messages[5]["content"] == "Wrote src/ui.tsx (160 lines)."
+    # Asked for less, the next ones follow; the most recent messages never.
+    assert compact_history(messages, budget=100_000, soft_budget=1000, keep_recent=2) is True
+    assert json.loads(messages[6]["tool_calls"][0]["function"]["arguments"])["content"].startswith("[162 lines")
+    assert json.loads(messages[8]["tool_calls"][0]["function"]["arguments"])["content"] == component
+    # An outline is not outlined again.
+    again = json.loads(messages[4]["tool_calls"][0]["function"]["arguments"])["content"]
+    assert again == first["content"]
+
+
+def test_outline_of_a_file():
+    python = "import os\n\nclass Store:\n    def get(self):\n        return 1\n\ndef main():\n    pass\n"
+    assert outline_of(python) == "class Store:\ndef main():"
+    markdown = "# Title\n\nText.\n\n## Usage\n\nMore text.\n"
+    assert outline_of(markdown) == "# Title\n## Usage"
+    # Nothing recognisable: the beginning of the file.
+    assert outline_of("alpha\n\nbeta\ngamma\n") == "alpha\nbeta\ngamma"
+    assert len(outline_of("export const x = 1;\n" * 500)) <= 1204
 
 
 # --------------------------------------------------------------------------- #

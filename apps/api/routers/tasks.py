@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 
-from ..config import Settings, get_settings, platform_seconds_remaining
+from ..config import MAX_GUIDELINES_CHARS, Settings, get_settings, platform_seconds_remaining
 from ..dependencies import get_runner_deps, get_task_runner
 from ..security import provider_keys, require_access, require_json_body
 from ..services.ci import UNFINISHED_PREFIX
@@ -97,6 +97,23 @@ class TaskCreateRequest(BaseModel):
     )
     continue_work: bool = Field(
         False, description="This task finishes work that an earlier run left unfinished."
+    )
+    handoff: Optional[str] = Field(
+        None,
+        max_length=8000,
+        description=(
+            "With continue_work: the `handoff` of the task that is being continued - what that run "
+            "reported when it stopped. The agent starts from it instead of finding everything out again."
+        ),
+    )
+    guidelines: Optional[str] = Field(
+        None,
+        max_length=MAX_GUIDELINES_CHARS,
+        description=(
+            "Standing instructions: rules the caller wants followed in every task (conventions of the "
+            "stack, what a deployment needs). They are given to the agent after the task; they are not "
+            "part of the prompt shown in the result or the pull request."
+        ),
     )
     llm: Optional[LLMOptions] = None
     commit: Optional[CommitOptions] = None
@@ -175,10 +192,13 @@ class TaskResponse(BaseModel):
     fix_checks: bool = False
     continue_work: bool = False
     failed_checks: List[Dict[str, Any]] = []
-    # The agent was stopped before it was done; what it had changed was delivered anyway.
+    # The agent stopped before the task was done; what it had changed was delivered anyway.
     unfinished: bool = False
-    stop_reason: Optional[str] = None  # timeout | llm_error | max_turns
-    unfinished_reason: Optional[str] = None  # why it was stopped, in words
+    # timeout | llm_error | max_turns (it was interrupted) | gave_up (it reported that it cannot complete the task)
+    stop_reason: Optional[str] = None
+    unfinished_reason: Optional[str] = None  # why it stopped, in words
+    # Where the work stands, for the task that continues it (send it back as `handoff`).
+    handoff: Optional[str] = None
     commit_authorship: Optional[str] = None  # bot | coauthor | user, as applied
     sandbox: Optional[str] = None
     source: str = "api"
@@ -302,6 +322,9 @@ def task_extras(req: TaskCreateRequest) -> Dict[str, Any]:
         "pull_request": req.pull_request,
         "fix_checks": req.fix_checks,
         "continue_work": req.continue_work,
+        # What the run that this task continues left behind (not part of the task's own result).
+        "previous_handoff": (req.handoff or "").strip() if req.continue_work else "",
+        "guidelines": (req.guidelines or "").strip(),
         # For a fix, the prompt shown is a description; what the user added is kept apart.
         "instructions": req.prompt if req.fix_checks else "",
     }
@@ -330,8 +353,17 @@ def runner_for(runner: TaskRunner, req: TaskCreateRequest, keys: Dict[str, str])
     return runner if settings is runner.settings else TaskRunner(settings, runner.store, runner.deps)
 
 
+# What a caller sent along for the agent. It is theirs already and no part of
+# the result: it is not sent back with the task record.
+_INPUT_ONLY = ("previous_handoff", "guidelines")
+
+
+def _result(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in record.items() if key not in _INPUT_ONLY}
+
+
 def _without_logs(record: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: value for key, value in record.items() if key not in ("logs", "log_entries")}
+    return {key: value for key, value in _result(record).items() if key not in ("logs", "log_entries")}
 
 
 # --------------------------------------------------------------------------- #
@@ -407,7 +439,7 @@ async def stream_task(
                 completed_at=time.time(),
             )
             final = task_store.get(task_id) or record
-        emit({"type": "done", "task": final})
+        emit({"type": "done", "task": _result(final)})
 
     return TaskStreamResponse(produce)
 

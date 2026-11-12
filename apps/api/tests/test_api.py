@@ -82,7 +82,11 @@ def test_env_health_ready_and_never_leaks_values(client: TestClient, app_env, mo
     assert body["llm"] == {
         "provider": "groq",
         "model": "openai/gpt-oss-120b",
-        "chain": [{"provider": "groq", "model": "openai/gpt-oss-120b"}],
+        # One provider, two models: the second has its own rate limit.
+        "chain": [
+            {"provider": "groq", "model": "openai/gpt-oss-120b"},
+            {"provider": "groq", "model": "openai/gpt-oss-20b"},
+        ],
         "fallback": True,
     }
     assert [(item["id"], item["configured"]) for item in body["providers"]] == [
@@ -93,11 +97,17 @@ def test_env_health_ready_and_never_leaks_values(client: TestClient, app_env, mo
         "label": "Google Gemini",
         "configured": False,
         "model": "gemini-flash-latest",
+        "models": ["gemini-flash-latest", "gemini-3.5-flash-lite"],
         "key_variable": "GEMINI_API_KEY",
         "model_variable": "GEMINI_MODEL",
     }
     assert body["commits"] == {"authorship": "bot", "author_configured": False, "author_name": None}
-    assert body["automation"] == {"ci_autofix": True, "ci_autofix_attempts": 2, "keep_unfinished_work": True}
+    assert body["automation"] == {
+        "ci_autofix": True,
+        "ci_autofix_attempts": 2,
+        "keep_unfinished_work": True,
+        "task_guidelines": False,
+    }
     assert body["github"] == {"auth_mode": "app"} and body["access"] == {"mode": "key"}
     assert body["variables"]["GITHUB_APP_PRIVATE_KEY"] is True and body["variables"]["GITHUB_TOKEN"] is False
     for secret in ("open-sesame-123", "gsk_", "e2b_", "PRIVATE KEY"):
@@ -652,7 +662,10 @@ def test_llm_failure_is_not_papered_over(client: TestClient, token_env, install_
     assert github.pulls["acme/demo"] == [] and github.calls("POST", r"/git/") == []
 
 
-def test_agent_giving_up_discards_partial_work(client: TestClient, token_env, install_deps, github: FakeGitHub):
+def test_agent_giving_up_keeps_what_it_changed(client: TestClient, token_env, install_deps, github: FakeGitHub):
+    """Work is never thrown away because the agent did not get to the end of
+    it: what it changed is delivered marked as unfinished, with its own
+    explanation, for the owner of the repository to judge."""
     install_deps(
         ScriptedLLM(
             [
@@ -663,8 +676,39 @@ def test_agent_giving_up_discards_partial_work(client: TestClient, token_env, in
         )
     )
     _events, task = run_stream(client, TASK)
+    reason = "The agent reported that it could not complete the task: I could not find the module to change."
+    assert task["status"] == "completed" and task["outcome"] == "pull_request"
+    assert task["unfinished"] is True and task["stop_reason"] == "gave_up" and task["unfinished_reason"] == reason
+    assert task["summary"] == "I could not find the module to change."
+    pull = github.pulls["acme/demo"][0]
+    # The task names the work; what the agent wrote is why it stopped, not a title.
+    assert pull["title"] == "[Unfinished] " + TASK["prompt"]
+    assert pull["body"].startswith(f"> [!WARNING]\n> **Unfinished.** {reason}\n")
+    assert github.remote.show("acme/demo", task["head_branch"], "half.py") == "x = 1"
+    commit = github.remote.log("acme/demo", task["head_branch"])[0]
+    assert commit.startswith("[Unfinished] ")
+    warnings = messages(task, "warn")
+    assert f"{reason[:-1]}. What it changed until then is kept and delivered marked as unfinished." in warnings
+    assert not any("was discarded" in message for message in warnings)
+    # Where the work stands, for whoever continues it.
+    assert task["handoff"] == (
+        "Its own account when it stopped:\nI could not find the module to change.\n\n" f"Why it stopped: {reason}"
+    )
+
+
+def test_agent_giving_up_without_having_changed_anything_fails(client: TestClient, token_env, install_deps, github: FakeGitHub):
+    install_deps(
+        ScriptedLLM(
+            [
+                [("search_code", {"query": "multiply("})],
+                [("finish", {"summary": "I could not find the module to change.", "success": False})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
     assert_honest_failure(task, "agent", "could not complete the task", "could not find the module")
-    assert any("was discarded" in message for message in messages(task, "warn"))
+    assert task["unfinished"] is False and task["handoff"] is None
+    assert not any("discarded" in message for message in messages(task, "warn"))
     assert github.calls("POST", r"/git/|/pulls") == []
 
 
