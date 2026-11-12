@@ -60,6 +60,9 @@ def test_env_health_reports_what_is_missing(client: TestClient):
     body = client.get("/api/v1/health/env").json()
     assert body["status"] == "INCOMPLETE" and body["ready"] is False
     assert len(body["missing"]) == 3
+    # The same by kind, so that a caller that brings its own model key knows what else is missing.
+    assert list(body["needs"]) == ["llm", "sandbox", "github"]
+    assert [message for message in body["needs"].values()] == body["missing"]
     assert body["llm"] is None and body["github"] == {"auth_mode": "none"}
     assert body["access"] == {"mode": "open"}
     assert set(body["variables"].values()) == {False}
@@ -70,7 +73,31 @@ def test_env_health_ready_and_never_leaks_values(client: TestClient, app_env, mo
     response = client.get("/api/v1/health/env")
     body = response.json()
     assert body["status"] == "HEALTHY" and body["ready"] is True and body["missing"] == []
-    assert body["llm"] == {"provider": "groq", "model": "openai/gpt-oss-120b"}
+    assert body["needs"] == {"llm": None, "sandbox": None, "github": None}
+    assert body["llm_preferences"] == {
+        "order": ["groq", "gemini", "openrouter", "openai", "anthropic"],
+        "first_choice": None,
+        "fallback": True,
+    }
+    assert body["llm"] == {
+        "provider": "groq",
+        "model": "openai/gpt-oss-120b",
+        "chain": [{"provider": "groq", "model": "openai/gpt-oss-120b"}],
+        "fallback": True,
+    }
+    assert [(item["id"], item["configured"]) for item in body["providers"]] == [
+        ("groq", True), ("gemini", False), ("openrouter", False), ("openai", False), ("anthropic", False)
+    ]
+    assert body["providers"][1] == {
+        "id": "gemini",
+        "label": "Google Gemini",
+        "configured": False,
+        "model": "gemini-flash-latest",
+        "key_variable": "GEMINI_API_KEY",
+        "model_variable": "GEMINI_MODEL",
+    }
+    assert body["commits"] == {"authorship": "bot", "author_configured": False, "author_name": None}
+    assert body["automation"] == {"ci_autofix": True, "ci_autofix_attempts": 2, "keep_unfinished_work": True}
     assert body["github"] == {"auth_mode": "app"} and body["access"] == {"mode": "key"}
     assert body["variables"]["GITHUB_APP_PRIVATE_KEY"] is True and body["variables"]["GITHUB_TOKEN"] is False
     for secret in ("open-sesame-123", "gsk_", "e2b_", "PRIVATE KEY"):
@@ -149,7 +176,9 @@ def test_other_websites_cannot_start_tasks_from_a_visitors_browser(client: TestC
         ({"repository": "https://gitlab.com/a/b", "prompt": "x"}, "repository"),
         ({"repository": "acme/demo", "prompt": "   "}, "Describe the task"),
         ({"repository": "acme/demo", "prompt": "x", "branch": "bad branch"}, "branch"),
-        ({"repository": "acme/demo"}, "prompt"),
+        ({"repository": "acme/demo"}, "Describe the task"),
+        ({"repository": "acme/demo", "prompt": "x", "pull_request": 0}, "pull_request"),
+        ({"repository": "acme/demo", "prompt": "x", "pull_request": 3, "branch": "main"}, "leave branch empty"),
     ],
 )
 def test_invalid_requests_are_rejected_with_a_readable_message(client: TestClient, payload, fragment):
@@ -733,6 +762,7 @@ def test_finished_task_is_recovered_from_github(client: TestClient, token_env, i
     assert recovered.status_code == 200
     body = recovered.json()
     assert body["recovered"] is True and body["status"] == "completed" and body["outcome"] == "pull_request"
+    assert body["unfinished"] is False
     assert (body["pr_url"], body["pr_number"]) == (task["pr_url"], task["pr_number"])
     assert body["head_branch"] == task["head_branch"] and body["base_branch"] == "main"
     # Dashed ids (as older clients stored them) work too.
@@ -765,6 +795,9 @@ def test_pull_request_state_is_read_from_github(client: TestClient, token_env, i
         "title": "Fix add()",
         "head_branch": task["head_branch"],
         "base_branch": "main",
+        "head_sha": github.remote.rev("acme/demo", f"refs/heads/{task['head_branch']}"),
+        "unfinished": False,
+        "checks": {"sha": task["commit_sha"], "state": "none", "failing": [], "failed": 0, "passed": 0, "pending": 0, "notes": []},
     }
 
     pull = github.pulls["acme/demo"][0]
@@ -990,7 +1023,15 @@ def test_webhook_failure_is_commented_honestly(client: TestClient, token_env, in
         ("issue_comment", comment_event("/jules do it", association="NONE"), "only repository owners"),
         ("issue_comment", comment_event("/jules do it", association="CONTRIBUTOR"), "only repository owners"),
         ("issue_comment", comment_event("/jules do it", sender={"login": "x[bot]", "type": "Bot"}), "bots"),
-        ("issue_comment", comment_event("/jules do it", issue={"number": 7, "pull_request": {"url": "x"}}), "pull requests"),
+        # Checks that did not fail, or failed somewhere that is not the agent's to fix.
+        ("check_suite", {"action": "completed", "check_suite": {"conclusion": "success", "head_branch": "jules/task-1", "head_sha": "a" * 40}, "repository": {"full_name": "acme/demo"}}, "not a failure"),
+        ("check_suite", {"action": "requested", "check_suite": {"head_branch": "jules/task-1", "head_sha": "a" * 40}, "repository": {"full_name": "acme/demo"}}, "are not results"),
+        ("check_suite", {"action": "completed", "check_suite": {"conclusion": "failure", "head_branch": "feature/login", "head_sha": "a" * 40}, "repository": {"full_name": "acme/demo"}}, "only fixed unasked on pull requests opened by Jules"),
+        ("workflow_run", {"action": "completed", "workflow_run": {"conclusion": "cancelled", "head_branch": "jules/task-1", "head_sha": "a" * 40}, "repository": {"full_name": "acme/demo"}}, "not a failure"),
+        ("workflow_run", {"action": "completed", "workflow_run": {"conclusion": "failure", "head_branch": "jules/task-1", "head_sha": "a" * 40, "head_repository": {"full_name": "stranger/demo"}}, "repository": {"full_name": "acme/demo"}}, "fork"),
+        ("status", {"state": "success", "sha": "a" * 40, "branches": [{"name": "jules/task-1"}], "repository": {"full_name": "acme/demo"}}, "not a failure"),
+        ("status", {"state": "failure", "sha": "a" * 40, "branches": [{"name": "main"}], "context": "Vercel", "repository": {"full_name": "acme/demo"}}, "only fixed unasked"),
+        ("status", {"state": "failure", "sha": "a" * 40, "branches": [], "context": "Vercel", "repository": {"full_name": "acme/demo"}}, "did not say which branch"),
         ("issue_comment", comment_event("/julesy do it"), "no line starting with /jules"),
         ("issue_comment", {**comment_event("/jules do it"), "action": "edited"}, "do not start tasks"),
         ("push", {"ref": "refs/heads/main"}, "do not start tasks"),

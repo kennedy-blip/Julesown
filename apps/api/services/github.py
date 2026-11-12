@@ -286,6 +286,39 @@ class PullRequest:
     head_branch: str
     base_branch: str
     merged: bool = False
+    head_sha: str = ""
+    head_repository: str = ""  # owner/name of the repository the head branch lives in
+    author: str = ""
+
+
+# A check that ended in one of these says the commit is broken. "cancelled"
+# (superseded by a newer run) and "action_required" (waiting for a person) do not.
+FAILED_CHECK_CONCLUSIONS = ("failure", "timed_out", "startup_failure")
+FAILED_STATUS_STATES = ("failure", "error")
+MAX_REPORTED_CHECKS = 12
+CHECK_LOG_CHARS = 5000
+_LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z ?")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def log_excerpt(log: str, limit: int = CHECK_LOG_CHARS) -> str:
+    """The part of a CI job log that says what went wrong.
+
+    GitHub Actions marks failures with ``##[error]``; the lines leading up to
+    the last such marker are what a person would scroll to. Without a marker
+    the end of the log is used.
+    """
+    lines = [_ANSI_RE.sub("", _LOG_TIMESTAMP_RE.sub("", line)).rstrip() for line in log.splitlines()]
+    lines = [line for line in lines if line and not line.startswith("##[debug]")]
+    if not lines:
+        return ""
+    marks = [index for index, line in enumerate(lines) if "##[error]" in line]
+    end = min(len(lines), marks[-1] + 4) if marks else len(lines)
+    start = max(0, (marks[0] if marks else end) - 60, end - 140)
+    excerpt = "\n".join(lines[start:end])
+    if len(excerpt) > limit:
+        excerpt = "[...]\n" + excerpt[-limit:]
+    return excerpt
 
 
 # --------------------------------------------------------------------------- #
@@ -319,6 +352,8 @@ class GitHubClient:
         self._extra_secrets: List[str] = []
         self._jwt_cache: Optional[Tuple[str, float]] = None
         self._app_info: Optional[Dict[str, Any]] = None
+        # Who the commits are made by ({} once looked up without success).
+        self._committer: Optional[Dict[str, str]] = None
         self._pause: Callable[[float], None] = time.sleep  # between retries
         self._http = httpx.Client(
             base_url=api_url.rstrip("/"),
@@ -1000,8 +1035,19 @@ class GitHubClient:
         expected_tree_sha: Optional[str] = None,
         known_blobs: Iterable[str] = (),
         inline_text: bool = True,
+        author: Optional[Dict[str, str]] = None,
+        committer: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Create a commit on top of ``parent_sha`` containing ``changes``.
+
+        ``author`` (``name`` and ``email``) attributes the commit to a person.
+        Without it GitHub uses the App (or the owner of the token) as author
+        and committer - and signs the commit, which it only does for commits
+        made in the App's own name.
+
+        ``committer`` names who made the commit when it has another author
+        (see ``committer_identity``). This request needs it spelled out: left
+        out, GitHub records the author as the committer too.
 
         The resulting tree is compared with the sandbox index tree, so the
         commit is guaranteed to be exactly what was tested. Files uploaded as
@@ -1075,6 +1121,8 @@ class GitHubClient:
                 expected_tree_sha=expected_tree_sha,
                 known_blobs=already_stored,
                 inline_text=False,
+                author=author,
+                committer=committer,
             )
 
         tree_request: Dict[str, Any] = {"tree": entries}
@@ -1111,7 +1159,13 @@ class GitHubClient:
             f"/repos/{slug}/git/commits",
             bearer=token,
             action="creating the commit",
-            json_body={"message": message, "tree": tree_sha, "parents": [parent_sha]},
+            json_body={
+                "message": message,
+                "tree": tree_sha,
+                "parents": [parent_sha],
+                **({"author": commit_author(author)} if author else {}),
+                **({"committer": commit_author(committer)} if author and committer else {}),
+            },
             ok=(201,),
         )
         commit_sha = commit.get("sha")
@@ -1231,6 +1285,8 @@ class GitHubClient:
         message: str,
         first_message: str = "Initial commit",
         expected_tree_sha: Optional[str] = None,
+        author: Optional[Dict[str, str]] = None,
+        committer: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Put ``changes`` into a repository that has no commits yet.
 
@@ -1264,6 +1320,8 @@ class GitHubClient:
             json_body={
                 "message": message if only_file else first_message,
                 "content": first.content_b64 or "",
+                **({"author": commit_author(author)} if author else {}),
+                **({"committer": commit_author(committer)} if author and committer else {}),
             },
         )
         refusal = (response.text or "").lower()
@@ -1363,6 +1421,8 @@ class GitHubClient:
                         message=message,
                         expected_tree_sha=expected_tree_sha,
                         known_blobs=[first.sha] if first.sha else (),
+                        author=author,
+                        committer=committer,
                     )
                     self.update_branch(slug, branch, result["sha"])
                     break
@@ -1385,16 +1445,24 @@ class GitHubClient:
             raise incomplete(exc.describe(), exc) from exc
         return {**result, "branch": branch, "commits": 2}
 
-    def find_task_commit(self, slug: str, task_id: str) -> Optional[Dict[str, Any]]:
-        """The commit on the default branch that a task made directly (the first
-        commit of a repository that was empty), found by its ``Task-Id`` trailer."""
+    def find_task_commit(self, slug: str, task_id: str, start: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """A commit a task made, found by its ``Task-Id`` trailer.
+
+        Without ``start`` the default branch is searched: that is where the
+        first commit of a repository that was empty went. ``start`` (a commit
+        sha or a branch) searches from there instead, which finds the commit a
+        task added to a pull request.
+        """
         token = self.access_for(slug).token
+        params: Dict[str, Any] = {"per_page": 30}
+        if start:
+            params["sha"] = start
         response = self._send(
             "GET",
             f"/repos/{slug}/commits",
             bearer=token,
             action="looking up the task's commit",
-            params={"per_page": 30},
+            params=params,
         )
         if response.status_code in (404, 409):
             return None  # no such repository for these credentials, or still empty
@@ -1426,14 +1494,18 @@ class GitHubClient:
             raise GitHubError(
                 "GitHub's response did not include a pull request number and URL.", code="github_error"
             )
+        head = data.get("head") or {}
         return PullRequest(
             number=number,
             html_url=html_url,
             state=str(data.get("state") or "open"),
             title=str(data.get("title") or ""),
-            head_branch=str((data.get("head") or {}).get("ref") or ""),
+            head_branch=str(head.get("ref") or ""),
             base_branch=str((data.get("base") or {}).get("ref") or ""),
             merged=bool(data.get("merged_at")),
+            head_sha=str(head.get("sha") or ""),
+            head_repository=str((head.get("repo") or {}).get("full_name") or ""),
+            author=str((data.get("user") or {}).get("login") or ""),
         )
 
     def create_pull_request(
@@ -1477,6 +1549,300 @@ class GitHubClient:
             ok=(201,),
         )
         return data.get("html_url")
+
+    def list_issue_comments(self, slug: str, issue_number: int, limit: int = 300) -> List[Dict[str, Any]]:
+        """Comments on an issue or pull request, oldest first: ``body`` and ``author``."""
+        listed, _total, _more, _error = self._collect_pages(
+            f"/repos/{slug}/issues/{int(issue_number)}/comments",
+            bearer=self.access_for(slug).token,
+            action="reading the comments",
+            limit=limit,
+        )
+        return [
+            {"body": str(item.get("body") or ""), "author": str((item.get("user") or {}).get("login") or "")}
+            for item in listed
+            if isinstance(item, dict)
+        ]
+
+    # ------------------------------------------------------------------ #
+    # Pull requests that already exist
+    # ------------------------------------------------------------------ #
+    def get_pull_request(self, slug: str, number: int) -> PullRequest:
+        token = self.access_for(slug).token
+        response = self._send(
+            "GET", f"/repos/{slug}/pulls/{int(number)}", bearer=token, action=f"reading pull request #{number}"
+        )
+        if response.status_code == 404:
+            raise GitHubError(f"{slug} has no pull request #{number}.", status_code=404, code="pull_request_not_found")
+        if response.status_code != 200:
+            raise self._error(response, f"reading pull request #{number}")
+        return self._pull_request_from(response.json())
+
+    def update_pull_request(self, slug: str, number: int, *, title: Optional[str] = None, body: Optional[str] = None) -> None:
+        changes = {key: value for key, value in (("title", title), ("body", body)) if value is not None}
+        if not changes:
+            return
+        self._json(
+            "PATCH",
+            f"/repos/{slug}/pulls/{int(number)}",
+            bearer=self.access_for(slug).token,
+            action=f"updating pull request #{number}",
+            json_body=changes,
+            ok=(200,),
+        )
+
+    # ------------------------------------------------------------------ #
+    # Checks: what CI says about a commit
+    # ------------------------------------------------------------------ #
+    def checks_for(self, slug: str, sha: str) -> Dict[str, Any]:
+        """What GitHub knows about the checks of commit ``sha``.
+
+        Two sources are read: check runs (GitHub Actions and other check apps)
+        and commit statuses (how Vercel, among others, reports a deployment).
+        ``state`` is ``failure`` if anything failed, else ``pending`` if
+        anything is still running, else ``success``, or ``none`` when the
+        commit has no checks. ``failing`` lists what failed. A source the
+        credentials may not read is named in ``notes`` instead of being
+        counted as "no checks".
+        """
+        token = self.access_for(slug).token
+        failing: List[Dict[str, Any]] = []
+        notes: List[str] = []
+        passed = pending = 0
+        readable = False
+
+        response = self._send(
+            "GET",
+            f"/repos/{slug}/commits/{sha}/check-runs",
+            bearer=token,
+            action="reading the checks",
+            params={"per_page": 100, "filter": "latest"},
+        )
+        if response.status_code == 200:
+            readable = True
+            try:
+                runs = response.json().get("check_runs") or []
+            except (ValueError, AttributeError):
+                runs = []
+            for run in runs:
+                if not isinstance(run, dict):
+                    continue
+                conclusion = str(run.get("conclusion") or "")
+                if run.get("status") != "completed":
+                    pending += 1
+                elif conclusion in FAILED_CHECK_CONCLUSIONS:
+                    output = run.get("output") if isinstance(run.get("output"), dict) else {}
+                    failing.append(
+                        {
+                            "kind": "check_run",
+                            "id": run.get("id"),
+                            "name": str(run.get("name") or "check"),
+                            "conclusion": conclusion,
+                            "app": str((run.get("app") or {}).get("slug") or ""),
+                            "url": run.get("html_url") or run.get("details_url"),
+                            "summary": " - ".join(
+                                str(output.get(key)).strip() for key in ("title", "summary") if output.get(key)
+                            )[:600],
+                        }
+                    )
+                else:
+                    passed += 1
+        elif response.status_code in (403, 404):
+            notes.append("check runs could not be read (GitHub App permission 'Checks: Read-only' is missing)")
+        elif response.status_code != 422:  # 422: no commit with this sha
+            raise self._error(response, "reading the checks")
+
+        response = self._send(
+            "GET", f"/repos/{slug}/commits/{sha}/status", bearer=token, action="reading the commit statuses"
+        )
+        if response.status_code == 200:
+            readable = True
+            try:
+                statuses = response.json().get("statuses") or []
+            except (ValueError, AttributeError):
+                statuses = []
+            for status in statuses:
+                if not isinstance(status, dict):
+                    continue
+                state = str(status.get("state") or "")
+                if state == "pending":
+                    pending += 1
+                elif state in FAILED_STATUS_STATES:
+                    failing.append(
+                        {
+                            "kind": "status",
+                            "id": status.get("id"),
+                            "name": str(status.get("context") or "status"),
+                            "conclusion": state,
+                            "app": "",
+                            "url": status.get("target_url"),
+                            "summary": str(status.get("description") or "")[:600],
+                        }
+                    )
+                else:
+                    passed += 1
+        elif response.status_code in (403, 404):
+            notes.append(
+                "commit statuses could not be read (GitHub App permission 'Commit statuses: Read-only' is missing)"
+            )
+        elif response.status_code != 422:
+            raise self._error(response, "reading the commit statuses")
+
+        if failing:
+            state = "failure"
+        elif pending:
+            state = "pending"
+        elif passed:
+            state = "success"
+        else:
+            state = "none" if readable else "unknown"
+        return {
+            "sha": sha,
+            "state": state,
+            "failing": failing[:MAX_REPORTED_CHECKS],
+            "failed": len(failing),
+            "passed": passed,
+            "pending": pending,
+            "notes": notes,
+        }
+
+    def check_failure_details(self, slug: str, check: Dict[str, Any]) -> Dict[str, Any]:
+        """What can be learnt about one failed check: its annotations and, for
+        a GitHub Actions job, the part of the log that shows the failure.
+        Best effort - whatever cannot be read is simply left out."""
+        details: Dict[str, Any] = {"annotations": [], "log": ""}
+        if check.get("kind") != "check_run" or not check.get("id"):
+            return details
+        token = self.access_for(slug).token
+        try:
+            response = self._send(
+                "GET",
+                f"/repos/{slug}/check-runs/{check['id']}/annotations",
+                bearer=token,
+                action="reading the check's annotations",
+                params={"per_page": 30},
+            )
+            if response.status_code == 200:
+                for item in response.json() or []:
+                    if not isinstance(item, dict) or item.get("annotation_level") == "notice":
+                        continue
+                    # GitHub Actions files a failure of the job itself under ".github".
+                    where = str(item.get("path") or "")
+                    where = "" if where == ".github" else where
+                    if where and item.get("start_line"):
+                        where += f":{item['start_line']}"
+                    text = " ".join(str(item.get("message") or "").split())
+                    if text:
+                        details["annotations"].append(f"{where}: {text}" if where else text)
+            if check.get("app") == "github-actions":
+                # For GitHub Actions the check run is the job; its log is behind a redirect.
+                response = self._send(
+                    "GET",
+                    f"/repos/{slug}/actions/jobs/{check['id']}/logs",
+                    bearer=token,
+                    action="reading the job log",
+                )
+                if response.status_code == 200:
+                    details["log"] = log_excerpt(response.text or "")
+        except (GitHubError, ValueError):
+            pass
+        details["annotations"] = details["annotations"][:12]
+        return details
+
+    # ------------------------------------------------------------------ #
+    # People
+    # ------------------------------------------------------------------ #
+    def _reading_token(self) -> str:
+        """Any credential that can read public data: the token, else the token
+        of one of the App's installations."""
+        if self._token:
+            return self._token
+        if self.app_configured:
+            found, _count, _more, _error = self._collect_pages(
+                "/app/installations", bearer=self._app_jwt(), action="listing App installations", limit=PAGE_SIZE
+            )
+            for installation in found:
+                if isinstance(installation, dict) and "id" in installation and not installation.get("suspended_at"):
+                    token, _expires, _permissions = self._installation_token(int(installation["id"]))
+                    with self._lock:
+                        self._extra_secrets.append(token)
+                    return token
+        raise GitHubError("No GitHub credentials are configured.", code="no_credentials")
+
+    def committer_identity(self, slug: str) -> Optional[Dict[str, str]]:
+        """Name and address of the credential that makes the commits: the App's
+        bot account, or the owner of the token.
+
+        It is what GitHub itself puts on a commit made without further ado.
+        A commit authored as somebody else has to name it, or that person is
+        recorded as the committer as well. None when it cannot be found out.
+        """
+        with self._lock:
+            if self._committer is not None:
+                return dict(self._committer) or None
+        found: Dict[str, str] = {}
+        try:
+            token = self.access_for(slug).token
+            if self.auth_mode == "app":
+                login = f"{self.app_info().get('slug')}[bot]"
+                response = self._send(
+                    "GET", f"/users/{quote(login, safe='')}", bearer=token, action="looking up the App's bot account"
+                )
+            else:
+                login = ""
+                response = self._send("GET", "/user", bearer=token, action="looking up the owner of the token")
+            if response.status_code == 200:
+                data = response.json()
+                account = str(data.get("login") or login)
+                address = noreply_address(account, data.get("id"))
+                if account and address:
+                    # A bot is known by its login; a person by the name on the account.
+                    name = account if account.endswith("[bot]") else str(data.get("name") or account)
+                    found = {"name": name, "email": address}
+        except (GitHubError, ValueError, TypeError):
+            found = {}
+        with self._lock:
+            self._committer = found
+        return dict(found) or None
+
+    def user_identity(self, login: str) -> Dict[str, Any]:
+        """Name and commit e-mail address of a GitHub account.
+
+        The address is the account's ``noreply`` one: GitHub attributes commits
+        that carry it to the account without publishing a private address.
+        """
+        cleaned = (login or "").strip().lstrip("@")
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?", cleaned):
+            raise GitHubError(f"'{login}' is not a GitHub user name.", code="invalid_user")
+        response = self._send(
+            "GET", f"/users/{cleaned}", bearer=self._reading_token(), action=f"looking up the GitHub user {cleaned}"
+        )
+        if response.status_code == 404:
+            raise GitHubError(f"There is no GitHub user '{cleaned}'.", status_code=404, code="user_not_found")
+        if response.status_code != 200:
+            raise self._error(response, f"looking up the GitHub user {cleaned}")
+        data = response.json()
+        account, user_id = str(data.get("login") or cleaned), data.get("id")
+        return {
+            "login": account,
+            "name": str(data.get("name") or account),
+            "email": f"{user_id}+{account}@users.noreply.github.com" if user_id else None,
+            "avatar_url": data.get("avatar_url"),
+            "html_url": data.get("html_url") or f"https://github.com/{account}",
+        }
+
+
+def commit_author(author: Dict[str, str]) -> Dict[str, str]:
+    """The ``author`` object of a commit request."""
+    return {"name": str(author.get("name") or ""), "email": str(author.get("email") or "")}
+
+
+def noreply_address(login: str, user_id: Any) -> Optional[str]:
+    """The commit address GitHub ties to an account: ``id+login@users.noreply.github.com``."""
+    try:
+        return f"{int(user_id)}+{login}@users.noreply.github.com" if login else None
+    except (TypeError, ValueError):
+        return None
 
 
 def compare_url(slug: str, base: str, head: str) -> str:

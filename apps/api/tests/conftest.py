@@ -35,6 +35,24 @@ CONFIG_VARIABLES = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_MODEL",
     "ANTHROPIC_BASE_URL",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_MODEL",
+    "GEMINI_BASE_URL",
+    "GEMINI_THINKING_LEVEL",
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_MODEL",
+    "OPENROUTER_BASE_URL",
+    "OPENROUTER_REASONING_EFFORT",
+    "OPENROUTER_TEMPERATURE",
+    "JULES_LLM_FALLBACK",
+    "JULES_LLM_ORDER",
+    "JULES_COMMIT_AUTHORSHIP",
+    "JULES_COMMIT_AUTHOR_NAME",
+    "JULES_COMMIT_AUTHOR_EMAIL",
+    "JULES_CI_AUTOFIX",
+    "JULES_CI_AUTOFIX_ATTEMPTS",
+    "JULES_KEEP_UNFINISHED_WORK",
     "E2B_API_KEY",
     "E2B_TEMPLATE",
     "GITHUB_TOKEN",
@@ -68,6 +86,7 @@ def isolated_state(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     task_store.clear()
     webhooks._seen_deliveries.clear()
+    webhooks._claimed_commits.clear()
     app.dependency_overrides.clear()
     yield
     app.dependency_overrides.clear()

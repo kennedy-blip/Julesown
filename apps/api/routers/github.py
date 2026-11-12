@@ -6,6 +6,7 @@ instead of a 404.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Mapping, Optional
 from urllib.parse import urlencode
 
@@ -19,6 +20,7 @@ from ..services.github import GitHubError, parse_repository
 from ..services.runner import RunnerDeps
 
 router = APIRouter(prefix="/api/v1/github", tags=["github"])
+_SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 _SETUP_ACTIONS = ("install", "update", "request")
 
@@ -185,6 +187,150 @@ def check_repository(
             result["ok"] = True
     except GitHubError as exc:
         result.update(code=exc.code, error=exc.describe())
+    finally:
+        github.close()
+    return result
+
+
+@router.get("/checks", dependencies=[Depends(require_access)])
+def commit_checks(
+    repository: str = Query(..., description="owner/name or a GitHub URL"),
+    ref: str = Query(..., description="A commit sha or a branch name"),
+    deps: RunnerDeps = Depends(get_runner_deps),
+) -> Dict[str, Any]:
+    """What CI says about a commit: check runs (GitHub Actions and other check
+    apps) and commit statuses (deployments by Vercel and the like).
+
+    ``state`` is ``failure``, ``pending``, ``success``, ``none`` (the commit has
+    no checks) or ``unknown`` (the credentials may not read them; ``notes``
+    says which permission is missing).
+    """
+    settings = get_settings()
+    result: Dict[str, Any] = {"ok": False, "repository": repository, "sha": None, "state": "unknown", "error": None}
+    try:
+        slug = parse_repository(repository)
+    except ValueError as exc:
+        result["error"] = str(exc)
+        return result
+    result["repository"] = slug
+    if settings.github_auth_mode == "none":
+        result["error"] = "No GitHub credentials are configured."
+        return result
+    github = deps.github_factory(settings)
+    try:
+        wanted = ref.strip()
+        sha = wanted if _SHA_RE.fullmatch(wanted) else github.get_branch_sha(slug, wanted)
+        if not sha:
+            result["error"] = f"{slug} has no branch or commit '{wanted}'."
+            return result
+        result.update(ok=True, **github.checks_for(slug, sha))
+    except GitHubError as exc:
+        result["error"] = exc.describe()
+    finally:
+        github.close()
+    return result
+
+
+@router.get("/identity", dependencies=[Depends(require_access)])
+def github_identity(
+    login: str = Query(..., min_length=1, max_length=60, description="A GitHub user name"),
+    deps: RunnerDeps = Depends(get_runner_deps),
+) -> Dict[str, Any]:
+    """Name and commit e-mail address of a GitHub account, for commits that are
+    to be attributed to a person. The address is the account's ``noreply``
+    address, which GitHub ties to the account without exposing a private one."""
+    settings = get_settings()
+    result: Dict[str, Any] = {"ok": False, "login": login, "name": None, "email": None, "error": None}
+    if settings.github_auth_mode == "none":
+        result["error"] = "No GitHub credentials are configured."
+        return result
+    github = deps.github_factory(settings)
+    try:
+        result.update(ok=True, **github.user_identity(login))
+    except GitHubError as exc:
+        result["error"] = exc.describe()
+    finally:
+        github.close()
+    return result
+
+
+# What the GitHub App needs in order to be told about failed checks, and to read them.
+AUTOMATION_EVENTS = {
+    "check_suite": "Check suite",
+    "status": "Status",
+    "workflow_run": "Workflow run",
+    "issue_comment": "Issue comment",
+}
+AUTOMATION_PERMISSIONS = {
+    "checks": "Checks",
+    "statuses": "Commit statuses",
+    "actions": "Actions",
+}
+
+
+@router.get("/automation", dependencies=[Depends(require_access)])
+def automation_status(deps: RunnerDeps = Depends(get_runner_deps)) -> Dict[str, Any]:
+    """Whether failed checks can be fixed automatically, and what is missing.
+
+    Fixing on request (from the dashboard or with ``/jules`` in a comment)
+    only needs to read the checks. Fixing unasked needs GitHub to tell this
+    server about failed checks: a webhook secret, and the GitHub App
+    subscribed to the events.
+    """
+    settings = get_settings()
+    result: Dict[str, Any] = {
+        "auth_mode": settings.github_auth_mode,
+        "ci_autofix": settings.ci_autofix,
+        "attempts": settings.ci_autofix_attempts,
+        "webhook_secret": bool(settings.github_webhook_secret),
+        "webhook_path": "/api/v1/webhooks/github",
+        "app": None,
+        "events": [],
+        "permissions": [],
+        "ready": False,
+        "error": None,
+    }
+    if not settings.github_app_configured:
+        # A personal token reads checks without further ado, but GitHub has
+        # nobody to send events to on its behalf except a repository webhook.
+        result["events"] = [
+            {"id": key, "label": label, "subscribed": None} for key, label in AUTOMATION_EVENTS.items()
+        ]
+        result["ready"] = bool(settings.ci_autofix and settings.github_webhook_secret and settings.github_token)
+        return result
+    github = deps.github_factory(settings)
+    try:
+        info = github.app_info()
+        subscribed = set(info.get("events") or [])
+        granted = info.get("permissions") or {}
+        slug, owner = info.get("slug"), info.get("owner") or {}
+        # An App owned by an organization is configured under that organization.
+        settings_url = None
+        if slug:
+            if owner.get("type") == "Organization" and owner.get("login"):
+                settings_url = f"https://github.com/organizations/{owner['login']}/settings/apps/{slug}"
+            else:
+                settings_url = f"https://github.com/settings/apps/{slug}"
+        result["app"] = {
+            "name": info.get("name"),
+            "slug": slug,
+            "settings_url": settings_url,
+            "permissions_url": f"{settings_url}/permissions" if settings_url else None,
+        }
+        result["events"] = [
+            {"id": key, "label": label, "subscribed": key in subscribed} for key, label in AUTOMATION_EVENTS.items()
+        ]
+        result["permissions"] = [
+            {"id": key, "label": label, "granted": granted.get(key) in ("read", "write")}
+            for key, label in AUTOMATION_PERMISSIONS.items()
+        ]
+        result["ready"] = bool(
+            settings.ci_autofix
+            and settings.github_webhook_secret
+            and subscribed & {"check_suite", "status", "workflow_run"}
+        )
+    except GitHubError as exc:
+        result["error"] = exc.describe()
     finally:
         github.close()
     return result

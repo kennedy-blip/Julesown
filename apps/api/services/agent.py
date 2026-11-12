@@ -31,6 +31,9 @@ MAX_NUDGES = 2
 # How often one model call is repeated when the provider refuses the model's
 # reply as an invalid tool call (a known habit of some hosted open models).
 MAX_FORMAT_RETRIES = 3
+# How often one model call may move on to another provider (several can be
+# configured as fallbacks) before the failure is final.
+MAX_PROVIDER_SWITCHES = 6
 MAX_REPORTED_FILES = 60
 # When this little of the time budget is left, the model is asked once to wrap
 # up, so that a run which is nearly done ends with a result instead of a
@@ -120,13 +123,27 @@ _DELIVERY_PULL_REQUEST = (
 )
 
 
-def system_prompt_for(*, new_project: bool, first_commit: bool) -> str:
-    """The instructions for this kind of repository."""
+_DELIVERY_UPDATE = (
+    "after you call finish, the platform adds your working tree as a new commit to the existing pull request."
+)
+
+
+def system_prompt_for(*, new_project: bool, first_commit: bool, update: bool = False) -> str:
+    """The instructions for this kind of repository and this way of delivering.
+
+    ``update``: the work goes onto the branch of a pull request that already
+    exists instead of into a new one.
+    """
     if not new_project:
-        return SYSTEM_PROMPT
-    return NEW_PROJECT_PROMPT.format(
-        delivery=_DELIVERY_FIRST_COMMIT if first_commit else _DELIVERY_PULL_REQUEST
-    )
+        if not update:
+            return SYSTEM_PROMPT
+        return SYSTEM_PROMPT.replace(
+            "after you call finish, the platform commits your working tree and opens the pull request for you.",
+            _DELIVERY_UPDATE,
+        ).replace("and a pull request title.", "and a title for the commit (pr_title).")
+    if first_commit:
+        return NEW_PROJECT_PROMPT.format(delivery=_DELIVERY_FIRST_COMMIT)
+    return NEW_PROJECT_PROMPT.format(delivery=_DELIVERY_UPDATE if update else _DELIVERY_PULL_REQUEST)
 
 
 AGENT_TOOLS: List[Dict[str, Any]] = [
@@ -335,8 +352,7 @@ def compact_history(messages: List[Dict[str, Any]], budget: int, *, keep_recent:
                 message["content"] = content[:200] + "\n[... older tool output dropped to save context ...]"
                 changed = True
         elif message.get("role") == "assistant":
-            # Provider-native blocks would no longer match the shortened calls.
-            message.pop("_anthropic_content", None)
+            native = [key for key in message if key.startswith("_")]
             for call in message.get("tool_calls") or []:
                 function = call.get("function", {})
                 raw = function.get("arguments") or ""
@@ -352,6 +368,11 @@ def compact_history(messages: List[Dict[str, Any]], budget: int, *, keep_recent:
                     if isinstance(value, str) and len(value) > 200:
                         arguments[key] = value[:120] + f" [... {len(value) - 120} characters omitted ...]"
                 function["arguments"] = json.dumps(arguments)
+                # Provider-native blocks (Anthropic's content, Gemini's parts)
+                # would no longer match the shortened calls.
+                for key in native:
+                    message.pop(key, None)
+                native = []
                 changed = True
         if history_size(messages) <= budget:
             break
@@ -413,7 +434,7 @@ def _storable_assistant_message(response: LLMResponse) -> Optional[Dict[str, Any
     if not unknown and not unreadable:
         return message
     # Provider-native blocks would still contain the calls that are removed here.
-    message = {key: value for key, value in message.items() if key != "_anthropic_content"}
+    message = {key: value for key, value in message.items() if not key.startswith("_")}
     kept: List[Dict[str, Any]] = []
     for wire in message.get("tool_calls") or []:
         if wire.get("id") in unknown:
@@ -456,8 +477,11 @@ class CodingAgent:
         reserve_seconds: float = 25.0,
         sleep: Callable[[float], None] = time.sleep,
         new_project: bool = False,
+        update: bool = False,
     ) -> None:
         self.llm = llm
+        # The work is added to a pull request that already exists.
+        self.update = update
         self.checkout = checkout
         self.workspace = checkout.workspace
         # The repository has no code: the agent builds a project from scratch.
@@ -470,8 +494,10 @@ class CodingAgent:
         self.reserve_seconds = reserve_seconds
         self._sleep = sleep
         self._configured_output_tokens = max_output_tokens
-        self._tokens_per_minute: Optional[int] = None
-        self._budget_scale = 1.0
+        # Limits differ from provider to provider, and a run can use several
+        # (fallbacks): what was learnt about one must not size requests to another.
+        self._tpm_by_provider: Dict[str, int] = {}
+        self._scale_by_provider: Dict[str, float] = {}
         self.context_budget = INITIAL_CONTEXT_CHARS
         self.max_output_tokens = max_output_tokens
         self._recompute_budgets()
@@ -493,6 +519,29 @@ class CodingAgent:
     # ------------------------------------------------------------------ #
     def _time_left(self) -> float:
         return self.deadline.remaining() - self.reserve_seconds
+
+    @property
+    def _provider(self) -> str:
+        """The provider the next request goes to."""
+        return str(getattr(self.llm, "provider", "") or "")
+
+    @property
+    def _tokens_per_minute(self) -> Optional[int]:
+        """The tokens-per-minute limit of the provider in use: what it reported,
+        else what its client says may be assumed, else unknown."""
+        known = self._tpm_by_provider.get(self._provider)
+        if known:
+            return known
+        assumed = getattr(self.llm, "assumed_tokens_per_minute", None)
+        return int(assumed) if isinstance(assumed, (int, float)) and assumed > 0 else None
+
+    @property
+    def _budget_scale(self) -> float:
+        return self._scale_by_provider.get(self._provider, 1.0)
+
+    @property
+    def _has_fallback(self) -> bool:
+        return len(getattr(self.llm, "chain", None) or ()) > 1
 
     def _recompute_budgets(self) -> None:
         """Size the context window (characters) and reply length (tokens).
@@ -517,10 +566,10 @@ class CodingAgent:
             min(self._configured_output_tokens, int(output_tokens * max(self._budget_scale, 0.5))),
         )
 
-    def _apply_token_limit(self, tokens_per_minute: Optional[int]) -> None:
+    def _apply_token_limit(self, tokens_per_minute: Optional[int], provider: str = "") -> None:
         if tokens_per_minute and tokens_per_minute > 0:
-            self._tokens_per_minute = tokens_per_minute
-            self._recompute_budgets()
+            self._tpm_by_provider[provider or self._provider] = tokens_per_minute
+        self._recompute_budgets()
 
     @property
     def _result_limit(self) -> int:
@@ -911,17 +960,38 @@ class CodingAgent:
     # ------------------------------------------------------------------ #
     # Model calls
     # ------------------------------------------------------------------ #
+    def _announce_switch(self, exc: LLMError) -> None:
+        """Log that another provider has taken over, and why."""
+        who = exc.provider or "the provider"
+        if exc.kind == "rate_limit":
+            scope = _rate_limit_scope(exc.message, self._tpm_by_provider.get(who))
+            if exc.daily:
+                reason = f"{who} has used up its daily limit"
+            else:
+                reason = f"{who}'s rate limit is reached" + (f" ({scope})" if scope else "")
+            level = "info"
+        elif exc.kind == "too_large":
+            reason, level = f"The request is larger than {who}'s limits allow", "info"
+        elif exc.kind == "tool_format":
+            reason = f"{who}'s model keeps answering with invalid tool calls ({_refused_reply_detail(exc)})"
+            level = "warn"
+        else:
+            reason, level = exc.message.strip().rstrip("."), "warn"
+        self.emit(level, f"{reason}: switching to {exc.switched_to}")
+
     def _complete(self, messages: List[Dict[str, Any]]) -> LLMResponse:
         transient_retries = 0
         format_retries = 0
         rate_limit_waits = 0
         shrinks = 0
+        switches = 0
         # Sent with a repeated request only; it never becomes part of the history.
         correction: Optional[Dict[str, Any]] = None
         while True:
             time_left = self._time_left()
             if time_left <= 5.0:
                 raise LLMError("The time budget ran out while waiting for the model.", kind="timeout")
+            self._recompute_budgets()  # sized for the provider that answers this request
             try:
                 return self.llm.complete(
                     messages + [correction] if correction else messages,
@@ -930,23 +1000,57 @@ class CodingAgent:
                     timeout=min(90.0, time_left),
                 )
             except LLMError as exc:
+                if exc.switched_to and switches < MAX_PROVIDER_SWITCHES:
+                    # Several providers are configured and another one has taken
+                    # over: no waiting, the request goes to it right away.
+                    switches += 1
+                    self._announce_switch(exc)
+                    correction = None  # it was about a reply the new model never wrote
+                    format_retries = transient_retries = 0
+                    self._recompute_budgets()
+                    compact_history(messages, self.context_budget)
+                    continue
+                # With one provider there is nothing to fall back on: say how to change that.
+                alone = not self._has_fallback
+                advice = (
+                    " Add a key for a second provider (Gemini or OpenRouter, in Settings): the agent "
+                    "then carries on with it instead of waiting."
+                    if alone
+                    else ""
+                )
                 if exc.kind == "rate_limit":
-                    wait = min(max(exc.retry_after or 5.0, 1.0) + 0.5, 65.0)
+                    if exc.daily:
+                        raise LLMError(
+                            f"{exc.message} That is a daily limit: it does not lift during a run.{advice}",
+                            kind="rate_limit",
+                            status_code=exc.status_code,
+                        ) from exc
+                    # What the provider asks for, and what is waited before trying
+                    # again: limits are counted per minute, so a longer pause than
+                    # that is never needed to find out whether the limit has lifted.
+                    needed = max(exc.retry_after or 5.0, 1.0) + 0.5
+                    wait = min(needed, 65.0)
                     rate_limit_waits += 1
-                    if rate_limit_waits > 8 or wait >= self._time_left() - 5.0:
+                    if rate_limit_waits > 8 or wait >= self._time_left() - 5.0 or needed > self._time_left():
                         raise LLMError(
                             f"{exc.message} The provider's rate limit left no room to finish within "
-                            "this run's time budget.",
+                            f"this run's time budget.{advice}",
                             kind="rate_limit",
                             status_code=exc.status_code,
                         ) from exc
                     # Expected on small plans (Groq's free tier allows 8,000 tokens
                     # per minute): the run simply continues after the pause.
-                    scope = _rate_limit_scope(exc.message, self._tokens_per_minute)
+                    if exc.next_provider:
+                        # Every provider is waiting; this one is free first.
+                        who, scope = exc.next_provider.split(" / ", 1)[0], "every provider is rate limited"
+                    else:
+                        who = exc.provider or self.llm.provider
+                        scope = _rate_limit_scope(exc.message, self._tokens_per_minute)
+                        if exc.all_limited:
+                            scope = f"{scope}; every provider is rate limited" if scope else "every provider is rate limited"
                     self.emit(
                         "info",
-                        f"Waiting {wait:.0f}s for {self.llm.provider}'s rate limit"
-                        + (f" ({scope})" if scope else ""),
+                        f"Waiting {wait:.0f}s for {who}'s rate limit" + (f" ({scope})" if scope else ""),
                     )
                     self._rate_limited = True
                     self._sleep(wait)
@@ -955,8 +1059,8 @@ class CodingAgent:
                     shrinks += 1
                     match = _TPM_LIMIT_RE.search(exc.message)
                     if match:
-                        self._tokens_per_minute = int(match.group(1))
-                    self._budget_scale *= 0.6
+                        self._tpm_by_provider[self._provider] = int(match.group(1))
+                    self._scale_by_provider[self._provider] = self._budget_scale * 0.6
                     self._recompute_budgets()
                     compact_history(messages, self.context_budget, keep_recent=2)
                     self.emit("warn", "The request was too large for the model; retrying with less context")
@@ -973,7 +1077,13 @@ class CodingAgent:
                             f"The model ({self.llm.model}) answered {format_retries + 1} times in a row "
                             f"with an invalid tool call ({detail}), so the task could not continue. "
                             "Nothing was wrong with the task itself: run it again"
-                            + (f", or choose another model with {variable}." if variable else "."),
+                            + (f", or choose another model with {variable}." if variable else ".")
+                            + (
+                                " With a second provider configured (Gemini or OpenRouter, in Settings) "
+                                "the agent switches to it when a model keeps doing this."
+                                if alone
+                                else ""
+                            ),
                             kind="tool_format",
                             status_code=exc.status_code,
                             rejected_tool=exc.rejected_tool,
@@ -1048,7 +1158,9 @@ class CodingAgent:
         messages: List[Dict[str, Any]] = [
             {
                 "role": "system",
-                "content": system_prompt_for(new_project=self.new_project, first_commit=first_commit),
+                "content": system_prompt_for(
+                    new_project=self.new_project, first_commit=first_commit, update=self.update
+                ),
             },
             {"role": "user", "content": task},
         ]
@@ -1094,7 +1206,17 @@ class CodingAgent:
                 if exc.kind == "timeout":
                     return outcome("timeout", error=exc.message)
                 return outcome("llm_error", error=exc.message)
-            self._apply_token_limit(response.tokens_per_minute_limit)
+            self._apply_token_limit(response.tokens_per_minute_limit, response.provider)
+            if response.recovered:
+                # The provider had refused the reply over its form (a prefixed
+                # tool name, a line break inside JSON); what it meant was clear.
+                self.emit(
+                    "info",
+                    f"{response.provider or self.llm.provider} refused the model's reply over its form; "
+                    "the call in it was used as meant ("
+                    + ", ".join(call.name for call in response.tool_calls)
+                    + ")",
+                )
             stored = _storable_assistant_message(response)
             if stored is not None:
                 messages.append(stored)

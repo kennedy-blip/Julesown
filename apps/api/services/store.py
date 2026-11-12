@@ -91,6 +91,18 @@ class TaskStore:
             "error": None,
             "llm_provider": None,
             "llm_model": None,
+            "llm_chain": [],
+            "llm_usage": [],
+            # More work on a pull request that exists: its number.
+            "pull_request": None,
+            "fix_checks": False,
+            "continue_work": False,
+            "failed_checks": [],
+            # The agent was stopped before it was done; its work was delivered anyway.
+            "unfinished": False,
+            "stop_reason": None,  # timeout | llm_error | max_turns
+            "unfinished_reason": None,  # the same in words, for people
+            "commit_authorship": None,
             "sandbox": None,
             "source": source,
             "recovered": False,

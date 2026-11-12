@@ -744,7 +744,9 @@ def test_model_that_only_produces_refused_replies_fails_with_advice(checkout: Re
     assert outcome.error == (
         "The model (openai/gpt-oss-120b) answered 4 times in a row with an invalid tool call (it called "
         "'json', which is not one of its tools), so the task could not continue. Nothing was wrong with "
-        "the task itself: run it again, or choose another model with GROQ_MODEL."
+        "the task itself: run it again, or choose another model with GROQ_MODEL. With a second "
+        "provider configured (Gemini or OpenRouter, in Settings) the agent switches to it when a "
+        "model keeps doing this."
     )
 
 
