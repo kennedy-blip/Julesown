@@ -10,6 +10,13 @@ search box. A repository that is still **empty** works too: the agent builds the
 description and pushes it as the repository's first commit, laid out so that it can be deployed on
 Vercel or another host afterwards.
 
+The agent is not tied to one model provider. With keys for more than one (Groq, Google Gemini,
+OpenRouter, OpenAI, Anthropic) it **carries on with the next** when one reaches its rate limit or
+fails. It can **add more work to a pull request**, **repair the checks that failed** on it (a test run
+on GitHub Actions, a deployment on Vercel) and, when a run is cut short, it **delivers what it had**
+marked as unfinished instead of throwing it away. Provider keys, the choice of model and who the
+commits are attributed to can be set in the dashboard's **Settings**.
+
 ---
 
 ## 🔁 What happens when you run a task
@@ -26,14 +33,18 @@ configuration check → GitHub access → E2B sandbox → git clone → agent lo
    `replace_in_file`, `run_command`, `run_tests`, `finish`). Every step is streamed to the dashboard.
    It is given the file list, the repository's manifests (`package.json`, `pyproject.toml`, …) and
    the start of the README together with the task, and it has to look before it writes
-   (see [What the agent's work is based on](#-what-the-agents-work-is-based-on)).
+   (see [What the agent's work is based on](#-what-the-agents-work-is-based-on)). When the model
+   provider reaches a limit or fails, the same conversation continues with the next one
+   (see [Model providers and fallback](#-model-providers-and-fallback)).
 5. **Commit** – the files that changed are committed to a new branch `jules/task-<id>` through the
    GitHub API. The base branch is never modified.
 6. **Pull request** – a pull request is opened from that branch. Its description contains the agent's
    summary, the changed files, the files the agent looked at and the real test results.
 
 An **empty repository** takes a different last step – see
-[Empty repositories and new projects](#-empty-repositories-and-new-projects).
+[Empty repositories and new projects](#-empty-repositories-and-new-projects). A task can also add
+its commit to a pull request that already exists instead of opening a new one – see
+[More work on a pull request](#-more-work-on-a-pull-request).
 
 Nothing in this pipeline is simulated:
 
@@ -43,6 +54,9 @@ Nothing in this pipeline is simulated:
 - If any step fails, the task is reported as **failed** with the reason (missing key, App not
   installed, rate limit, time budget…). If the agent changes nothing, the task finishes with
   **no changes** and no pull request.
+- A run that is stopped after the agent had already changed files is not reported as a clean result
+  and not thrown away either: the changes are delivered **marked as unfinished**
+  (see [Unfinished work](#-unfinished-work)).
 - Test status is what actually happened in the sandbox: *passed*, *failed*, *no tests* or *not run*.
   A pull request opened with failing or missing tests says so.
   - *No tests* means a test command was run but had nothing to test – for example `npm test` in a
@@ -140,6 +154,127 @@ run ends with a result that says what is missing rather than with a timeout that
 
 ---
 
+## 🧠 Model providers and fallback
+
+| Provider | Key | Default model |
+| --- | --- | --- |
+| Groq | `GROQ_API_KEY` | `openai/gpt-oss-120b` |
+| Google Gemini | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | `gemini-flash-latest` |
+| OpenRouter | `OPENROUTER_API_KEY` | `baidu/ernie-5.5-flash-preview:free` |
+| OpenAI | `OPENAI_API_KEY` | `gpt-6-luna` |
+| Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` |
+
+One key is enough to run tasks. Every provider that has a key is part of the **chain** a task uses, in
+the order of the table (change it with `JULES_LLM_ORDER`, or name the first choice with
+`JULES_LLM_PROVIDER`). The agent works with the first one and switches when it has to:
+
+- **Rate limit** – the next provider that is ready takes over at once and stays in use; the agent
+  does not hop back. Only when *every* provider is limited does it wait, for the shortest of the
+  waits. If that wait is longer than the time the task has left, the run ends there.
+- **Daily limit, rejected key, no credit, unknown model, request the provider refuses** – that
+  provider is out for the rest of the run.
+- **Outage or timeout** – the provider is set aside for a short while and tried again later.
+- **Replies the provider refuses for their form** (Groq does this when an open model calls a tool
+  that does not exist) – the reply is rebuilt from what the provider returned when that is possible;
+  after two refusals in a row the next provider takes over.
+
+The conversation carries over: the next provider receives everything the agent has read and done so
+far. The task log says when and why it switched, and the result lists which providers answered
+(`llm_usage` in the task record). `JULES_LLM_FALLBACK=false` restricts tasks to the first choice.
+
+**Where the keys live.** A key can be an environment variable of the deployment, or be entered in the
+dashboard under **Settings → AI models**. A key entered there is kept in that browser
+(`localStorage`) and sent to your own backend with each task you start, in a request header
+(`X-Groq-Key`, `X-Gemini-Key`, `X-OpenRouter-Key`, `X-OpenAI-Key`, `X-Anthropic-Key`). The backend
+uses it for that one task, in place of its own key for that provider; it is not stored and is masked
+in logs and error messages. The same page chooses the model per provider and the first choice, and
+its **Test** button sends one small request with a tool to the provider (`POST /api/v1/llm/test`) to
+show whether the key is accepted, the model exists and it can call tools.
+
+Tasks that GitHub starts (a `/jules` comment, an automatic fix of failed checks) do not pass through
+a browser. They use the keys of the deployment, so for fallback there, set the keys as environment
+variables.
+
+---
+
+## ➕ More work on a pull request
+
+A task does not have to open a new pull request. It can add a commit to one that is open:
+
+- **Dashboard** – choose *Add to a pull request* in the task form and give its number, or press
+  *Ask for more changes* on the result of an earlier task.
+- **GitHub** – comment `/jules <what to change>` on the pull request.
+- **API** – send `"pull_request": <number>` with the task.
+
+The agent works on a clone of the pull request's branch, so it starts from what is there already,
+and it is told which checks currently fail on it. Its commit is added on top (the branch is never
+force-pushed) and the pull request gets a comment saying what was added. The pull request must be
+open and its branch must be in the repository itself (not in a fork). This works for any pull
+request, not only for ones Jules opened. The task ends with the outcome `pr_updated`.
+
+### 🧩 Unfinished work
+
+A run can be cut short: the time budget is used up, every model provider is exhausted, or the turn
+limit is reached. If the agent had changed files by then, they are not discarded:
+
+- In a repository with code, a pull request titled **`[Unfinished] …`** is opened (or the commit is
+  added to the pull request the task was working on). Its description starts with a warning that says
+  why the agent stopped, and that it should not be merged as it is.
+- In an empty repository the files are pushed as the first commit, marked the same way.
+
+The result in the dashboard then offers **Continue the work**: the same task again as a follow-up on
+that pull request (or, for a first commit, as a task that delivers the rest as a pull request), with
+the instruction to look at what is there first. From GitHub, a `/jules <what is still missing>`
+comment on the pull request continues it as well. When a follow-up finishes, the mark is taken off
+the title. `JULES_KEEP_UNFINISHED_WORK=false` restores the old behaviour, where an interrupted run
+leaves nothing behind.
+
+---
+
+## 🩺 Failed checks
+
+When the checks of a pull request fail – a workflow on GitHub Actions, a deployment reported by
+Vercel, any other check run or commit status – the agent can read what failed and repair it. It is
+given the names of the failed checks, their annotations (file, line, message), the part of the job
+log around the error and, for commit statuses, the description and link; it then reproduces the
+failure in the sandbox where it can, fixes it and adds the commit to the pull request.
+
+| How | What it needs |
+| --- | --- |
+| **From the dashboard.** The result of a task shows the checks of its pull request (or first commit) and, when they fail, a *Fix failed checks* button. The task form has the same option for any pull request or branch. | Permission to read checks (see below). |
+| **From GitHub, on request.** Comment `/jules fix the checks` (or just `/jules`) on the pull request. | The webhook with *Issue comment* events. |
+| **Unasked.** For pull requests Jules opened itself (branches `jules/…`), as soon as GitHub reports the failure. At most `JULES_CI_AUTOFIX_ATTEMPTS` times per pull request (default 2), once per failing commit; after that it says so in a comment and leaves it to you. | The webhook with *Check suite* and/or *Status* events, and `GITHUB_WEBHOOK_SECRET`. `JULES_CI_AUTOFIX=false` turns it off. |
+
+**Settings → Automation** in the dashboard shows which of these are in place for your GitHub App
+(`GET /api/v1/github/automation`) and links to the page where the rest is switched on.
+
+A check that fails for a reason outside the repository (a secret or environment variable missing on
+the CI or hosting service, an outage there) cannot be fixed by a commit. The agent is told to report
+that in its summary rather than change code to hide it.
+
+---
+
+## 👤 Who the commits are attributed to
+
+By default a commit is made by the GitHub App (or the owner of `GITHUB_TOKEN`), which GitHub marks as
+*Verified*. Two other modes attribute the work to a person:
+
+| Mode | Commit author | Notes |
+| --- | --- | --- |
+| `bot` (default) | the GitHub App | *Verified*. |
+| `coauthor` | the GitHub App, with a `Co-authored-by:` line naming you | Still *Verified*; the commit also counts as yours on GitHub. |
+| `user` | you; the App appears only as the committer | Not *Verified*: GitHub signs only commits the App authors itself. |
+
+Choose the mode under **Settings → Commits** in the dashboard (it applies to the tasks started from
+that browser; *Look up* fills in the name and the `noreply` address of a GitHub account), send
+`"commit": {"mode": "user", "name": "…", "email": "…"}` with an API request, or set the server's
+default with `JULES_COMMIT_AUTHORSHIP`, `JULES_COMMIT_AUTHOR_NAME` and `JULES_COMMIT_AUTHOR_EMAIL`.
+With a mode other than `bot` and no name configured, a task started from GitHub is attributed to the
+person who wrote the `/jules` comment, using their `noreply` address. The pull request itself is
+always opened by the GitHub App: only commits can carry another author.
+
+---
+
 ## 🏗 Architecture
 
 ```text
@@ -147,24 +282,26 @@ run ends with a result that says what is missing rather than with a timeout that
 ├── apps/
 │   ├── web/                        # Next.js 14 dashboard (App Router + Tailwind CSS)
 │   │   ├── app/
-│   │   │   ├── page.tsx            # Dashboard: task form, live log, result
-│   │   │   ├── layout.tsx          # Root layout with the backend status badge
+│   │   │   ├── page.tsx            # Workspace (repositories, task form, live log, result, history) and Settings
+│   │   │   ├── layout.tsx          # Root layout: navigation and the backend status badge
 │   │   │   └── not-found.tsx       # 404 page; forwards stray GitHub App redirects to the dashboard
-│   │   ├── components/             # RepositoryPicker, TaskForm, LiveTerminal, PRStatusTracker, StageProgress, …
-│   │   └── lib/                    # API client (NDJSON stream), repository search, health store, session history, result wording
+│   │   ├── components/             # RepositoryPicker, TaskForm, LiveTerminal, PRStatusTracker, TaskHistory, SettingsPanel, ui (shared look), …
+│   │   └── lib/                    # API client (NDJSON stream), settings kept in the browser, routes, provider chain, health store, session history, result wording
 │   └── api/                        # Python FastAPI backend (Vercel Python function)
 │       ├── main.py                 # App entrypoint
 │       ├── config.py               # Environment-driven settings and model defaults
 │       ├── security.py             # Access control for task endpoints
 │       ├── routers/
-│       │   ├── tasks.py            # Create/stream/look up tasks
-│       │   ├── github.py           # Repository list, pre-flight check, App redirect landing
-│       │   ├── webhooks.py         # GitHub webhook: `/jules` commands on issues
+│       │   ├── tasks.py            # Create/stream/look up tasks; state of a task's pull request and its checks
+│       │   ├── github.py           # Repository list, pre-flight check, checks of a commit, account lookup, automation status, App redirect landing
+│       │   ├── llm.py              # Trying a provider key out
+│       │   ├── webhooks.py         # GitHub webhook: `/jules` commands, failed checks
 │       │   └── health.py           # Liveness and configuration diagnostics
 │       ├── services/
-│       │   ├── runner.py           # The pipeline above, end to end (pull request or first commit)
+│       │   ├── runner.py           # The pipeline above, end to end (new pull request, more work on one, first commit, unfinished work)
 │       │   ├── agent.py            # Tool-calling loop and tools; instructions for existing and for new projects
-│       │   ├── llm.py              # Groq / OpenAI / Anthropic clients
+│       │   ├── llm.py              # Groq / Gemini / OpenRouter / OpenAI / Anthropic clients and the fallback between them
+│       │   ├── ci.py               # Reading failed checks: check runs, annotations, job logs, commit statuses
 │       │   ├── verification.py     # What a test command's result means; documentation-only changes
 │       │   ├── sandbox.py          # E2B sandbox adapter, clone and change collection
 │       │   ├── github.py           # GitHub App + token auth, repository listing, commits, branches, pull requests
@@ -180,14 +317,16 @@ run ends with a result that says what is missing rather than with a timeout that
 
 ## ⚙️ Configuration
 
-All configuration is environment variables. `GET /api/v1/health/env` (and **Diagnostics Details** in
-the dashboard) reports which are present and what is still missing — never their values.
+The server is configured with environment variables. `GET /api/v1/health/env` (and **Settings →
+About** in the dashboard) reports which are present and what is still missing — never their values.
+Model provider keys can also be entered in the dashboard instead
+(see [Model providers and fallback](#-model-providers-and-fallback)).
 
 ### Required
 
 | Variable | Purpose |
 | --- | --- |
-| `GROQ_API_KEY` **or** `OPENAI_API_KEY` **or** `ANTHROPIC_API_KEY` | The model that drives the agent. If several are set, the order of preference is Groq, OpenAI, Anthropic (override with `JULES_LLM_PROVIDER`). |
+| `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` — at least one, here or in the dashboard's Settings | The model that drives the agent. With several, a task starts with the first in that order and carries on with the next when it has to. |
 | `E2B_API_KEY` | Sandbox in which the repository is cloned, edited and tested. |
 | `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` **or** `GITHUB_TOKEN` | Credentials used to push the branch and open the pull request. See [GitHub setup](#-github-setup). |
 
@@ -207,15 +346,22 @@ With neither set, tasks are **locked** on Vercel / `ENVIRONMENT=production` and 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GROQ_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | `openai/gpt-oss-120b` / `gpt-6-luna` / `claude-sonnet-5-5` | Model to use. If the configured model has been retired, the backend picks an available one from the provider's model list and says so in the task log. |
-| `GROQ_REASONING_EFFORT` / `OPENAI_REASONING_EFFORT` | `low` / `none` | Reasoning effort sent to the model (`default` omits the parameter). |
-| `GROQ_TEMPERATURE` | `0.2` | Sampling temperature for Groq, `0`–`2` (`default` leaves it to Groq, which uses `1`). A low value makes malformed tool calls and made-up content less likely. |
+| `GROQ_MODEL` / `GEMINI_MODEL` / `OPENROUTER_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | see [the table above](#-model-providers-and-fallback) | Model to use. If the configured model has been retired, the backend picks an available one from the provider's model list and says so in the task log. |
+| `JULES_LLM_PROVIDER` | – | The provider tasks start with (`groq`, `gemini`, `openrouter`, `openai`, `anthropic`). |
+| `JULES_LLM_ORDER` | `groq,gemini,openrouter,openai,anthropic` | The order in which providers that have a key are used. |
+| `JULES_LLM_FALLBACK` | `true` | `false`: a task uses only the first provider. |
+| `GROQ_REASONING_EFFORT` / `OPENROUTER_REASONING_EFFORT` / `OPENAI_REASONING_EFFORT` | `low` / `low` / `none` | Reasoning effort sent to the model (`default` omits the parameter). |
+| `GEMINI_THINKING_LEVEL` | `low` | How much Gemini thinks before it answers (`minimal`, `low`, `medium`, `high`; `default` leaves it to Google). |
+| `GROQ_TEMPERATURE` / `OPENROUTER_TEMPERATURE` | `0.2` | Sampling temperature, `0`–`2` (`default` leaves it to the provider). A low value makes malformed tool calls and made-up content less likely. |
+| `JULES_KEEP_UNFINISHED_WORK` | `true` | Deliver what an interrupted run had changed, marked as unfinished (see [Unfinished work](#-unfinished-work)). |
+| `JULES_CI_AUTOFIX` / `JULES_CI_AUTOFIX_ATTEMPTS` | `true` / `2` | Fix failed checks of Jules' own pull requests unasked, and how often per pull request (see [Failed checks](#-failed-checks)). |
+| `JULES_COMMIT_AUTHORSHIP` | `bot` | `bot`, `coauthor` or `user`, with `JULES_COMMIT_AUTHOR_NAME` and `JULES_COMMIT_AUTHOR_EMAIL` (see [Who the commits are attributed to](#-who-the-commits-are-attributed-to)). |
 | `JULES_TASK_BUDGET_SECONDS` | `270` | Time one task may take. On Vercel it is additionally capped by the function's remaining time. |
 | `JULES_MAX_AGENT_TURNS` | `30` | Maximum model turns per task. |
 | `JULES_COMMAND_TIMEOUT_SECONDS` | `120` | Time limit for one command in the sandbox. |
 | `JULES_MAX_OUTPUT_TOKENS` | `8192` | Upper bound for one model reply. |
 | `E2B_TEMPLATE` | E2B default | Sandbox template, e.g. one with your toolchain preinstalled. |
-| `GITHUB_WEBHOOK_SECRET` | – | Enables `/jules` commands from GitHub issues (see below). |
+| `GITHUB_WEBHOOK_SECRET` | – | Enables what GitHub starts: `/jules` commands and fixing failed checks unasked (see below). |
 | `JULES_CORS_ORIGINS` | – | Comma-separated origins allowed to call the API from a browser. Not needed for the dashboard, which is served from the same origin. |
 
 ---
@@ -228,7 +374,13 @@ With neither set, tasks are **locked** on Vercel / `ENVIRONMENT=production` and 
    - **Contents: Read and write** (push the task branch)
    - **Pull requests: Read and write** (open the pull request)
    - **Issues: Read and write** (only if you use `/jules` commands; lets the result be commented on the issue)
+   - **Checks: Read-only** and **Commit statuses: Read-only** (to see whether the checks of a result
+     passed, and to fix them when they failed)
+   - **Actions: Read-only** (optional: lets the agent read the log of a failed GitHub Actions job)
    - Metadata: Read-only (mandatory)
+
+   When permissions are added to an App that is already installed, GitHub asks the owner of each
+   installation to approve them; until then the installation keeps the old ones.
 2. Generate a private key and set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` (paste the whole PEM;
    literal `\n` sequences and base64 are accepted too).
 3. **Install the App on the repositories** Jules should work on. A task on a repository without the
@@ -249,7 +401,7 @@ enters the sandbox; private repositories are cloned with a separate read-only to
 Set `GITHUB_TOKEN` to a fine-grained token with **Contents: Read and write** and
 **Pull requests: Read and write** on the target repositories (or a classic token with `repo`).
 
-### `/jules` commands from issues (optional)
+### `/jules` commands and failed checks from GitHub (optional)
 
 With `GITHUB_WEBHOOK_SECRET` set and the webhook subscribed to **Issues** and **Issue comments**, a
 repository owner, member or collaborator can start a task by writing a line that begins with `/jules`
@@ -260,6 +412,15 @@ in a new issue or an issue comment:
 ```
 
 The pull request link (or the reason for failure) is posted back to the issue as a comment.
+
+The same line as a comment **on a pull request** adds the work to that pull request instead of
+opening another one, and `/jules fix the checks` (or `/jules` alone) there repairs its failed checks
+– see [More work on a pull request](#-more-work-on-a-pull-request) and [Failed checks](#-failed-checks).
+
+To have failed checks of Jules' own pull requests fixed **unasked**, also subscribe the webhook to
+**Check suite** (GitHub Actions and other check runs) and/or **Status** (commit statuses, which is how
+Vercel reports a deployment). *Workflow run* is understood as well.
+
 Deliveries with an invalid signature are rejected, and nothing is started when no secret is configured.
 
 ---
@@ -277,7 +438,7 @@ function's maximum duration (300 s on the Hobby plan; the default task budget of
 to open the pull request). If the browser loses the connection, the dashboard looks the task up
 again and, when necessary, finds its pull request on GitHub by the task's branch name.
 
-When a task fails, the dashboard shows the stage it failed at and the reason. *Diagnostics Details*
+When a task fails, the dashboard shows the stage it failed at and the reason. *Settings → About*
 (`GET /api/v1/health/env`) shows which settings the deployment actually sees, without their values,
 and every task leaves one summary line in the function logs (Vercel → your deployment → Logs).
 
@@ -289,15 +450,34 @@ and every task leaves one summary line in the function logs (Vercel → your dep
 | --- | --- |
 | `POST /api/v1/tasks/stream` | Run a task and stream progress as newline-delimited JSON (`task`, `log`, `update`, `ping`, `done`). Used by the dashboard. |
 | `POST /api/v1/tasks` | Run a task in the background; poll `GET /api/v1/tasks/{id}`. |
-| `GET /api/v1/tasks/{id}?repository=owner/name` | Task status. When the answering server instance does not know the task, its pull request is looked up on GitHub. |
-| `GET /api/v1/tasks/{id}/pull-request?repository=owner/name` | The task's pull request as it is on GitHub right now: `open`, `merged` or `closed`. The dashboard uses it to keep the history up to date. |
+| `GET /api/v1/tasks/{id}?repository=owner/name` | Task status. When the answering server instance does not know the task, its pull request is looked up on GitHub. For a task that added to a pull request, also pass `pull_request=<number>`: its commit is then looked for on that pull request. |
+| `GET /api/v1/tasks/{id}/pull-request?repository=owner/name` | The task's pull request as it is on GitHub right now: `open`, `merged` or `closed`, whether it is still marked `unfinished`, its `head_sha` and, while it is open, its `checks` (`state`: `failure`, `pending`, `success`, `none` or `unknown`; `failing[]`; counts). `number=<n>` names the pull request for a task that added to an existing one. |
+| `GET /api/v1/github/checks?repository=…&ref=…` | The checks of a commit or branch, in the same form. |
+| `GET /api/v1/github/identity?login=…` | Name and `noreply` e-mail address of a GitHub account, for commit authorship. |
+| `GET /api/v1/github/automation` | Whether failed checks can be fixed unasked: webhook secret, the App's event subscriptions and permissions, and where to change them. |
+| `POST /api/v1/llm/test` | Try a provider out: `{"provider": "gemini", "model": "optional"}` with the key in its `X-<Provider>-Key` header (or the server's key without it). Costs one small request. |
 | `GET /api/v1/github/repos` | Every repository the configured credentials can work on (all pages, up to 2,000), most recently pushed first, with `total`, `truncated` and, for a GitHub App, `installations` (account, `repository_selection`: `all` or `selected`, and where to change it). |
 | `GET /api/v1/github/check?repository=…&branch=…` | Check, without running anything, that a task could act on a repository. `empty: true` means it has no commits and a task will create its first commit. |
 | `GET /api/v1/health`, `GET /api/v1/health/env` | Liveness and configuration diagnostics. |
 | `POST /api/v1/webhooks/github` | GitHub webhook receiver. |
 
 Request body for both task endpoints (JSON, sent with `Content-Type: application/json`):
-`{"repository": "owner/name or GitHub URL", "branch": "optional", "prompt": "what to do"}`.
+
+```jsonc
+{
+  "repository": "owner/name or GitHub URL",
+  "prompt": "what to do",              // optional with fix_checks
+  "branch": "optional base branch",
+  "pull_request": 12,                   // optional: add the result to this pull request
+  "fix_checks": true,                   // optional: the task is the failed checks (of the pull request, else of the branch)
+  "continue_work": true,                // optional: carry on with work that was left unfinished
+  "llm": {"primary": "gemini", "fallback": true, "models": {"gemini": "gemini-flash-latest"}},
+  "commit": {"mode": "coauthor", "name": "Ada Example", "email": "1234567+ada-example@users.noreply.github.com"}
+}
+```
+
+`llm` and `commit` are optional and apply to that task only. Provider keys for the task go in the
+headers `X-Groq-Key`, `X-Gemini-Key`, `X-OpenRouter-Key`, `X-OpenAI-Key`, `X-Anthropic-Key`.
 Interactive documentation is served at `/api/docs`.
 
 Fields of a task record that describe how far the result can be trusted:
@@ -308,7 +488,11 @@ Fields of a task record that describe how far the result can be trusted:
 | `verification[]` | Every `run_tests` call: `command`, `exit_code`, `duration`, `outcome` (`passed`, `failed`, `timed_out`, `no_tests`) and, for `no_tests`, a `note` with the reason. |
 | `docs_only` | `true` when the change only touches documentation files. |
 | `files_read` | Repository files whose content the agent saw before it finished. |
-| `outcome` | `pull_request`, `no_changes`, or `initial_commit` (the repository was empty: `commit_sha` and `commit_url` name its first commit and there is no pull request). |
+| `outcome` | `pull_request`, `pr_updated` (a commit was added to an existing pull request), `no_changes`, or `initial_commit` (the repository was empty: `commit_sha` and `commit_url` name its first commit and there is no pull request). |
+| `unfinished`, `stop_reason`, `unfinished_reason` | The agent was stopped before it was done (`timeout`, `llm_error` or `max_turns`) and what it had changed was delivered anyway; `unfinished_reason` says why in words. |
+| `llm_chain[]`, `llm_usage[]` | The providers the task could use, and what each did: `provider`, `model`, `requests`, `failures`, `input_tokens`, `output_tokens` and, if it dropped out, why (`out`). |
+| `failed_checks[]` | For a task that fixes checks: the checks that had failed when it started (`name`, `kind`, `url`). |
+| `commit_authorship` | `bot`, `coauthor` or `user`: who the commit was attributed to. |
 | `empty_repository`, `new_project` | The repository had no commits / no code when the task started. |
 
 ---
@@ -325,20 +509,33 @@ Fields of a task record that describe how far the result can be trusted:
   words. The platform reports what it can observe (files read, commands run, test results); it does
   not verify that a description is accurate.
 - **LLM rate limits.** Free tiers are small (Groq's free tier allows about 8,000 tokens per minute on
-  the default model). The agent sizes its context to the provider's limit and waits out rate limits,
-  which makes runs slower; a task that cannot finish in time fails and says so. A paid tier or
-  another provider removes most of this.
+  the default model). The agent sizes its context to the provider's limit. With one provider it has
+  to wait out a rate limit, and a wait that does not fit in the time budget ends the run; with a
+  second provider it carries on with that one instead. Either way, what it had changed by then is
+  kept (see [Unfinished work](#-unfinished-work)).
+- **Free models differ.** A free model on OpenRouter may be limited to a number of requests per day,
+  may not support tool calls, or may be withdrawn. Use the **Test** button in Settings before relying
+  on one; `OPENROUTER_MODEL` (or the model field in Settings) selects another.
 - **Refused model replies.** Open models hosted by Groq sometimes answer with a call to a tool that
-  does not exist (`commentary`, `json`, …); Groq refuses such a reply and nothing is executed. The
-  agent tells the model what was wrong and asks again, up to three times per step and with a slightly
-  higher temperature each time. The log shows these as warnings. If the model keeps doing it, the
-  task fails with that reason: run it again or choose another model with `GROQ_MODEL`.
+  does not exist (`commentary`, `json`, …), or with arguments that are not valid JSON; Groq refuses
+  such a reply. Where the refused reply contains a usable tool call it is recovered and executed.
+  Otherwise the agent tells the model what was wrong and asks again, up to three times; with a
+  second provider configured, that one takes over after two refusals in a row. If the model keeps
+  doing it and there is nothing to switch to, the task fails with that reason.
+- **Automatic fixes are bounded.** Failed checks are fixed unasked only on pull requests Jules
+  opened, at most twice per pull request by default. Each attempt is a full task and spends model
+  and sandbox quota.
 - **Sandbox contents.** The default E2B template has git, Python and Node.js but not your project's
   dependencies; the agent installs what the tests need, which costs time. Use `E2B_TEMPLATE` for a
   prepared image.
 - **Task history** is kept in the server's memory and in your browser. It is not a database; the
   durable record of a task is its pull request (or first commit). Whether a pull request has been merged or closed
-  since is read from GitHub when the dashboard loads and when you return to its tab.
+  since, and what its checks say, is read from GitHub when the dashboard loads, when you return to
+  its tab, and for a while after a task finishes.
+- **Settings are per browser.** Provider keys, model choices and the commit identity entered in the
+  dashboard are kept in that browser's `localStorage`: another browser or device starts without
+  them, and anyone with access to the browser profile can read them. Use environment variables for
+  keys that should be shared or that tasks started from GitHub need.
 - **Change size.** A task may change up to 300 files / 4 MB (1 MB per file). Dependency and build
   directories (`node_modules`, `.venv`, `__pycache__`, …) are never committed.
 
