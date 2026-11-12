@@ -48,7 +48,7 @@ from .ci import (
     names_of,
     standing_instructions,
 )
-from .common import Deadline, Redactor, clip, first_line
+from .common import Deadline, Redactor, clip, first_line, listed
 from .github import GitHubClient, GitHubError, PullRequest, compare_url, noreply_address
 from .llm import ChatClient, LLMError, create_llm_client
 from .sandbox import ChangeSet, E2BWorkspace, RepoCheckout, SandboxError, Workspace
@@ -142,6 +142,12 @@ def _code(text: str) -> str:
     return "`" + text.replace("`", "'").replace("\n", " ") + "`"
 
 
+def _left_out_item(item: str) -> str:
+    """``path (reason)`` from ``ChangeSet.left_out``, with the path as code."""
+    path, _, reason = item.rpartition(" (")
+    return f"{_code(path)} ({reason}" if path else _code(item)
+
+
 def build_pr_body(
     *,
     task: Dict[str, Any],
@@ -182,6 +188,13 @@ def build_pr_body(
         lines.append(f"- `{change.path}` ({label}{counts})")
     if len(changeset.changes) > 60:
         lines.append(f"- ... and {len(changeset.changes) - 60} more files")
+    if changeset.left_out:
+        # The work tree held more than this pull request does: say what and why.
+        lines += [
+            "",
+            "Not included, because it is build output or too large to commit: "
+            + listed([_left_out_item(item) for item in changeset.left_out], 12),
+        ]
 
     # What the change is based on: a reviewer can see at a glance whether the
     # agent looked at the code it describes or changes.
@@ -703,11 +716,19 @@ class TaskRunner:
                     and deadline.remaining() >= MIN_SECONDS_TO_DELIVER
                 ):
                     try:
-                        changeset = checkout.collect_changes()
+                        # Nobody can tidy up any more: build output and files too
+                        # large to commit are left out rather than costing the rest.
+                        changeset = checkout.collect_changes(salvage=True, written=outcome.files_written)
                     except SandboxError as exc:
                         emit("warn", f"The unfinished work cannot be kept: {exc}")
                         changeset = None
                 if changeset is None or changeset.empty:
+                    if changeset is not None and changeset.left_out:
+                        emit(
+                            "warn",
+                            "Nothing of the unfinished work can be kept. All of it is build output or too large "
+                            "to commit: " + listed(changeset.left_out),
+                        )
                     self._note_discarded_work(checkout, emit)
                     raise TaskFailed(reason)
                 unfinished = redact(reason)
@@ -716,9 +737,20 @@ class TaskRunner:
                     stop_reason=outcome.stop_reason,
                     unfinished_reason=unfinished,
                     handoff=redact(
-                        build_handoff(summary=outcome.summary, reason=reason, last_failure=outcome.last_failure)
+                        build_handoff(
+                            summary=outcome.summary,
+                            reason=reason,
+                            last_failure=outcome.last_failure,
+                            left_out=changeset.left_out,
+                        )
                     ),
                 )
+                if changeset.left_out:
+                    emit(
+                        "warn",
+                        "Not kept, because it is no part of the work or cannot be committed: "
+                        + listed(changeset.left_out),
+                    )
                 emit(
                     "warn",
                     (
@@ -734,7 +766,20 @@ class TaskRunner:
             # 6. Changes ------------------------------------------------------
             stage("commit", "Collecting changes")
             if changeset is None:
-                changeset = checkout.collect_changes()
+                try:
+                    changeset = checkout.collect_changes()
+                except SandboxError as exc:
+                    # The agent has finished and cannot tidy up any more. What
+                    # cannot be committed (a bundle, a dump) is left out and
+                    # named, rather than costing the whole result.
+                    changeset = checkout.collect_changes(salvage=True, written=outcome.files_written)
+                    if changeset.empty or not changeset.left_out:
+                        raise exc  # there is no rest to deliver: the task fails for the reason it gives
+                    emit(
+                        "warn",
+                        f"{str(exc).rstrip('.')}. Left out so that the rest can be delivered: "
+                        + listed(changeset.left_out),
+                    )
             if changeset.empty:
                 update(
                     status="completed",

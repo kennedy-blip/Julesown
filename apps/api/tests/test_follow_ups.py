@@ -15,7 +15,7 @@ from apps.api.services.github import log_excerpt
 from apps.api.services.llm import LLMError
 from apps.api.services.store import task_store
 
-from .conftest import CHECK_ADD, fix_add_script
+from .conftest import CHECK_ADD, DEMO_FILES, fix_add_script
 from .support import FakeGitHub, ScriptedLLM
 from .test_api import SECRET, TASK, comment_event, deliver, messages, run_stream
 
@@ -1387,3 +1387,98 @@ def test_without_a_webhook_the_pull_request_does_not_promise_a_comment_command(
     _events, again = run_stream(client, more)
     assert again["outcome"] == "pr_updated" and again["unfinished"] is True
     assert github.comments[-1]["body"].startswith("⚠️ I pushed ") and "/jules continue" not in github.comments[-1]["body"]
+
+
+# --------------------------------------------------------------------------- #
+# A file that cannot be committed does not cost the result
+# --------------------------------------------------------------------------- #
+def test_a_finished_task_is_delivered_without_the_file_that_cannot_be_committed(
+    client: TestClient, app_env, install_deps, github: FakeGitHub
+):
+    """The agent is done when its changes are collected: nobody can remove the
+    bundle any more. The pull request is opened without it and says so."""
+    bundle = "mkdir -p dist && head -c 1200000 /dev/zero | tr '\\0' 'x' > dist/bundle.js"
+    install_deps(
+        ScriptedLLM(
+            [
+                [("read_file", {"path": "calc.py"})],
+                [("write_file", {"path": "calc.py", "content": "def add(a, b):\n    return a + b\n"})],
+                [("run_command", {"command": bundle})],
+                [("run_tests", {"command": CHECK_ADD})],
+                [("finish", {"summary": "add() adds.", "pr_title": "Fix add()"})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
+    assert task["status"] == "completed" and task["outcome"] == "pull_request" and not task.get("unfinished")
+    assert [change["path"] for change in task["changed_files"]] == ["calc.py"]
+    warning = next(line for line in messages(task, "warn") if "Left out so that the rest can be delivered" in line)
+    assert warning.startswith("These changed files are larger than 1000 kB and cannot be committed by the agent: dist/bundle.js.")
+    assert warning.endswith("Left out so that the rest can be delivered: dist/bundle.js (1,200 kB, too large to commit)")
+    body = github.pulls["acme/demo"][0]["body"]
+    assert (
+        "Not included, because it is build output or too large to commit: "
+        "`dist/bundle.js` (1,200 kB, too large to commit)"
+    ) in body
+    assert github.remote.files("acme/demo", task["head_branch"]) == sorted(DEMO_FILES)  # no dist/ among them
+
+
+def test_build_output_that_can_be_committed_is_still_committed_by_a_finished_task(
+    client: TestClient, app_env, install_deps, github: FakeGitHub
+):
+    """Nothing changes for a task that finishes with a change that can be
+    committed as it is: what the agent left in the work tree is what is delivered."""
+    install_deps(
+        ScriptedLLM(
+            [
+                [("read_file", {"path": "calc.py"})],
+                [("write_file", {"path": "calc.py", "content": "def add(a, b):\n    return a + b\n"})],
+                [("run_command", {"command": "mkdir -p dist && echo built > dist/out.txt"})],
+                [("run_tests", {"command": CHECK_ADD})],
+                [("finish", {"summary": "add() adds.", "pr_title": "Fix add()"})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
+    assert sorted(change["path"] for change in task["changed_files"]) == ["calc.py", "dist/out.txt"]
+    assert "Not included" not in github.pulls["acme/demo"][0]["body"]
+    assert not any("Left out" in line for line in messages(task, "warn"))
+
+
+def test_a_task_whose_whole_result_cannot_be_committed_still_fails_for_that_reason(
+    client: TestClient, app_env, install_deps, github: FakeGitHub
+):
+    """Leaving the file out would leave nothing: an empty result would hide why."""
+    install_deps(
+        ScriptedLLM(
+            [
+                [("read_file", {"path": "calc.py"})],
+                [("run_command", {"command": "head -c 1200000 /dev/zero | tr '\\0' 'x' > dump.sql"})],
+                [("finish", {"summary": "Exported the data.", "pr_title": "Add the export"})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
+    assert task["status"] == "failed" and not github.pulls.get("acme/demo")
+    assert "larger than 1000 kB and cannot be committed by the agent: dump.sql" in task["error"]
+    assert not any("Left out" in line for line in messages(task, "warn"))
+
+
+def test_an_interrupted_run_that_only_left_build_output_has_nothing_to_keep(
+    client: TestClient, app_env, install_deps, github: FakeGitHub
+):
+    install_deps(
+        ScriptedLLM(
+            [
+                [("read_file", {"path": "calc.py"})],
+                [("run_command", {"command": "mkdir -p .cache/tool && echo built > .cache/tool/out.js"})],
+                RATE_LIMIT,
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
+    assert task["status"] == "failed" and not task.get("unfinished") and not github.pulls.get("acme/demo")
+    assert (
+        "Nothing of the unfinished work can be kept. All of it is build output or too large to commit: "
+        ".cache/ (build output, 1 file)"
+    ) in messages(task, "warn")

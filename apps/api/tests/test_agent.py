@@ -20,7 +20,15 @@ from apps.api.services.agent import (
 )
 from apps.api.services.common import Deadline, Redactor, clip, plain_text
 from apps.api.services.llm import LLMError, LLMResponse, ToolCall
-from apps.api.services.sandbox import KEY_FILE_BYTES, KEY_FILES_TOTAL_BYTES, README_BYTES, RepoCheckout, SandboxError
+from apps.api.services.sandbox import (
+    KEY_FILE_BYTES,
+    KEY_FILES_TOTAL_BYTES,
+    README_BYTES,
+    RepoCheckout,
+    SandboxError,
+    _in_batches,
+    build_output_root,
+)
 
 from .conftest import CHECK_ADD, DEMO_FILES
 from .support import GitRemote, LocalWorkspace, ScriptedLLM, git
@@ -153,6 +161,166 @@ def test_oversized_change_is_refused(checkout: RepoCheckout):
     with pytest.raises(SandboxError) as caught:
         checkout.collect_changes()
     assert "huge.bin" in str(caught.value)
+
+
+def test_salvaging_leaves_out_what_cannot_be_committed_instead_of_failing(checkout: RepoCheckout):
+    """A run that was stopped cannot tidy up any more. One bundle that is too
+    large must not cost everything else it did."""
+    root = Path(checkout.directory)
+    (root / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (root / "package.json").write_text('{"name": "demo", "scripts": {"build": "vite build"}}\n')
+    (root / "src").mkdir()
+    (root / "src" / "app.js").write_text("export const app = 1;\n")
+    (root / "huge.bin").write_bytes(b"0" * 1_200_000)
+    (root / "dist" / "assets").mkdir(parents=True)
+    (root / "dist" / "index.html").write_text("<!doctype html>\n")
+    (root / "dist" / "assets" / "index-abc.js").write_text("console.log(1);\n")
+    (root / "tsconfig.tsbuildinfo").write_text("{}\n")
+    with pytest.raises(SandboxError):
+        checkout.collect_changes()
+
+    changeset = checkout.collect_changes(salvage=True)
+    assert sorted(change.path for change in changeset.changes) == ["calc.py", "package.json", "src/app.js"]
+    assert changeset.left_out == [
+        "dist/ (build output, 2 files)",
+        "huge.bin (1,200 kB, too large to commit)",
+        "tsconfig.tsbuildinfo (build output)",
+    ]
+    # The tree that will be committed is the tree the commit is checked against: without them.
+    in_tree = git(root, "ls-tree", "-r", "--name-only", changeset.tree_sha).splitlines()
+    assert "src/app.js" in in_tree and "calc.py" in in_tree
+    assert not any(path.startswith("dist/") or path in ("huge.bin", "tsconfig.tsbuildinfo") for path in in_tree)
+    # Nothing was deleted from the work tree: only the commit goes without them.
+    assert (root / "huge.bin").exists() and (root / "dist" / "index.html").exists()
+    # A file the agent wrote itself is its work wherever it lies: only what a command left there is output.
+    own = checkout.collect_changes(salvage=True, written=["dist/index.html", "src/app.js"])
+    assert sorted(change.path for change in own.changes) == ["calc.py", "dist/index.html", "package.json", "src/app.js"]
+    assert "dist/ (build output, 1 file)" in own.left_out and len(own.left_out) == 3
+    in_tree = git(root, "ls-tree", "-r", "--name-only", own.tree_sha).splitlines()
+    assert "dist/index.html" in in_tree and "dist/assets/index-abc.js" not in in_tree
+
+
+def test_salvaging_keeps_a_build_directory_the_repository_tracks(remote: GitRemote, tmp_path):
+    """Some repositories commit their dist/ (a GitHub Action, a published
+    bundle). There a new file in it is part of the work."""
+    kept = checkout_of(
+        remote,
+        tmp_path,
+        {"package.json": "{}\n", "dist/index.js": "module.exports = 1;\n", "README.md": "# Action\n", "big.txt": "small\n"},
+    )
+    root = Path(kept.directory)
+    (root / "dist" / "extra.js").write_text("module.exports = 2;\n")
+    (root / "coverage").mkdir()
+    (root / "coverage" / "lcov.info").write_text("TN:\n")
+    (root / "big.txt").write_bytes(b"x" * 1_300_000)  # a file of the repository that became too large
+    (root / "README.md").write_text("# Action\n\nMore.\n")
+    changeset = kept.collect_changes(salvage=True)
+    assert sorted(change.path for change in changeset.changes) == ["README.md", "dist/extra.js"]
+    assert changeset.left_out == ["big.txt (1,300 kB, too large to commit)", "coverage/ (build output, 1 file)"]
+    # big.txt stays in the commit as it was in the repository.
+    assert git(root, "cat-file", "-p", f"{changeset.tree_sha}:big.txt") == "small"
+
+
+def test_salvaging_takes_paths_literally_and_copes_with_many_files(checkout: RepoCheckout):
+    """Brackets are common in the paths of web projects (app/[id]/page.js): to
+    git they are a pattern, one that also matches other files. And a build can
+    leave thousands of files."""
+    root = Path(checkout.directory)
+    (root / "app" / "[Id]").mkdir(parents=True)
+    (root / "app" / "[Id]" / "page.js").write_text("export default 1;\n")
+    (root / "app" / "[Id]" / "data.bin").write_bytes(b"1" * 1_100_000)
+    (root / "app" / "I").mkdir()
+    (root / "app" / "I" / "data.bin").write_text("what the pattern app/[Id]/data.bin matches as well\n")
+    (root / "packages" / "[web]" / "build" / "static").mkdir(parents=True)
+    (root / "packages" / "[web]" / "package.json").write_text("{}\n")
+    for index in range(1200):
+        name = f"chunk-{index:04d}-0123456789abcdef0123456789abcdef.js"
+        (root / "packages" / "[web]" / "build" / "static" / name).write_text(f"// {index}\n")
+    changeset = checkout.collect_changes(salvage=True)
+    assert sorted(change.path for change in changeset.changes) == [
+        "app/I/data.bin",
+        "app/[Id]/page.js",
+        "packages/[web]/package.json",
+    ]
+    assert changeset.left_out == [
+        "app/[Id]/data.bin (1,100 kB, too large to commit)",
+        "packages/[web]/build/ (build output, 1200 files)",
+    ]
+    in_tree = git(root, "ls-tree", "-r", "--name-only", changeset.tree_sha).splitlines()
+    assert "app/[Id]/page.js" in in_tree and "app/I/data.bin" in in_tree
+    assert "app/[Id]/data.bin" not in in_tree and not any(path.startswith("packages/[web]/build/") for path in in_tree)
+
+
+def test_shell_arguments_are_split_before_a_command_line_grows_too_long():
+    shas = [f"{index:040x}" for index in range(5000)]
+    batches = _in_batches(shas)
+    assert [sha for batch in batches for sha in batch] == shas and len(batches) > 1
+    assert all(sum(len(sha) + 3 for sha in batch) <= 40_000 for batch in batches)
+    assert _in_batches([]) == [] and _in_batches(["x" * 90_000, "y"]) == [["x" * 90_000], ["y"]]
+
+
+def test_where_build_output_may_lie():
+    assert build_output_root("dist/assets/index.js") == "dist"
+    assert build_output_root("packages/app/build/static/js/main.js") == "packages/app/build"
+    assert build_output_root("target/debug/app") == "target" and build_output_root("coverage/lcov.info") == "coverage"
+    assert build_output_root("apps/web/.turbo/cache/a.log") == "apps/web/.turbo"
+    # A file is not a directory, and source directories are not output.
+    for path in ("dist", "build.gradle", "src/build.ts", "src/app.js", "public/index.html", "bin/run", "docs/out.md"):
+        assert build_output_root(path) is None
+
+
+def test_a_directory_is_build_output_only_next_to_a_manifest(remote: GitRemote, tmp_path):
+    """"build", "out", "target" and "coverage" are ordinary names as well: a
+    folder of that name is taken for output only where a build would put it."""
+    mono = checkout_of(
+        remote,
+        tmp_path,
+        {"README.md": "# Mono\n", "packages/api/pyproject.toml": "[project]\nname = 'api'\n", "src/policy.py": "x = 1\n"},
+    )
+    root = Path(mono.directory)
+    for path in (
+        "src/coverage/rules.py",  # a module of an insurance application, moved here by a command
+        "docs/out/notes.md",
+        "packages/api/build/lib/api.py",  # beside the pyproject.toml of the repository
+        "packages/web/package.json",  # a manifest this run created ...
+        "packages/web/dist/index.js",  # ... and what its build left beside it
+        "packages/web/src/target/a.js",
+        "tools/.cache/blob",  # a tool's cache needs no manifest to be recognised
+    ):
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text("content\n")
+    changeset = mono.collect_changes(salvage=True)
+    assert sorted(change.path for change in changeset.changes) == [
+        "docs/out/notes.md",
+        "packages/web/package.json",
+        "packages/web/src/target/a.js",
+        "src/coverage/rules.py",
+    ]
+    assert changeset.left_out == [
+        "packages/api/build/ (build output, 1 file)",
+        "packages/web/dist/ (build output, 1 file)",
+        "tools/.cache/ (build output, 1 file)",
+    ]
+
+
+def test_salvaging_changes_nothing_when_everything_can_be_committed(checkout: RepoCheckout):
+    (Path(checkout.directory) / "notes.md").write_text("# Notes\n")
+    strict, salvaged = checkout.collect_changes(), checkout.collect_changes(salvage=True)
+    assert [change.path for change in salvaged.changes] == ["notes.md"] and salvaged.left_out == []
+    assert salvaged.tree_sha == strict.tree_sha
+
+
+def test_salvaging_when_the_change_is_too_large_in_total(checkout: RepoCheckout):
+    root = Path(checkout.directory)
+    for index in range(5):
+        (root / f"data{index}.txt").write_bytes(bytes([97 + index]) * (900_000 - index * 1000))
+    (root / "main.py").write_text("print('hi')\n")
+    with pytest.raises(SandboxError, match="in total"):
+        checkout.collect_changes()
+    changeset = checkout.collect_changes(salvage=True)
+    # The largest new files go first, until the rest fits (4,000 kB).
+    assert sorted(change.path for change in changeset.changes) == ["data1.txt", "data2.txt", "data3.txt", "data4.txt", "main.py"]
+    assert changeset.left_out == ["data0.txt (900 kB, the change was too large in total)"]
 
 
 # --------------------------------------------------------------------------- #

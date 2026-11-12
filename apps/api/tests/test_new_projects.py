@@ -794,6 +794,34 @@ def test_a_project_the_agent_gave_up_on_is_pushed_as_unfinished(client: TestClie
     assert any(line.startswith("The project is unfinished: what the agent had built when it stopped was pushed") for line in messages(task, "warn"))
 
 
+def test_build_output_does_not_cost_an_interrupted_run_its_work(
+    client: TestClient, token_env, install_deps, github: FakeGitHub, blank: str
+):
+    """The first build has run, the .gitignore is not written yet, and the run
+    is cut short: the bundle is too large to commit. Everything else is kept."""
+    bundle = sys.executable + " -c \"import os; os.makedirs('dist/assets'); open('dist/assets/index.js', 'w').write('x' * 1200000)\""
+    install_deps(
+        ScriptedLLM(
+            [
+                [
+                    ("write_file", {"path": "package.json", "content": '{"name": "pulse", "version": "1.0.0", "scripts": {"build": "vite build"}}\n'}),
+                    ("write_file", {"path": "src/main.js", "content": "console.log('pulse');\n"}),
+                ],
+                [("run_command", {"command": bundle})],
+                LLMError("groq returned HTTP 429: Rate limit reached.", kind="rate_limit", status_code=429, retry_after=900.0),
+            ]
+        )
+    )
+    _events, task = run_stream(client, {"repository": blank, "prompt": "Build Pulse"})
+    assert task["status"] == "completed" and task["outcome"] == "initial_commit" and task["unfinished"] is True
+    assert github.remote.files(blank, "main") == ["package.json", "src/main.js"]
+    warnings = messages(task, "warn")
+    assert "Not kept, because it is no part of the work or cannot be committed: dist/ (build output, 1 file)" in warnings
+    assert not any("cannot be kept" in line or "discarded" in line for line in warnings)
+    # The run that continues is told that the bundle is not in the repository.
+    assert "Not committed (build output, or too large to commit): dist/ (build output, 1 file)" in task["handoff"]
+
+
 def test_a_private_empty_repository_needs_no_clone_token(
     client: TestClient, app_env, install_deps, github: FakeGitHub
 ):

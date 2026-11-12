@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-from .common import clip
+from .common import clip, listed
 from .github import GitHubClient
 
 # Hidden in the comment that announces an automatic fix. Counting these on a
@@ -32,7 +32,13 @@ CONTINUE_NOTE = (
 GAVE_UP = "The agent reported that it could not complete the task"
 
 
-def build_handoff(*, summary: str, reason: str, last_failure: Optional[Dict[str, Any]] = None) -> str:
+def build_handoff(
+    *,
+    summary: str,
+    reason: str,
+    last_failure: Optional[Dict[str, Any]] = None,
+    left_out: Optional[List[str]] = None,
+) -> str:
     """What a run that stopped early leaves for the run that continues it: the
     agent's own account, the command that still fails, and why it stopped.
 
@@ -51,6 +57,9 @@ def build_handoff(*, summary: str, reason: str, last_failure: Optional[Dict[str,
             f"The last command that failed and has not passed since: `{last_failure['command']}` ({status}). "
             f"Its output ended with:\n{clip(output, 1500)}"
         )
+    if left_out:
+        # What the run produced but the commit does not contain: the next run must not look for it.
+        parts.append("Not committed (build output, or too large to commit): " + listed(left_out))
     parts.append(f"Why it stopped: {reason.strip()}")
     return "\n\n".join(parts)
 

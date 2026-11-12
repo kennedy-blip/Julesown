@@ -13,7 +13,7 @@ import hashlib
 import posixpath
 import shlex
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from .github import FileChange
 
@@ -70,6 +70,44 @@ README_FILES = ("README.md", "README.rst", "README.txt", "README", "Readme.md", 
 KEY_FILE_BYTES = 1600
 README_BYTES = 500
 KEY_FILES_TOTAL_BYTES = 2400
+
+# Where builds and test runs put their output: in a directory of one of these
+# names next to the project's manifest (dist/ beside package.json), or in a
+# tool's own cache directory anywhere. When a run stops early, its .gitignore
+# may not be written yet: what a command left there is then not part of the
+# work that is kept (see ``RepoCheckout.collect_changes``). This never applies
+# to a file the agent wrote itself, nor to a directory the repository keeps
+# under version control.
+BUILD_OUTPUT_DIRS = ("dist", "build", "out", "target", "coverage", "htmlcov")
+TOOL_CACHE_DIRS = (".vite", ".turbo", ".cache", ".parcel-cache", ".output", ".nuxt", ".svelte-kit", ".gradle")
+BUILD_OUTPUT_SUFFIXES = (".tsbuildinfo",)
+
+
+def build_output_root(path: str) -> Optional[str]:
+    """The directory named like build output that ``path`` lies in
+    (``packages/app/dist`` for ``packages/app/dist/assets/a.js``), if any.
+    Whether it *is* build output depends on what lies next to it."""
+    parts = path.split("/")
+    for index, part in enumerate(parts[:-1]):
+        if part in BUILD_OUTPUT_DIRS or part in TOOL_CACHE_DIRS:
+            return "/".join(parts[: index + 1])
+    return None
+
+
+def _in_batches(arguments: Sequence[str], limit: int = 40_000) -> List[List[str]]:
+    """Split shell arguments into groups that each fit on one command line: a
+    script is handed to the shell as one argument, and the kernel limits the
+    length of a single argument (128 kB on Linux)."""
+    batches: List[List[str]] = []
+    length = 0
+    for argument in arguments:
+        cost = len(argument.encode("utf-8", "replace")) + 3
+        if not batches or length + cost > limit:
+            batches.append([])
+            length = 0
+        batches[-1].append(argument)
+        length += cost
+    return batches
 
 
 class SandboxError(RuntimeError):
@@ -262,6 +300,10 @@ class ChangeSet:
     changes: List[FileChange] = field(default_factory=list)
     tree_sha: str = ""
     total_bytes: int = 0
+    # Files of the work tree that are not part of the changes although they
+    # differ from the base, each with the reason: "dist/app.js (build output)".
+    # Only when unfinished work is salvaged (see ``collect_changes``).
+    left_out: List[str] = field(default_factory=list)
 
     @property
     def empty(self) -> bool:
@@ -474,13 +516,20 @@ class RepoCheckout:
         return result.stdout.strip() if result.ok else ""
 
     # ------------------------------------------------------------------ #
-    def collect_changes(self) -> ChangeSet:
+    def collect_changes(self, *, salvage: bool = False, written: Sequence[str] = ()) -> ChangeSet:
         """Stage everything and describe the difference to the base commit.
 
         The comparison is against the commit that was cloned (not ``HEAD``), so
         the result is correct even if a command inside the sandbox committed.
         For a repository that had no commits it is against the empty tree:
         every file is an addition.
+
+        A file that is too large, or a change that is too big altogether, is an
+        error: the agent is told while it can still act on it. With ``salvage``
+        - for a run that was stopped, where nobody can act any more - such
+        files and build output are left out instead (``ChangeSet.left_out``),
+        so that one stray bundle does not cost all the work. ``written`` names
+        the files the agent wrote itself: those are never taken for build output.
         """
         base = shlex.quote(self.diff_base)
         staged = self.git("add -A")
@@ -495,6 +544,7 @@ class RepoCheckout:
         tokens = _decode_b64_output(raw.stdout, "the list of changed files").split(b"\0")
 
         changes: List[FileChange] = []
+        previous: Dict[str, tuple[str, str]] = {}  # path -> (mode, blob) in the base
         index = 0
         while index + 1 < len(tokens):
             meta_bytes, path_bytes = tokens[index], tokens[index + 1]
@@ -504,7 +554,7 @@ class RepoCheckout:
             fields = meta_bytes.decode("ascii", "replace").lstrip(":").split(" ")
             if len(fields) != 5:
                 raise SandboxError("Unexpected output from git diff; cannot determine the changes.")
-            old_mode, new_mode, _old_sha, new_sha, status = fields
+            old_mode, new_mode, old_sha, new_sha, status = fields
             try:
                 path = path_bytes.decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -512,13 +562,17 @@ class RepoCheckout:
             letter = status[:1]
             if letter == "U":
                 raise SandboxError(f"{path} has unresolved merge conflicts.")
+            previous[path] = (old_mode, old_sha)
             if letter == "D":
                 changes.append(FileChange(path=path, status="D", mode=old_mode))
             else:
                 changes.append(FileChange(path=path, status=letter, mode=new_mode, sha=new_sha))
 
+        left_out: List[str] = []
+        if salvage and changes:
+            changes, left_out = self._leave_out_what_cannot_be_kept(changes, previous, set(written))
         if not changes:
-            return ChangeSet()
+            return ChangeSet(left_out=left_out)
         if len(changes) > MAX_CHANGED_FILES:
             raise SandboxError(
                 f"The run changed {len(changes)} files, more than the limit of {MAX_CHANGED_FILES}. "
@@ -532,7 +586,131 @@ class RepoCheckout:
         tree_sha = tree.stdout.strip()
         if not tree.ok or len(tree_sha) != 40:
             raise SandboxError(f"git write-tree failed: {tree.output()[-400:]}")
-        return ChangeSet(changes=changes, tree_sha=tree_sha, total_bytes=total)
+        return ChangeSet(changes=changes, tree_sha=tree_sha, total_bytes=total, left_out=left_out)
+
+    def _blob_sizes(self, shas: List[str]) -> Dict[str, int]:
+        """Size in bytes of each of the given blobs."""
+        unique = sorted(set(shas))
+        sizes: Dict[str, int] = {}
+        for batch in _in_batches(unique):
+            listing = self.git_shell(
+                "printf '%s\\n' " + " ".join(shlex.quote(sha) for sha in batch) + " | git cat-file --batch-check"
+            )
+            if not listing.ok:
+                raise SandboxError(f"Could not inspect the changed files: {listing.output()[-400:]}")
+            for line in listing.stdout.splitlines():
+                pieces = line.split()
+                if len(pieces) == 3 and pieces[1] == "blob" and pieces[2].isdigit():
+                    sizes[pieces[0]] = int(pieces[2])
+        if any(sha not in sizes for sha in unique):
+            raise SandboxError("Could not determine the size of some changed files.")
+        return sizes
+
+    def _leave_out_what_cannot_be_kept(
+        self, changes: List[FileChange], previous: Dict[str, "tuple[str, str]"], written: set
+    ) -> "tuple[List[FileChange], List[str]]":
+        """Take out of the staged changes what would make them impossible to
+        commit, or what is no part of the work: build output a command of this
+        run produced (new files in a build directory that the agent did not
+        write itself), files above the size limit and - if the change is still
+        too big in total - the largest new files.
+
+        They are taken out of the index as well, so that the tree that is
+        committed is still the tree the commit is checked against. Returns the
+        changes that remain and a description of each thing left out.
+        """
+        # 1. Build output: decided by where a file lies, before anything is measured.
+        generated = [change for change in changes if change.status == "A" and change.path not in written]
+        candidates = sorted({root for root in (build_output_root(change.path) for change in generated) if root})
+        manifests_beside = {
+            root: [posixpath.join(posixpath.dirname(root), name) for name in MANIFEST_FILES]
+            for root in candidates
+            if posixpath.basename(root) in BUILD_OUTPUT_DIRS
+        }
+        in_base = self._paths_in_base(candidates + [path for paths in manifests_beside.values() for path in paths])
+        in_work_tree = {change.path for change in changes if change.status != "D"} | (in_base or set())
+
+        def is_build_output(root: str) -> bool:
+            if in_base is None or root in in_base:
+                return False  # the repository keeps this directory: what is new in it is work
+            beside = manifests_beside.get(root)
+            return beside is None or any(path in in_work_tree for path in beside)
+
+        roots = {root for root in candidates if is_build_output(root)}
+        output_of: Dict[str, List[str]] = {}  # build directory -> its files that are left out
+        dropped: Dict[str, str] = {}  # path -> why
+        for change in generated:
+            root = build_output_root(change.path)
+            if root in roots:
+                output_of.setdefault(root, []).append(change.path)
+                dropped[change.path] = "build output"
+            elif change.path.endswith(BUILD_OUTPUT_SUFFIXES):
+                dropped[change.path] = "build output"
+        described = [f"{path} (build output)" for path, why in dropped.items() if build_output_root(path) not in output_of]
+        described += [
+            f"{root}/ (build output, {len(paths)} file{'' if len(paths) == 1 else 's'})"
+            for root, paths in output_of.items()
+        ]
+
+        # 2. Size: of what is left.
+        remaining = [change for change in changes if change.path not in dropped]
+        sizes = self._blob_sizes([c.sha for c in remaining if c.status != "D" and c.mode != "160000" and c.sha])
+
+        def size(change: FileChange) -> int:
+            return 0 if change.status == "D" else sizes.get(change.sha or "", 0)
+
+        for change in remaining:
+            if size(change) > MAX_FILE_BYTES:
+                dropped[change.path] = f"{size(change) // 1000:,} kB, too large to commit"
+                described.append(f"{change.path} ({dropped[change.path]})")
+        remaining = [change for change in remaining if change.path not in dropped]
+        total = sum(size(change) for change in remaining)
+        for change in sorted((c for c in remaining if c.status == "A"), key=size, reverse=True):
+            if total <= MAX_TOTAL_BYTES:
+                break
+            dropped[change.path] = f"{size(change) // 1000:,} kB, the change was too large in total"
+            described.append(f"{change.path} ({dropped[change.path]})")
+            total -= size(change)
+        if not dropped:
+            return changes, []
+
+        # 3. The index follows. A build directory none of whose files is kept goes in one piece.
+        kept_paths = {change.path for change in changes if change.path not in dropped}
+        whole = [root for root in output_of if not any(path.startswith(root + "/") for path in kept_paths)]
+        single = [
+            change.path
+            for change in changes
+            if change.path in dropped and change.status == "A" and build_output_root(change.path) not in whole
+        ]
+        for batch in _in_batches(whole + single):
+            # Literal: "app/[id]/page.js" is a path here, not a pattern.
+            paths = " ".join(shlex.quote(path) for path in batch)
+            result = self.git(f"--literal-pathspecs rm -r --cached -q --ignore-unmatch -- {paths}")
+            if not result.ok:
+                raise SandboxError(f"git rm --cached failed: {result.output()[-400:]}")
+        for change in changes:
+            if change.path in dropped and change.status != "A":
+                # A file of the repository that became too large: it stays as it was.
+                old_mode, old_sha = previous[change.path]
+                result = self.git(f"update-index --cacheinfo {old_mode},{old_sha},{shlex.quote(change.path)}")
+                if not result.ok:
+                    raise SandboxError(f"git update-index failed: {result.output()[-400:]}")
+        return [change for change in changes if change.path not in dropped], sorted(described)
+
+    def _paths_in_base(self, paths: List[str]) -> Optional[set]:
+        """Which of the given files and directories exist in the commit that
+        was cloned. None when that cannot be told."""
+        found: set = set()
+        for batch in _in_batches(paths):
+            names = " ".join(shlex.quote(path) for path in batch)
+            result = self.git(
+                "-c core.quotePath=false --literal-pathspecs ls-tree --name-only "
+                f"{shlex.quote(self.diff_base)} -- {names}"
+            )
+            if not result.ok:
+                return None
+            found.update(line.strip() for line in result.stdout.splitlines() if line.strip())
+        return found
 
     def _attach_line_counts(self, changes: List[FileChange]) -> None:
         numstat = self.git_shell(
@@ -569,19 +747,7 @@ class RepoCheckout:
         if not blobs:
             return 0
         unique = sorted({c.sha for c in blobs if c.sha})
-        listing = self.git_shell(
-            "printf '%s\\n' " + " ".join(shlex.quote(sha) for sha in unique) + " | git cat-file --batch-check"
-        )
-        if not listing.ok:
-            raise SandboxError(f"Could not inspect the changed files: {listing.output()[-400:]}")
-        sizes: Dict[str, int] = {}
-        for line in listing.stdout.splitlines():
-            pieces = line.split()
-            if len(pieces) == 3 and pieces[1] == "blob" and pieces[2].isdigit():
-                sizes[pieces[0]] = int(pieces[2])
-        missing = [sha for sha in unique if sha not in sizes]
-        if missing:
-            raise SandboxError("Could not determine the size of some changed files.")
+        sizes = self._blob_sizes(unique)
 
         too_big = [c.path for c in blobs if sizes[c.sha or ""] > MAX_FILE_BYTES]
         if too_big:

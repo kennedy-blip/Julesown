@@ -128,8 +128,8 @@ you wrote is on disk as you sent it, so do not read it back. Keep files lean: sa
 a handful of entries, no filler code, no long comments - what you write costs time, and the time \
 of a run is limited.
 - With a build step (a bundler, TypeScript, a compiler) work in this order: the manifest, the \
-configuration and a minimal entry point first; then install and run the build once, while a \
-mistake in the configuration is cheap to find; then the features; then the build again. When an \
+configuration, the .gitignore and a minimal entry point first; then install and run the build once, \
+while a mistake in the configuration is cheap to find; then the features; then the build again. When an \
 install, a build or a test fails, fix what it reports before you write anything else: change only \
 what the error points at and run the command again.
 - Check your work before you finish with run_command, using what the stack offers: install and \
@@ -340,6 +340,9 @@ class AgentOutcome:
     verification: List[VerificationRun] = field(default_factory=list)
     # Repository files whose content the model was shown, in the order it saw them.
     files_read: List[str] = field(default_factory=list)
+    # Files the agent wrote or edited with its own tools (as opposed to what a
+    # command it ran left behind: installed dependencies, build output).
+    files_written: List[str] = field(default_factory=list)
     # The last command that failed and was not run again with success since:
     # ``command``, ``exit_code``, ``timed_out`` and the end of its ``output``.
     # It is where a follow-up run picks the work up.
@@ -632,6 +635,7 @@ class CodingAgent:
         self.verification: List[VerificationRun] = []
         # What the model has looked at. It decides whether a write is "blind".
         self.files_read: List[str] = []
+        self.files_written: set = set()
         self._known_content: set[str] = set()  # files whose current content the model has seen
         self._inspections = 0  # read_file / search_code / run_command calls so far
         self._blind_write_refused = False
@@ -839,6 +843,7 @@ class CodingAgent:
         self._check_blind_write(absolute, relative)
         self.workspace.write_file(absolute, content)
         self._known_content.add(relative)
+        self.files_written.add(relative)
         self._unwritten.discard(relative)
         line_count = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
         self.emit("edit", f"write_file {relative} ({line_count} lines)")
@@ -1021,6 +1026,7 @@ class CodingAgent:
             )
         self.workspace.write_file(absolute, current.replace(old_text, new_text, 1))
         self._known_content.add(relative)
+        self.files_written.add(relative)
         self._unwritten.discard(relative)
         self.emit("edit", f"replace_in_file {relative}")
         return f"Updated {relative}."
@@ -1360,6 +1366,7 @@ class CodingAgent:
                 model=self.llm.model,
                 verification=list(self.verification),
                 files_read=list(self.files_read),
+                files_written=sorted(self.files_written),
                 last_failure=self._unresolved_failure(),
                 served=dict(self._served),
                 **extra,

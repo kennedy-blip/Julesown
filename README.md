@@ -158,9 +158,9 @@ into it, a larger one takes two or three. The agent is told so and works accordi
 
 - It is told how much time the run has, to keep files lean (a handful of sample entries, no filler)
   and not to read back what it has just written.
-- With a build step it writes the manifest, the configuration and a minimal entry point first and
-  runs the install and the build **once, early**, while a mistake in the configuration is cheap to
-  find. A command that fails is fixed before anything else is written.
+- With a build step it writes the manifest, the configuration, the `.gitignore` and a minimal entry
+  point first and runs the install and the build **once, early**, while a mistake in the
+  configuration is cheap to find. A command that fails is fixed before anything else is written.
 - At half time it is told how many seconds are left and to check what it has.
 - When the time is nearly used up it is asked once to wrap up: to say what is done, what is missing
   and what the last failing command reported.
@@ -280,6 +280,13 @@ by then, they are **not discarded**:
 - In an empty repository the files are pushed as the first commit, marked the same way.
 - The commit message records where the work stands: the agent's own account, why it stopped and the
   command that still failed, with the end of its output.
+- A run that was stopped cannot tidy up after itself. What a build left behind before the
+  `.gitignore` was written, and files too large to commit, are **left out** rather than costing
+  the rest; the log and the handoff name them, so the next run knows they are not in the
+  repository. Build output means: new files in `dist/`, `build/`, `out/`, `target/`, `coverage/`
+  or `htmlcov/` next to the project's manifest (`package.json`, `pyproject.toml`, `Cargo.toml` …),
+  in a tool's cache directory (`.vite`, `.turbo`, `.cache` …), and `*.tsbuildinfo`. A file the agent
+  wrote itself, or a directory the repository already keeps, is never taken for it.
 
 ```text
 [Unfinished] Build OmniPulse
@@ -668,8 +675,11 @@ Fields of a task record that describe how far the result can be trusted:
   identity entered in the dashboard are kept in that browser's `localStorage`: another browser or
   device starts without them, and anyone with access to the browser profile can read them. Use
   environment variables for what should be shared or what tasks started from GitHub need.
-- **Change size.** A task may change up to 300 files / 4 MB (1 MB per file). Dependency and build
-  directories (`node_modules`, `.venv`, `__pycache__`, …) are never committed.
+- **Change size.** A task may change up to 300 files / 4 MB (1 MB per file). Dependency and cache
+  directories (`node_modules`, `.venv`, `__pycache__`, `.next`, …) are never committed. If a
+  finished task left a file that is too large (a bundle, a dump), the pull request is opened
+  without it - together with any build output the run produced - and says so under *Changes*; a
+  task with nothing else to deliver fails with that reason.
 
 ---
 
