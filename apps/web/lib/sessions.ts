@@ -1,4 +1,4 @@
-import type { LogEntry, PullRequestState, TaskRecord } from './api';
+import type { ChecksSummary, LogEntry, PullRequestState, TaskRecord } from './api';
 import { firstCommitUrl, pullRequestUrl } from './api';
 
 /**
@@ -21,9 +21,19 @@ export interface Session {
   note: string | null;
   /**
    * What became of the pull request after the task opened it, as last read
-   * from GitHub. Absent until it has been looked up.
+   * from GitHub: its state, whether it is still marked unfinished and what CI
+   * says about its head. Absent until it has been looked up.
    */
-  pullRequest?: { state: PullRequestState; checkedAt: number } | null;
+  pullRequest?: {
+    state: PullRequestState;
+    checkedAt: number;
+    unfinished?: boolean;
+    checks?: ChecksSummary | null;
+  } | null;
+  /** What CI says about the first commit of a repository that was empty. */
+  commitChecks?: { checks: ChecksSummary; checkedAt: number } | null;
+  /** More work on an existing pull request: what was asked for. */
+  target?: { pullRequest: number | null; fixChecks: boolean; continueWork: boolean } | null;
   createdAt: number; // ms
   updatedAt: number; // ms
 }
@@ -31,6 +41,8 @@ export interface Session {
 export type SessionBadge =
   | 'RUNNING'
   | 'PR OPENED'
+  | 'PR UPDATED'
+  | 'UNFINISHED'
   | 'MERGED'
   | 'PR CLOSED'
   | 'PUSHED'
@@ -44,16 +56,34 @@ export function pullRequestState(session: Session): PullRequestState | null {
   return session.pullRequest ? session.pullRequest.state : null;
 }
 
+/**
+ * Whether the result of this session is unfinished work: the agent was cut
+ * short and what it had was delivered. For a pull request GitHub has the last
+ * word - a follow-up that finished it takes the mark off.
+ */
+export function isUnfinished(session: Session): boolean {
+  if (session.state !== 'completed' || !session.task) return false;
+  if (pullRequestUrl(session.task) && session.pullRequest && typeof session.pullRequest.unfinished === 'boolean') {
+    return session.pullRequest.unfinished;
+  }
+  return session.task.unfinished === true;
+}
+
 export function sessionBadge(session: Session): SessionBadge {
   if (session.state === 'running') return 'RUNNING';
   if (session.state === 'failed') return 'FAILED';
   if (session.state === 'interrupted') return 'UNKNOWN';
+  const outcome = session.task ? session.task.outcome : null;
+  if (outcome === 'no_changes') return 'NO CHANGES';
   if (pullRequestUrl(session.task)) {
     const state = pullRequestState(session);
-    return state === 'merged' ? 'MERGED' : state === 'closed' ? 'PR CLOSED' : 'PR OPENED';
+    if (state === 'merged') return 'MERGED';
+    if (state === 'closed') return 'PR CLOSED';
+    if (isUnfinished(session)) return 'UNFINISHED';
+    return outcome === 'pr_updated' ? 'PR UPDATED' : 'PR OPENED';
   }
   // The repository was empty: the result is its first commit, on the default branch.
-  if (firstCommitUrl(session.task)) return 'PUSHED';
+  if (firstCommitUrl(session.task)) return isUnfinished(session) ? 'UNFINISHED' : 'PUSHED';
   return 'NO CHANGES';
 }
 
@@ -64,7 +94,14 @@ export function sessionBadge(session: Session): SessionBadge {
 export function pullRequestCanChange(session: Session): boolean {
   if (session.state !== 'completed' || !pullRequestUrl(session.task)) return false;
   if (!session.task || !session.task.task_id) return false;
+  // A follow-up that changed nothing names the pull request it was about, not a result.
+  if (session.task.outcome === 'no_changes') return false;
   return pullRequestState(session) !== 'merged';
+}
+
+/** Whether the result is the first commit of a repository that was empty (its checks can be asked for). */
+export function isFirstCommit(session: Session): boolean {
+  return session.state === 'completed' && !!firstCommitUrl(session.task) && !!session.task && !!session.task.commit_sha;
 }
 
 // --------------------------------------------------------------------------
@@ -83,6 +120,25 @@ function isLogEntry(value: unknown): value is LogEntry {
   return typeof entry.ts === 'number' && typeof entry.level === 'string' && typeof entry.message === 'string';
 }
 
+function reviveChecks(value: unknown): ChecksSummary | null {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  const states = ['failure', 'pending', 'success', 'none', 'unknown'];
+  if (typeof raw.state !== 'string' || states.indexOf(raw.state) < 0) return null;
+  const count = (item: unknown) => (typeof item === 'number' ? item : 0);
+  return {
+    sha: typeof raw.sha === 'string' ? raw.sha : '',
+    state: raw.state as ChecksSummary['state'],
+    failing: Array.isArray(raw.failing)
+      ? raw.failing.filter((item) => item && typeof item === 'object' && typeof (item as { name?: unknown }).name === 'string')
+      : [],
+    failed: count(raw.failed),
+    passed: count(raw.passed),
+    pending: count(raw.pending),
+    notes: Array.isArray(raw.notes) ? raw.notes.filter((item) => typeof item === 'string') : [],
+  };
+}
+
 function revivePullRequest(value: unknown): Session['pullRequest'] {
   if (!value || typeof value !== 'object') return null;
   const raw = value as Record<string, unknown>;
@@ -91,7 +147,26 @@ function revivePullRequest(value: unknown): Session['pullRequest'] {
   return {
     state: raw.state as PullRequestState,
     checkedAt: typeof raw.checkedAt === 'number' ? raw.checkedAt : 0,
+    unfinished: typeof raw.unfinished === 'boolean' ? raw.unfinished : undefined,
+    checks: reviveChecks(raw.checks),
   };
+}
+
+function reviveTarget(value: unknown): Session['target'] {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  return {
+    pullRequest: typeof raw.pullRequest === 'number' && raw.pullRequest > 0 ? raw.pullRequest : null,
+    fixChecks: raw.fixChecks === true,
+    continueWork: raw.continueWork === true,
+  };
+}
+
+function reviveCommitChecks(value: unknown): Session['commitChecks'] {
+  if (!value || typeof value !== 'object') return null;
+  const raw = value as Record<string, unknown>;
+  const checks = reviveChecks(raw.checks);
+  return checks ? { checks, checkedAt: typeof raw.checkedAt === 'number' ? raw.checkedAt : 0 } : null;
 }
 
 function reviveSession(value: unknown): Session | null {
@@ -113,6 +188,8 @@ function reviveSession(value: unknown): Session | null {
     logs: Array.isArray(raw.logs) ? raw.logs.filter(isLogEntry) : [],
     note: typeof raw.note === 'string' ? raw.note : null,
     pullRequest: revivePullRequest(raw.pullRequest),
+    commitChecks: reviveCommitChecks(raw.commitChecks),
+    target: reviveTarget(raw.target),
     createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
     updatedAt: typeof raw.updatedAt === 'number' ? raw.updatedAt : Date.now(),
   };

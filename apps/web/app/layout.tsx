@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import { HeaderNav } from '@/components/HeaderNav';
 import { SystemStatus } from '@/components/SystemStatus';
 import './globals.css';
 
@@ -16,23 +17,27 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body className="min-h-screen bg-[#090d16] text-slate-100 antialiased selection:bg-blue-600 selection:text-white">
-        <header className="border-b border-slate-800 bg-[#0f172a]/80 backdrop-blur sticky top-0 z-50">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-            <div className="flex items-center space-x-3">
-              <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center font-bold text-white shadow-lg shadow-blue-500/30">
-                J
-              </div>
-              <span className="font-semibold text-base sm:text-lg tracking-tight text-white whitespace-nowrap">
-                Project Jules <span className="hidden sm:inline text-xs uppercase bg-blue-500/20 text-blue-400 border border-blue-500/30 px-2 py-0.5 rounded-full ml-1">Clone</span>
-              </span>
+        <header className="border-b border-slate-800 bg-[#0c1322]/90 backdrop-blur sticky top-0 z-40">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-14 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-6 min-w-0">
+              <a href="#/" className="flex items-center gap-2.5 flex-shrink-0" aria-label="Jules workspace">
+                <span className="w-8 h-8 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center font-bold text-white shadow-lg shadow-blue-500/30">
+                  J
+                </span>
+                <span className="font-semibold text-[15px] tracking-tight text-white whitespace-nowrap">
+                  Jules
+                  <span className="hidden md:inline font-normal text-slate-500"> · coding agent</span>
+                </span>
+              </a>
+              <HeaderNav />
             </div>
-            <div className="flex items-center space-x-4 text-sm text-slate-400">
+            <div className="flex items-center gap-4 flex-shrink-0">
               <SystemStatus />
               <a
                 href="/api/docs"
                 target="_blank"
                 rel="noreferrer"
-                className="hidden sm:inline hover:text-white transition-colors text-xs font-medium text-slate-300 whitespace-nowrap"
+                className="hidden md:inline text-[13px] font-medium text-slate-400 hover:text-white transition-colors whitespace-nowrap"
               >
                 API docs
               </a>
@@ -40,9 +45,7 @@ export default function RootLayout({
           </div>
         </header>
 
-        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-          {children}
-        </main>
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">{children}</main>
       </body>
     </html>
   );
