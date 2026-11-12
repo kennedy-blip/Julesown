@@ -629,8 +629,9 @@ Fields of a task record that describe how far the result can be trusted:
   finishes it. Asking for a first version and extending it with follow-up tasks works as well.
 - **Tokens.** Every request to a model repeats the conversation so far. Files the agent wrote some
   turns ago are therefore replaced in the conversation by an outline of what they declare (they are
-  in the sandbox, and it can read them again); without that a project of thirty files is sent
-  thirty times over.
+  in the sandbox, and it is told to read a file again before it changes it); without that a project
+  of thirty files is sent thirty times over. Its latest reply always stays whole. Should a model
+  copy such an outline into a file instead of the file's content, the write is refused.
 - **Workflow files.** GitHub refuses files under `.github/workflows` from a GitHub App without the
   *Workflows* permission, which fails the commit. The agent does not add CI workflows unless asked.
 - **Review before you merge.** The agent's summary and any documentation it writes are the model's

@@ -917,6 +917,10 @@ def test_trying_a_key_out(client: TestClient, app_env, monkeypatch):
     ).json()
     assert [item["model"] for item in listed["models"]] == ["gemini-3.8-flash", "gemini-3.6-flash"] and listed["model"] == "gemini-3.8-flash"
     assert len(seen) == 2
+    # Four long names are a long setting; it is not refused for its length.
+    long_names = ", ".join(f"vendor/{'m' * 150}-{index}" for index in range(4))
+    wordy = client.post("/api/v1/llm/test", json={"provider": "gemini", "model": long_names}, headers={"X-Gemini-Key": GEMINI_KEY})
+    assert wordy.status_code == 200 and len(wordy.json()["models"]) == 4
 
     # Without a key in the request the server's own is tried - here Groq has one.
     server = client.post("/api/v1/llm/test", json={"provider": "GROQ"}).json()

@@ -374,6 +374,20 @@ _OUTLINE_LINE_RE = re.compile(
     r"interface\s|type\s+[A-Z]|enum\s|struct\s|fn\s|func\s|pub\s|#{1,3}\s)"
 )
 _OUTLINED_MARK = "["
+# What compaction puts in the place of old file content: the outline note at
+# the start (see ``_outlined_write``) or the cut mark at the end (see
+# ``compact_history``). A model that copies its own earlier call would write
+# that note into the file, so content that carries one is refused.
+_STAND_IN_RE = re.compile(
+    r"\A\[\d+ lines, written to [^\n]{1,300} as sent\. They are not repeated here"
+    r"|\[\.\.\. \d+ characters omitted \.\.\.\]\s*\Z"
+)
+
+
+def is_stand_in(content: str) -> bool:
+    """Whether ``content`` is what the conversation keeps of an older file
+    instead of the file's content."""
+    return bool(_STAND_IN_RE.search(content))
 
 
 def outline_of(content: str, *, limit: int = 1200) -> str:
@@ -392,17 +406,27 @@ def outline_of(content: str, *, limit: int = 1200) -> str:
 def _outlined_write(path: str, content: str) -> str:
     """What stands in for the content of a file the agent wrote some turns ago."""
     count = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
+    # The model can no longer see what is in the file: before it changes the
+    # file it has to look, or it would rewrite it from this outline.
     return (
         f"{_OUTLINED_MARK}{count} lines, written to {path or 'the file'} as sent. They are not repeated "
-        "here to keep the conversation short - read_file shows the file. It declares:]\n" + outline_of(content)
+        "here to keep the conversation short: read the file with read_file before you change it. "
+        "It declares:]\n" + outline_of(content)
     )
 
 
 def _outline_old_writes(messages: List[Dict[str, Any]], target: int, *, keep_recent: int) -> bool:
     """Replace the content of files written a while ago by an outline, oldest
-    first, until the history is no longer than ``target`` characters."""
+    first, until the history is no longer than ``target`` characters.
+
+    The model's latest reply is left as it is, however many files it wrote:
+    what it does next (run the build, fix what that reports) is about them.
+    """
     changed = False
-    for index in range(2, max(2, len(messages) - keep_recent)):
+    latest_reply = max(
+        (index for index, message in enumerate(messages) if message.get("role") == "assistant"), default=len(messages)
+    )
+    for index in range(2, max(2, min(len(messages) - keep_recent, latest_reply))):
         message = messages[index]
         if message.get("role") != "assistant":
             continue
@@ -802,6 +826,16 @@ class CodingAgent:
         content = args.get("content")
         if not isinstance(content, str):
             raise ToolError("content must be a string")
+        if is_stand_in(content):
+            if relative not in self._known_content:
+                self._unwritten.add(relative)  # it is still to be written
+            raise ToolError(
+                f"{relative} was not written: what you sent is not the content of a file but the note "
+                "that stands in for one in this conversation. Older file contents are shortened here to "
+                "save space; the files themselves are complete on disk. Send the whole content of the "
+                "file - or, if it is on disk already as it should be, leave it alone.",
+                log=f"write_file {relative} held back: the content was the conversation's shortened copy, not a file",
+            )
         self._check_blind_write(absolute, relative)
         self.workspace.write_file(absolute, content)
         self._known_content.add(relative)
@@ -955,6 +989,12 @@ class CodingAgent:
             raise ToolError("old_text is required")
         if not isinstance(new_text, str):
             raise ToolError("new_text must be a string")
+        if is_stand_in(new_text):
+            raise ToolError(
+                f"{relative} was not changed: new_text ends with the mark this conversation puts where "
+                "older text was cut to save space - it is not the text itself. Send the complete new text.",
+                log=f"replace_in_file {relative} held back: new_text was the conversation's shortened copy",
+            )
         try:
             current = self.workspace.read_file(absolute)
         except FileNotFoundError:
@@ -1366,9 +1406,10 @@ class CodingAgent:
                         "content": (
                             f"Time check: about {left} seconds of working time are left in this run. Get "
                             "what you have into a state that builds or runs, and check it now with the "
-                            "project's build or test command. Fix what that reports before you add "
-                            "anything else. A smaller result that works beats a larger one that does "
-                            "not; whatever is still missing at the end is continued in a follow-up run."
+                            "project's build or test command (a change to documentation alone needs no "
+                            "such check). Fix what that reports before you add anything else. A smaller "
+                            "result that works beats a larger one that does not; whatever is still "
+                            "missing at the end is continued in a follow-up run."
                         ),
                     }
                 )

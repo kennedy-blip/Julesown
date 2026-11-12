@@ -52,7 +52,13 @@ class LLMOptions(BaseModel):
         None, description="Carry on with the other configured providers when the one in use reaches a limit or fails."
     )
     order: Optional[List[str]] = Field(None, description="Order in which the remaining providers are tried.")
-    models: Optional[Dict[str, str]] = Field(None, description="Model per provider, e.g. {\"gemini\": \"gemini-flash-latest\"}.")
+    models: Optional[Dict[str, str]] = Field(
+        None,
+        description=(
+            "Models per provider: one, or up to four separated by commas in the order they are tried, "
+            "e.g. {\"gemini\": \"gemini-flash-latest, gemini-3.5-flash-lite\"}. They replace the server's for this task."
+        ),
+    )
 
 
 class CommitOptions(BaseModel):

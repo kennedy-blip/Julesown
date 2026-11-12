@@ -15,6 +15,7 @@ from apps.api.services.agent import (
     CodingAgent,
     compact_history,
     history_size,
+    is_stand_in,
     outline_of,
 )
 from apps.api.services.common import Deadline, Redactor, clip, plain_text
@@ -947,7 +948,8 @@ def test_compact_history_keeps_task_and_recent_messages():
     shortened = json.loads(messages[2]["tool_calls"][0]["function"]["arguments"])
     # A file the agent wrote is replaced by a note about it, not cut off mid-way.
     assert shortened["path"] == "a.py" and shortened["content"].startswith("[1 lines, written to a.py as sent.")
-    assert "read_file shows the file" in shortened["content"] and len(shortened["content"]) < 400
+    # The model is told to look before it changes a file it can no longer see.
+    assert "read the file with read_file before you change it" in shortened["content"] and len(shortened["content"]) < 400
     assert messages[5]["content"] == big  # inside the protected recent window
     assert history_size(messages) <= 7000
 
@@ -1015,6 +1017,36 @@ def test_files_written_a_while_ago_are_kept_as_an_outline():
     assert again == first["content"]
 
 
+def test_the_latest_reply_is_never_outlined_however_many_files_it_wrote():
+    """A reply that writes six files is followed by six results: it is more
+    than four messages back at once. The build that comes next is about
+    exactly these files."""
+    big = "export const value = 1;\n" * 200
+
+    def reply(start: int, count: int):
+        calls = [
+            {"id": str(start + offset), "type": "function", "function": {"name": "write_file", "arguments": json.dumps({"path": f"src/f{start + offset}.ts", "content": big})}}
+            for offset in range(count)
+        ]
+        results = [{"role": "tool", "tool_call_id": str(start + offset), "content": f"Wrote src/f{start + offset}.ts (200 lines)."} for offset in range(count)]
+        return [{"role": "assistant", "content": None, "tool_calls": calls}] + results
+
+    messages = [{"role": "system", "content": "system"}, {"role": "user", "content": "the task"}] + reply(1, 2) + reply(10, 6)
+    assert compact_history(messages, budget=1_000_000, soft_budget=1000) is True
+    earlier = [json.loads(call["function"]["arguments"])["content"] for call in messages[2]["tool_calls"]]
+    latest = [json.loads(call["function"]["arguments"])["content"] for call in messages[5]["tool_calls"]]
+    assert all(content.startswith("[200 lines, written to src/f") for content in earlier)
+    assert latest == [big] * 6
+    # A reminder after the results (the time check) does not change which reply is the latest.
+    messages.append({"role": "user", "content": "Time check: ..."})
+    assert compact_history(messages, budget=1_000_000, soft_budget=1000) is False
+    # Once the model has replied again, the six files are old ones.
+    messages += reply(20, 1)
+    assert compact_history(messages, budget=1_000_000, soft_budget=1000) is True
+    assert all(json.loads(call["function"]["arguments"])["content"].startswith("[200 lines") for call in messages[5]["tool_calls"])
+    assert json.loads(messages[-2]["tool_calls"][0]["function"]["arguments"])["content"] == big
+
+
 def test_outline_of_a_file():
     python = "import os\n\nclass Store:\n    def get(self):\n        return 1\n\ndef main():\n    pass\n"
     assert outline_of(python) == "class Store:\ndef main():"
@@ -1023,6 +1055,94 @@ def test_outline_of_a_file():
     # Nothing recognisable: the beginning of the file.
     assert outline_of("alpha\n\nbeta\ngamma\n") == "alpha\nbeta\ngamma"
     assert len(outline_of("export const x = 1;\n" * 500)) <= 1204
+
+
+def test_the_shortened_copy_of_a_file_is_not_written_back_as_the_file(checkout: RepoCheckout):
+    """Older file contents are shortened in the conversation. A model that
+    copies its own earlier call would write that note into a file - and the
+    note would be committed as if it were the code."""
+    outlined = (
+        "[162 lines, written to src/chart.py as sent. They are not repeated here to keep the conversation "
+        "short: read the file with read_file before you change it. It declares:]\ndef draw(points):"
+    )
+    cut = "def add(a, b):\n" + "    # filler\n" * 8 + " [... 3880 characters omitted ...]"
+    real = "def draw(points):\n    return len(points)\n"
+    llm = ScriptedLLM(
+        [
+            [("read_file", {"path": "calc.py"})],
+            [("write_file", {"path": "src/chart.py", "content": outlined})],
+            [("write_file", {"path": "calc.py", "content": cut})],
+            [("replace_in_file", {"path": "calc.py", "old_text": "return a - b", "new_text": cut})],
+            [("write_file", {"path": "src/chart.py", "content": real})],
+            [("finish", {"summary": "Added the chart helper."})],
+        ]
+    )
+    before = (Path(checkout.directory) / "calc.py").read_text()
+    agent, events = make_agent(checkout, llm)
+    assert run(agent).finished
+    _source, no_outline, no_cut, no_cut_edit, wrote = llm.tool_results()
+    assert no_outline.startswith("Error: src/chart.py was not written: what you sent is not the content of a file")
+    assert "Send the whole content of the file" in no_outline
+    assert no_cut.startswith("Error: calc.py was not written:")
+    assert no_cut_edit.startswith("Error: calc.py was not changed: new_text ends with the mark")
+    assert wrote == "Wrote src/chart.py (2 lines)."
+    # Nothing of the notes reached the files.
+    assert (Path(checkout.directory) / "src/chart.py").read_text() == real
+    assert (Path(checkout.directory) / "calc.py").read_text() == before
+    assert ("warn", "write_file src/chart.py held back: the content was the conversation's shortened copy, not a file") in events
+
+
+def test_a_file_the_model_never_sent_in_full_holds_the_finish_back(checkout: RepoCheckout):
+    outlined = (
+        "[40 lines, written to notes.md as sent. They are not repeated here to keep the conversation short: "
+        "read the file with read_file before you change it. It declares:]\n# Notes"
+    )
+    llm = ScriptedLLM(
+        [
+            [("read_file", {"path": "calc.py"})],
+            [("write_file", {"path": "notes.md", "content": outlined})],
+            [("finish", {"summary": "Added notes."})],  # ... but notes.md does not exist
+            [("write_file", {"path": "notes.md", "content": "# Notes\n"})],
+            [("finish", {"summary": "Added notes."})],
+        ]
+    )
+    agent, events = make_agent(checkout, llm)
+    outcome = run(agent)
+    assert outcome.finished and outcome.turns == 5
+    assert ("warn", "finish held back: notes.md was never written - the agent was asked to complete it") in events
+    assert (Path(checkout.directory) / "notes.md").read_text() == "# Notes\n"
+
+
+def test_what_counts_as_a_shortened_copy():
+    assert is_stand_in("[12 lines, written to a.py as sent. They are not repeated here to keep the conversation short")
+    assert is_stand_in("x = 1\n [... 250 characters omitted ...]") and is_stand_in("abc [... 9 characters omitted ...]\n")
+    # Ordinary content that merely looks similar.
+    for content in ("", "[1, 2, 3]\n", "[12 lines, written by hand]\n", "# Log\n[... 250 characters omitted ...] and then it went on\n"):
+        assert not is_stand_in(content)
+    # What compaction itself produces is recognised.
+    component = "export function Card() {\n" + "  // filler\n" * 300 + "}\n"
+    call = {"id": "1", "type": "function", "function": {"name": "write_file", "arguments": json.dumps({"path": "src/ui.tsx", "content": component})}}
+    later = {"role": "assistant", "content": "Now the build."}
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "t"},
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "1", "content": "Wrote src/ui.tsx (302 lines)."},
+        later,
+    ]
+    assert compact_history(messages, budget=100_000, soft_budget=500, keep_recent=0) is True
+    assert is_stand_in(json.loads(messages[2]["tool_calls"][0]["function"]["arguments"])["content"])
+    # ... and so is the cut that is made when even the latest reply has to shrink to fit a provider.
+    other = {"id": "2", "type": "function", "function": {"name": "write_file", "arguments": json.dumps({"path": "b.txt", "content": "word " * 400})}}
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "t"},
+        {"role": "assistant", "content": None, "tool_calls": [other]},
+        {"role": "tool", "tool_call_id": "2", "content": "Wrote b.txt (1 lines)."},
+    ]
+    assert compact_history(messages, budget=300, keep_recent=0) is True
+    cut = json.loads(messages[2]["tool_calls"][0]["function"]["arguments"])["content"]
+    assert cut.endswith("characters omitted ...]") and is_stand_in(cut)
 
 
 # --------------------------------------------------------------------------- #
