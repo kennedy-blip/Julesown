@@ -28,8 +28,8 @@ export function providerName(id: string | null | undefined): string {
 }
 
 export type CommitMode = 'bot' | 'coauthor' | 'user';
-export type SettingsTab = 'access' | 'models' | 'commits' | 'automation' | 'about';
-export const SETTINGS_TABS: SettingsTab[] = ['access', 'models', 'commits', 'automation', 'about'];
+export type SettingsTab = 'access' | 'models' | 'instructions' | 'commits' | 'automation' | 'about';
+export const SETTINGS_TABS: SettingsTab[] = ['access', 'models', 'instructions', 'commits', 'automation', 'about'];
 
 export interface CommitIdentity {
   mode: CommitMode;
@@ -69,9 +69,19 @@ export interface Settings {
   /** Carry on with the next provider when the one in use reaches a limit or fails. */
   fallback: boolean;
   commit: CommitIdentity;
+  /**
+   * Standing instructions: rules for every task started from this browser
+   * (conventions of the stack, what a deployment needs). They follow the task.
+   */
+  guidelines: string;
   settingsTab: SettingsTab;
   draft: Draft;
 }
+
+/** How long standing instructions may be (the server refuses more). */
+export const MAX_GUIDELINES = 4000;
+/** How many models a provider can be given. */
+export const MAX_MODELS = 4;
 
 const STORAGE_KEY = 'jules_settings_v1';
 
@@ -81,9 +91,23 @@ export const DEFAULT_SETTINGS: Settings = {
   primary: 'auto',
   fallback: true,
   commit: { mode: 'bot', name: '', email: '', login: '' },
+  guidelines: '',
   settingsTab: 'access',
   draft: EMPTY_DRAFT,
 };
+
+/**
+ * The model names in a setting such as "a, b": valid ones only, without
+ * repeats, in the order given. The same rule as the server's `split_models`.
+ */
+export function splitModels(value: string | null | undefined): string[] {
+  const models: string[] = [];
+  (value || '').split(/[,;\n]+/).forEach((item) => {
+    const name = item.trim();
+    if (name && /^[A-Za-z0-9][A-Za-z0-9._:\/@+-]{0,199}$/.test(name) && models.indexOf(name) < 0) models.push(name);
+  });
+  return models.slice(0, MAX_MODELS);
+}
 
 function text(value: unknown, limit = 600): string {
   return typeof value === 'string' ? value.slice(0, limit) : '';
@@ -118,6 +142,7 @@ export function reviveSettings(value: unknown): Settings {
       email: text(commit.email, 200),
       login: text(commit.login, 60),
     },
+    guidelines: text(raw.guidelines, MAX_GUIDELINES),
     settingsTab: SETTINGS_TABS.indexOf(raw.settingsTab as SettingsTab) >= 0 ? (raw.settingsTab as SettingsTab) : 'access',
     draft: {
       repository: text(draft.repository, 200),
@@ -214,6 +239,7 @@ export function providerKeyHeaders(settings: Settings = current): Record<string,
 export interface TaskOptions {
   llm?: { primary?: string; fallback?: boolean; models?: Record<string, string> };
   commit?: { mode: CommitMode; name?: string; email?: string };
+  guidelines?: string;
 }
 
 /** The choices sent along with every task (never keys: those travel in headers). */
@@ -221,7 +247,8 @@ export function taskOptions(settings: Settings = current): TaskOptions {
   const options: TaskOptions = {};
   const models: Record<string, string> = {};
   PROVIDER_IDS.forEach((id) => {
-    const model = (settings.models[id] || '').trim();
+    // One model or several ("a, b"): the list replaces the server's for this task.
+    const model = splitModels(settings.models[id]).join(',');
     if (model) models[id] = model;
   });
   const llm: NonNullable<TaskOptions['llm']> = {};
@@ -236,5 +263,7 @@ export function taskOptions(settings: Settings = current): TaskOptions {
       email: settings.commit.email.trim(),
     };
   }
+  const guidelines = settings.guidelines.trim();
+  if (guidelines) options.guidelines = guidelines.slice(0, MAX_GUIDELINES);
   return options;
 }

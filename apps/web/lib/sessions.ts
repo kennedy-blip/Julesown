@@ -33,7 +33,13 @@ export interface Session {
   /** What CI says about the first commit of a repository that was empty. */
   commitChecks?: { checks: ChecksSummary; checkedAt: number } | null;
   /** More work on an existing pull request: what was asked for. */
-  target?: { pullRequest: number | null; fixChecks: boolean; continueWork: boolean } | null;
+  target?: {
+    pullRequest: number | null;
+    fixChecks: boolean;
+    continueWork: boolean;
+    /** What the run that this one continues reported when it stopped (sent again by a retry). */
+    handoff?: string | null;
+  } | null;
   createdAt: number; // ms
   updatedAt: number; // ms
 }
@@ -159,7 +165,34 @@ function reviveTarget(value: unknown): Session['target'] {
     pullRequest: typeof raw.pullRequest === 'number' && raw.pullRequest > 0 ? raw.pullRequest : null,
     fixChecks: raw.fixChecks === true,
     continueWork: raw.continueWork === true,
+    handoff: typeof raw.handoff === 'string' && raw.handoff.trim() ? raw.handoff.slice(0, 8000) : null,
   };
+}
+
+/**
+ * Where unfinished work stands, for the task that continues it: the handoff of
+ * the latest run on the same work. For a pull request that is the newest run
+ * that added to it and stopped early; an earlier one describes a state the
+ * pull request has left behind.
+ */
+export function handoffFor(session: Session, sessions: Session[]): string | null {
+  const own = session.task && typeof session.task.handoff === 'string' && session.task.handoff.trim() ? session.task.handoff : null;
+  const task = session.task;
+  if (!task || !task.pr_number || task.outcome === 'initial_commit') return own;
+  const repository = (task.repository || session.repository).toLowerCase();
+  // Newest first, as the history is kept.
+  const latest = sessions.find(
+    (item) =>
+      !!item.task &&
+      (item.task.repository || item.repository).toLowerCase() === repository &&
+      item.task.pr_number === task.pr_number &&
+      item.task.outcome !== 'no_changes' &&
+      item.state === 'completed'
+  );
+  if (latest && latest.task && latest.task.unfinished && typeof latest.task.handoff === 'string' && latest.task.handoff.trim()) {
+    return latest.task.handoff;
+  }
+  return latest && latest.id !== session.id ? null : own;
 }
 
 function reviveCommitChecks(value: unknown): Session['commitChecks'] {

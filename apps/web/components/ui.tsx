@@ -96,8 +96,13 @@ export function Panel({
   );
 }
 
-export function Hint({ className = '', children }: { className?: string; children: React.ReactNode }) {
-  return <p className={`text-xs leading-relaxed text-slate-400 ${className}`}>{children}</p>;
+export function Hint({ className = '', children, ...rest }: React.HTMLAttributes<HTMLParagraphElement>) {
+  // The rest reaches the element: a data-testid written on a Hint would otherwise be dropped unnoticed.
+  return (
+    <p className={`text-xs leading-relaxed text-slate-400 ${className}`} {...rest}>
+      {children}
+    </p>
+  );
 }
 
 /** A notice inside a panel. */

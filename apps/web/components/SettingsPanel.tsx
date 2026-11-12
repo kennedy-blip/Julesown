@@ -15,6 +15,7 @@ import {
   GitCommitHorizontal,
   Info,
   KeyRound,
+  ListChecks,
   Loader2,
   RefreshCw,
   Search,
@@ -26,12 +27,12 @@ import {
   Zap,
 } from 'lucide-react';
 import { ApiError, describeError, fetchAutomation, fetchIdentity, testProvider } from '@/lib/api';
-import type { AppInstallation, AutomationStatus, HealthEnv, ProviderInfo, ProviderTest } from '@/lib/api';
-import { effectiveChain, providersOf } from '@/lib/providers';
-import { identityComplete, SETTINGS_TABS, updateSettings, useSettings } from '@/lib/settings';
+import type { AppInstallation, AutomationStatus, HealthEnv, ProviderInfo, ProviderModelTest, ProviderTest } from '@/lib/api';
+import { effectiveChain, providersIn, providersOf, serverModels } from '@/lib/providers';
+import { identityComplete, MAX_GUIDELINES, MAX_MODELS, SETTINGS_TABS, splitModels, updateSettings, useSettings } from '@/lib/settings';
 import type { CommitMode, ProviderId, Settings, SettingsTab } from '@/lib/settings';
 import { AccessKeyField } from './AccessKeyField';
-import { Badge, Button, buttonClass, Callout, CARD, Hint, INPUT, INSET, LABEL, Toggle } from './ui';
+import { Badge, Button, buttonClass, Callout, CARD, Hint, INPUT, INSET, LABEL, TEXTAREA, Toggle } from './ui';
 
 interface SettingsPanelProps {
   health: HealthEnv | null;
@@ -51,6 +52,7 @@ interface SettingsPanelProps {
 const TAB_META: Record<SettingsTab, { label: string; description: string; icon: React.ReactNode }> = {
   access: { label: 'Access', description: 'The key that unlocks this deployment', icon: <KeyRound className="w-4 h-4" /> },
   models: { label: 'AI models', description: 'Provider keys, models and fallbacks', icon: <Cpu className="w-4 h-4" /> },
+  instructions: { label: 'Instructions', description: 'Rules the agent follows in every task', icon: <ListChecks className="w-4 h-4" /> },
   commits: { label: 'Commits', description: 'Who the commits are attributed to', icon: <GitCommitHorizontal className="w-4 h-4" /> },
   automation: { label: 'Automation', description: 'Failed checks and unfinished work', icon: <Wrench className="w-4 h-4" /> },
   about: { label: 'About', description: 'What the server is configured with', icon: <Info className="w-4 h-4" /> },
@@ -68,13 +70,15 @@ const PROVIDER_HELP: Record<ProviderId, { keysUrl: string; keysLabel: string; pl
     keysUrl: 'https://aistudio.google.com/apikey',
     keysLabel: 'Google AI Studio',
     placeholder: 'AQ.… or AIza…',
-    blurb: 'Generous limits on the free tier. A good second provider to carry on with when Groq is exhausted.',
+    blurb:
+      'Generous limits on the free tier. gemini-flash-latest is Google\u2019s own name for its current Flash model, so it does not go out of date when a version is retired.',
   },
   openrouter: {
     keysUrl: 'https://openrouter.ai/keys',
     keysLabel: 'openrouter.ai',
     placeholder: 'sk-or-…',
-    blurb: 'One key for many models, including free ones. Free models are limited by requests per day.',
+    blurb:
+      'One key for many models, including free ones. With openrouter/free OpenRouter picks, for every request, a free model that is available - no single model to be throttled or retired. Free models are limited by requests per day.',
   },
   openai: {
     keysUrl: 'https://platform.openai.com/api-keys',
@@ -150,6 +154,40 @@ function AccessTab({ accessMode, accessKey, onAccessKeyChange, accessProblem, ac
 // --------------------------------------------------------------------------
 type TestState = { phase: 'idle' } | { phase: 'testing' } | { phase: 'done'; result: ProviderTest } | { phase: 'error'; message: string };
 
+/** How one model of a provider did when the key was tried out. */
+function ModelTestRow({ item }: { item: ProviderModelTest }) {
+  const good = item.ok && item.tool_call;
+  const Icon = good ? CheckCircle2 : item.ok ? AlertTriangle : XCircle;
+  return (
+    <li
+      className={`flex items-start gap-1.5 ${good ? 'text-emerald-400' : item.ok ? 'text-amber-400' : 'text-rose-400'}`}
+      data-testid="provider-test-model"
+      data-model={item.model}
+      data-ok={good ? 'true' : 'false'}
+    >
+      <Icon className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+      <span className="min-w-0 break-words">
+        <span className="font-mono">{item.model}</span>
+        {good ? (
+          <>
+            {' '}
+            called the test tool
+            {item.answered_by ? (
+              <>
+                {' '}
+                (answered by <span className="font-mono">{item.answered_by}</span>)
+              </>
+            ) : null}
+            {typeof item.latency_ms === 'number' ? ` in ${(item.latency_ms / 1000).toFixed(1)} s` : ''}
+          </>
+        ) : (
+          <>: {item.message}</>
+        )}
+      </span>
+    </li>
+  );
+}
+
 function ProviderCard({
   info,
   settings,
@@ -168,6 +206,14 @@ function ProviderCard({
   const [shown, setShown] = useState(false);
   const [test, setTest] = useState<TestState>({ phase: 'idle' });
   const hasKey = key.trim() !== '';
+  // What is typed into the model field: the names that can be model names, and the rest.
+  const typed = model
+    .split(/[,;\n]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const mine = splitModels(model);
+  const notNames = typed.filter((item, index) => splitModels(item).length === 0 && typed.indexOf(item) === index);
+  const defaults = serverModels(info);
 
   const setKey = (value: string) => {
     updateSettings((current) => {
@@ -183,7 +229,8 @@ function ProviderCard({
   const setModel = (value: string) => {
     updateSettings((current) => {
       const models = { ...current.models };
-      if (value.trim()) models[info.id] = value.trim();
+      // Kept as typed ("a, b" needs its space while it is being written); read with splitModels.
+      if (value.trim()) models[info.id] = value.slice(0, 600);
       else delete models[info.id];
       return { models };
     });
@@ -193,7 +240,7 @@ function ProviderCard({
   const runTest = async () => {
     setTest({ phase: 'testing' });
     try {
-      setTest({ phase: 'done', result: await testProvider(info.id, key, model) });
+      setTest({ phase: 'done', result: await testProvider(info.id, key, mine.join(',')) });
     } catch (error) {
       setTest({
         phase: 'error',
@@ -255,20 +302,41 @@ function ProviderCard({
         </div>
         <div>
           <label htmlFor={`model-${info.id}`} className={LABEL}>
-            Model
+            Models
           </label>
           <input
             id={`model-${info.id}`}
             type="text"
             value={model}
             onChange={(event) => setModel(event.target.value)}
-            placeholder={info.model || 'the server\u2019s default'}
+            placeholder={defaults.join(', ') || 'the server\u2019s default'}
             autoComplete="off"
             spellCheck={false}
             data-testid="provider-model"
+            aria-describedby={`model-hint-${info.id}`}
             className={`${INPUT} font-mono`}
           />
         </div>
+      </div>
+      <div id={`model-hint-${info.id}`} className="mt-2" data-testid="provider-model-hint">
+        {notNames.length > 0 ? (
+          <p className="text-xs text-amber-400" data-testid="provider-model-problem">
+            Not a model name: {notNames.map((item) => `\u201c${item}\u201d`).join(', ')}.{' '}
+            {mine.length > 0 ? 'It is left out.' : 'The server\u2019s models are used instead.'}
+          </p>
+        ) : (
+          <Hint>
+            One model, or up to {MAX_MODELS} separated by commas: limits are counted per model, so when the first is
+            rate limited, overloaded or gone the next one carries on.{' '}
+            {mine.length === 0 && defaults.length > 0 && (
+              <>
+                Left empty, the server&apos;s {defaults.length === 1 ? 'model is' : 'models are'} used:{' '}
+                <span className="font-mono text-slate-300">{defaults.join(', ')}</span>.
+              </>
+            )}
+            {typed.length > MAX_MODELS && <> Only the first {MAX_MODELS} are used.</>}
+          </Hint>
+        )}
       </div>
 
       <div className="flex flex-wrap items-center gap-3 mt-3">
@@ -279,14 +347,26 @@ function ProviderCard({
           title={
             !hasKey && !info.configured
               ? 'Enter a key first'
-              : 'Sends one small request with a tool to the provider - the kind of request the agent makes'
+              : 'Sends one small request with a tool to each model - the kind of request the agent makes'
           }
         >
           {test.phase === 'testing' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
           {test.phase === 'testing' ? 'Testing…' : 'Test'}
         </Button>
         <div className="text-xs min-w-0 flex-1" data-testid="provider-test-result" data-phase={test.phase}>
-          {test.phase === 'done' && test.result.ok && test.result.tool_call && (
+          {test.phase === 'done' && test.result.models && test.result.models.length > 0 && (
+            <div data-testid="provider-test-models">
+              <ul className="space-y-1">
+                {test.result.models.map((item) => (
+                  <ModelTestRow key={item.model} item={item} />
+                ))}
+              </ul>
+              <p className="text-slate-500 mt-1">
+                Tried with {test.result.key_source === 'server' ? 'the server\u2019s key' : 'the key entered here'}, one request per model.
+              </p>
+            </div>
+          )}
+          {test.phase === 'done' && !test.result.models && test.result.ok && test.result.tool_call && (
             <span className="text-emerald-400 inline-flex items-start gap-1.5">
               <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
               <span>
@@ -296,13 +376,13 @@ function ProviderCard({
               </span>
             </span>
           )}
-          {test.phase === 'done' && test.result.ok && !test.result.tool_call && (
+          {test.phase === 'done' && !test.result.models && test.result.ok && !test.result.tool_call && (
             <span className="text-amber-400 inline-flex items-start gap-1.5">
               <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
               <span>{test.result.message}</span>
             </span>
           )}
-          {test.phase === 'done' && !test.result.ok && (
+          {test.phase === 'done' && !test.result.models && !test.result.ok && (
             <span className="text-rose-400 inline-flex items-start gap-1.5">
               <XCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
               <span className="break-words">{test.result.message}</span>
@@ -324,6 +404,8 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
   const settings = useSettings();
   const providers = providersOf(health);
   const chain = effectiveChain(health, settings);
+  // The providers behind the chain, each once, in the order they are first used.
+  const chainProviders = providersIn(chain);
   const [showMore, setShowMore] = useState(false);
   const usable = providers.filter((item) => item.configured || !!(settings.keys[item.id] || '').trim());
   const main = providers.filter((item) => ['groq', 'gemini', 'openrouter'].indexOf(item.id) >= 0);
@@ -336,9 +418,9 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
   return (
     <div data-testid="settings-models">
       <SectionTitle title="AI models">
-        The agent works with one provider at a time. With keys for more than one, it does not wait when a
-        provider reaches its rate limit, rejects a request or is down: it carries on with the next one, in
-        the same conversation.
+        The agent works with one model at a time. When that one reaches its rate limit, rejects a request or is
+        down, it does not wait: it carries on with the next one, in the same conversation - first every
+        provider&apos;s main model, then the ones that stand in for them.
       </SectionTitle>
 
       <div className={`${INSET} p-4 mb-5`}>
@@ -350,7 +432,7 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
         ) : (
           <ol className="flex flex-wrap items-center gap-2" data-testid="provider-chain">
             {chain.map((item, index) => (
-              <li key={item.id} className="flex items-center gap-2" data-provider={item.id}>
+              <li key={`${item.id}/${item.model}`} className="flex items-center gap-2" data-provider={item.id} data-model={item.model}>
                 {index > 0 && <ArrowRight className="w-3.5 h-3.5 text-slate-500" />}
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-800/80 border border-slate-700/70 text-xs">
                   <span className="font-medium text-slate-100">{item.label}</span>
@@ -361,9 +443,15 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
           </ol>
         )}
         {chain.length === 1 && (
-          <Hint className="mt-2">
-            Only one provider: when it reaches its limit the task has to wait, and fails if the wait is longer
-            than its time budget. Add a key for a second one.
+          <Hint className="mt-2" data-testid="chain-hint">
+            Only one model: when it reaches its limit the task has to wait, and stops early if the wait is longer
+            than the time it has. Add a key for a second provider.
+          </Hint>
+        )}
+        {chain.length > 1 && chainProviders.length === 1 && (
+          <Hint className="mt-2" data-testid="chain-hint">
+            Only one provider. Its models stand in for each other when one is rate limited, but not when the
+            provider is down or its daily allowance is used up. Add a key for a second one.
           </Hint>
         )}
 
@@ -391,11 +479,11 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
             <Toggle
               checked={settings.fallback && !serverFallbackOff}
               onChange={(value) => updateSettings({ fallback: value })}
-              label="Carry on with the next provider"
+              label="Carry on with the next model"
               description={
                 serverFallbackOff
                   ? 'Switched off on the server (JULES_LLM_FALLBACK).'
-                  : 'When the one in use is rate limited, rejects the key or fails.'
+                  : 'When the one in use is rate limited, rejects the key or fails. Off: the first model alone.'
               }
               testId="fallback-toggle"
             />
@@ -409,7 +497,7 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
             key={item.id}
             info={item}
             settings={settings}
-            position={chain.findIndex((entry) => entry.id === item.id) + 1}
+            position={chainProviders.findIndex((entry) => entry.id === item.id) + 1}
             canCallApi={canCallApi}
           />
         ))}
@@ -419,7 +507,7 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
               key={item.id}
               info={item}
               settings={settings}
-              position={chain.findIndex((entry) => entry.id === item.id) + 1}
+              position={chainProviders.findIndex((entry) => entry.id === item.id) + 1}
               canCallApi={canCallApi}
             />
           ))}
@@ -436,6 +524,101 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
         store it. Tasks that GitHub starts (a <code className="font-mono">/jules</code> comment, a failed check) do
         not pass through a browser: for those, set the key as an environment variable of the deployment (
         {main.map((item) => item.key_variable).join(', ')}).
+      </Callout>
+    </div>
+  );
+}
+
+// --------------------------------------------------------------------------
+// Instructions
+// --------------------------------------------------------------------------
+const INSTRUCTION_EXAMPLES = [
+  'In a Vite app read configuration from import.meta.env, never from process.env.',
+  'If vite.config.ts uses Node APIs (path, process, __dirname), add @types/node to devDependencies.',
+  'Run the build before you finish and fix every error it reports.',
+  'Deployments are on Vercel: no server of its own, no hard-coded localhost addresses.',
+];
+
+function InstructionsTab({ health }: SettingsPanelProps) {
+  const settings = useSettings();
+  const text = settings.guidelines;
+  const serverHasSome = !!health && !!health.automation && health.automation.task_guidelines === true;
+  const add = (line: string) => {
+    const current = settings.guidelines.replace(/\s+$/, '');
+    updateSettings({ guidelines: (current ? `${current}\n` : '') + `- ${line}` });
+  };
+
+  return (
+    <div data-testid="settings-instructions">
+      <SectionTitle title="Standing instructions">
+        Rules the agent is given with every task you start from this browser, after the task itself: the
+        conventions of your stack, what your deployments need, what to leave alone. Write them once here
+        instead of repeating them in each task. Where they contradict a task, the task wins.
+      </SectionTitle>
+
+      <label htmlFor="task-guidelines" className={LABEL}>
+        Instructions for every task
+      </label>
+      <textarea
+        id="task-guidelines"
+        value={text}
+        onChange={(event) => updateSettings({ guidelines: event.target.value.slice(0, MAX_GUIDELINES) })}
+        rows={9}
+        maxLength={MAX_GUIDELINES}
+        spellCheck={false}
+        placeholder={INSTRUCTION_EXAMPLES.map((line) => `- ${line}`).join('\n')}
+        className={`${TEXTAREA} font-mono text-xs`}
+        data-testid="guidelines"
+      />
+      <div className="flex flex-wrap items-center justify-between gap-2 mt-1.5">
+        <Hint data-testid="guidelines-state">
+          {text.trim()
+            ? 'Saved in this browser. Sent with every task started here; the result and the pull request show the task as you wrote it.'
+            : 'Empty: tasks are sent as written.'}
+        </Hint>
+        <span className={`text-[11px] font-mono ${text.length > MAX_GUIDELINES - 200 ? 'text-amber-400' : 'text-slate-500'}`} data-testid="guidelines-count">
+          {text.length} / {MAX_GUIDELINES}
+        </span>
+      </div>
+
+      <div className="mt-4">
+        <div className={LABEL}>Examples (click to add)</div>
+        <ul className="space-y-1.5">
+          {INSTRUCTION_EXAMPLES.map((line) => (
+            <li key={line}>
+              <button
+                type="button"
+                onClick={() => add(line)}
+                disabled={text.indexOf(line) >= 0 || text.length + line.length + 3 > MAX_GUIDELINES}
+                className="text-left text-xs text-slate-300 hover:text-white disabled:text-slate-600 disabled:cursor-default underline-offset-2 hover:underline disabled:no-underline"
+                data-testid="guideline-example"
+              >
+                + {line}
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
+
+      {text.trim() !== '' && (
+        <div className="mt-4">
+          <Button variant="danger" onClick={() => updateSettings({ guidelines: '' })} data-testid="guidelines-clear">
+            <Trash2 className="w-4 h-4" />
+            Remove the instructions
+          </Button>
+        </div>
+      )}
+
+      <Callout tone="info" className="mt-5" icon={<Info className="w-4 h-4 text-sky-300" />}>
+        <strong className="font-semibold">What is built in already.</strong> Every task is told to read before it
+        writes, to keep changes small, to fix a failing install, build or test before doing anything else, and - in
+        an empty repository - to get a small version building first and extend it from there. These need not be
+        repeated here.
+        <span className="block mt-1.5" data-testid="guidelines-server">
+          {serverHasSome
+            ? 'This server adds instructions of its own to every task as well (JULES_TASK_GUIDELINES); yours follow them.'
+            : 'Tasks that GitHub starts (a /jules comment, a failed check) do not pass through a browser: for those, set the same text as the environment variable JULES_TASK_GUIDELINES of the deployment.'}
+        </span>
       </Callout>
     </div>
   );
@@ -810,7 +993,7 @@ function AutomationTab({ health, canCallApi }: SettingsPanelProps) {
         <SectionTitle title="Unfinished work">
           {automation && automation.keep_unfinished_work === false
             ? 'Switched off on the server (JULES_KEEP_UNFINISHED_WORK=false): when a run is cut short, what the agent had changed is discarded.'
-            : 'When a run is cut short - the time budget is used up, or every model provider is exhausted - what the agent had changed is not thrown away. It is delivered marked as unfinished (a pull request titled "[Unfinished] …", or the first commit of an empty repository), and Continue on its result picks it up.'}
+            : 'When a run stops before the task is done - the time is used up, every model is exhausted, or the agent reports that it cannot complete it - what it had changed is not thrown away. It is delivered marked as unfinished (a pull request titled "[Unfinished] …", or the first commit of an empty repository) together with the agent\u2019s account of what is done and what still fails. Continue the work on its result - or the comment /jules continue on GitHub - starts a run that picks it up from there.'}
         </SectionTitle>
       </div>
     </div>
@@ -836,6 +1019,7 @@ function AboutTab({ health }: SettingsPanelProps) {
     ['Access', health.access ? health.access.mode : 'open'],
     ['Time budget per task', health.limits ? `${health.limits.task_budget_seconds} s` : 'unknown'],
     ['Model turns per task', health.limits ? String(health.limits.max_agent_turns) : 'unknown'],
+    ['Standing instructions', health.automation && health.automation.task_guidelines ? 'set (JULES_TASK_GUIDELINES)' : 'none on the server'],
     ['Environment', [health.environment, health.region].filter(Boolean).join(' · ') || 'unknown'],
   ];
   return (
@@ -849,7 +1033,10 @@ function AboutTab({ health }: SettingsPanelProps) {
         {facts.map(([name, value]) => (
           <div key={name} className={`${INSET} px-3 py-2.5`}>
             <dt className="text-[11px] text-slate-500">{name}</dt>
-            <dd className="text-[13px] font-mono text-slate-200 break-words" data-testid={name === 'Status' ? 'backend-status' : undefined}>
+            <dd
+              className="text-[13px] font-mono text-slate-200 break-words"
+              data-testid={name === 'Status' ? 'backend-status' : name === 'Standing instructions' ? 'server-guidelines' : undefined}
+            >
               {value}
             </dd>
           </div>
@@ -930,6 +1117,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
       <div className={`${CARD} lg:col-span-9 p-5 sm:p-6 min-w-0`} role="tabpanel">
         {tab === 'access' && <AccessTab {...props} />}
         {tab === 'models' && <ModelsTab {...props} />}
+        {tab === 'instructions' && <InstructionsTab {...props} />}
         {tab === 'commits' && <CommitsTab {...props} />}
         {tab === 'automation' && <AutomationTab {...props} />}
         {tab === 'about' && <AboutTab {...props} />}

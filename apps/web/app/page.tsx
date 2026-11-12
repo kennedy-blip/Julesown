@@ -27,9 +27,10 @@ import {
 } from '@/lib/api';
 import type { ChecksSummary, LogEntry, RepoListing, StreamEvent, TaskRecord } from '@/lib/api';
 import { readinessOf, refreshHealth, stillMissing, useHealth } from '@/lib/health';
-import { effectiveChain } from '@/lib/providers';
+import { effectiveChain, providersIn } from '@/lib/providers';
 import { navigate, routeHref, useRoute } from '@/lib/route';
 import {
+  handoffFor,
   isFirstCommit,
   isUnfinished,
   loadSessions,
@@ -74,6 +75,8 @@ interface LaunchRequest {
   pullRequest: number | null;
   fixChecks: boolean;
   continueWork: boolean;
+  /** With continueWork: what the run that is continued reported when it stopped. */
+  handoff?: string | null;
 }
 
 function clientLog(level: string, message: string): LogEntry {
@@ -608,7 +611,12 @@ export default function Dashboard() {
         task: null,
         logs: [clientLog('client', `Sending the task for ${where} to the server`)],
         note: null,
-        target: { pullRequest: request.pullRequest, fixChecks: request.fixChecks, continueWork: request.continueWork },
+        target: {
+          pullRequest: request.pullRequest,
+          fixChecks: request.fixChecks,
+          continueWork: request.continueWork,
+          handoff: request.continueWork ? request.handoff || null : null,
+        },
         createdAt: now,
         updatedAt: now,
       };
@@ -624,6 +632,7 @@ export default function Dashboard() {
             pullRequest: request.pullRequest,
             fixChecks: request.fixChecks,
             continueWork: request.continueWork,
+            handoff: request.continueWork ? request.handoff || null : null,
           },
           (event) => patchSession(id, (item) => applyStreamEvent(item, event))
         );
@@ -693,12 +702,15 @@ export default function Dashboard() {
     if (!task) return;
     const repository = task.repository || session.repository;
     const prompt = session.prompt.trim() || 'Finish the work that was left unfinished.';
+    // The server keeps nothing between two runs: what the stopped run reported
+    // (what is done, the command that still fails) is sent along with this one.
+    const handoff = handoffFor(session, sessionsRef.current);
     if (task.pr_number && task.outcome !== 'initial_commit') {
       // The rest is added to the pull request that holds the unfinished work.
-      void launch({ repository, branch: '', prompt, pullRequest: task.pr_number, fixChecks: false, continueWork: true });
+      void launch({ repository, branch: '', prompt, pullRequest: task.pr_number, fixChecks: false, continueWork: true, handoff });
     } else {
       // The unfinished project is on the default branch: the rest arrives as a pull request.
-      void launch({ repository, branch: '', prompt, pullRequest: null, fixChecks: false, continueWork: true });
+      void launch({ repository, branch: '', prompt, pullRequest: null, fixChecks: false, continueWork: true, handoff });
     }
   };
 
@@ -723,6 +735,7 @@ export default function Dashboard() {
       pullRequest: target ? target.pullRequest : null,
       fixChecks: !!target && target.fixChecks,
       continueWork: !!target && target.continueWork,
+      handoff: target && target.continueWork ? target.handoff || null : null,
     });
   };
 
@@ -1027,7 +1040,7 @@ export default function Dashboard() {
             }}
             refreshing={!!activeSession && refreshingId === activeSession.id}
             startBlocked={startBlocked}
-            singleProvider={chain.length <= 1}
+            singleProvider={providersIn(chain).length <= 1}
           />
         </div>
       </div>
