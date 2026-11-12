@@ -73,6 +73,20 @@ const PROVIDER_HELP: Record<ProviderId, { keysUrl: string; keysLabel: string; pl
     blurb:
       'Generous limits on the free tier. gemini-flash-latest is Google\u2019s own name for its current Flash model, so it does not go out of date when a version is retired.',
   },
+  nvidia: {
+    keysUrl: 'https://build.nvidia.com/settings/api-keys',
+    keysLabel: 'build.nvidia.com',
+    placeholder: 'nvapi-…',
+    blurb:
+      'Open models hosted by NVIDIA, free to use: requests are limited per minute (about 40, for the whole account), not per day. Its catalogue changes often - a model that was withdrawn is replaced by one it still lists.',
+  },
+  zai: {
+    keysUrl: 'https://z.ai/manage-apikey/apikey-list',
+    keysLabel: 'z.ai',
+    placeholder: 'A standard API key',
+    blurb:
+      'GLM models. The Flash models used here are free with a standard API key, one request at a time; glm-5.3 and the other large ones are paid for from the account\u2019s balance. A GLM Coding Plan key is not meant for this: Z.AI limits that plan to the coding tools it lists.',
+  },
   openrouter: {
     keysUrl: 'https://openrouter.ai/keys',
     keysLabel: 'openrouter.ai',
@@ -179,6 +193,12 @@ function ModelTestRow({ item }: { item: ProviderModelTest }) {
               </>
             ) : null}
             {typeof item.latency_ms === 'number' ? ` in ${(item.latency_ms / 1000).toFixed(1)} s` : ''}
+            {item.requested && item.requested !== item.model ? (
+              <span className="text-amber-400" data-testid="provider-test-replaced">
+                {' '}
+                - in place of <span className="font-mono">{item.requested}</span>, which the provider no longer offers
+              </span>
+            ) : null}
           </>
         ) : (
           <>: {item.message}</>
@@ -357,8 +377,8 @@ function ProviderCard({
           {test.phase === 'done' && test.result.models && test.result.models.length > 0 && (
             <div data-testid="provider-test-models">
               <ul className="space-y-1">
-                {test.result.models.map((item) => (
-                  <ModelTestRow key={item.model} item={item} />
+                {test.result.models.map((item, index) => (
+                  <ModelTestRow key={`${index}-${item.model}`} item={item} />
                 ))}
               </ul>
               <p className="text-slate-500 mt-1">
@@ -408,7 +428,8 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
   const chainProviders = providersIn(chain);
   const [showMore, setShowMore] = useState(false);
   const usable = providers.filter((item) => item.configured || !!(settings.keys[item.id] || '').trim());
-  const main = providers.filter((item) => ['groq', 'gemini', 'openrouter'].indexOf(item.id) >= 0);
+  // The providers with a free tier are shown at once; the pay-per-token ones on request.
+  const main = providers.filter((item) => ['groq', 'gemini', 'nvidia', 'zai', 'openrouter'].indexOf(item.id) >= 0);
   const more = providers.filter((item) => main.indexOf(item) < 0);
   const moreInUse = more.some((item) => usable.indexOf(item) >= 0);
   const serverFallbackOff =

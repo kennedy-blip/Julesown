@@ -11,12 +11,15 @@ import { useEffect, useSyncExternalStore } from 'react';
  * travel to the dashboard's own backend in headers, are used for that request
  * and are not stored there.
  */
-export type ProviderId = 'groq' | 'gemini' | 'openrouter' | 'openai' | 'anthropic';
-export const PROVIDER_IDS: ProviderId[] = ['groq', 'gemini', 'openrouter', 'openai', 'anthropic'];
+export type ProviderId = 'groq' | 'gemini' | 'nvidia' | 'zai' | 'openrouter' | 'openai' | 'anthropic';
+/** In the order the server tries them when nothing else is said (`LLM_PROVIDERS` in apps/api/config.py). */
+export const PROVIDER_IDS: ProviderId[] = ['groq', 'gemini', 'nvidia', 'zai', 'openrouter', 'openai', 'anthropic'];
 
 const PROVIDER_NAMES: Record<string, string> = {
   groq: 'Groq',
   gemini: 'Gemini',
+  nvidia: 'NVIDIA',
+  zai: 'Z.AI',
   openrouter: 'OpenRouter',
   openai: 'OpenAI',
   anthropic: 'Anthropic',
