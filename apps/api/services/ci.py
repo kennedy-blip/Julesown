@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+from .common import clip, listed
 from .github import GitHubClient
 
 # Hidden in the comment that announces an automatic fix. Counting these on a
@@ -22,10 +23,107 @@ UNFINISHED_PREFIX = "[Unfinished] "
 DETAILED_CHECKS = 4
 
 CONTINUE_NOTE = (
-    "A previous run started this work and stopped before it was finished. Look at what is there "
-    "first (list the files and read the ones that matter), then complete the task and check that "
-    "it works."
+    "A previous run started this work and stopped before it was finished. What it did is in the "
+    "repository now: do not start over. Look at what is there first (list the files and read the "
+    "ones that matter), run the install and the build or tests to see where it stands and fix what "
+    "fails. Then complete what is missing and check that it works."
 )
+# How a run that stopped by itself describes why (the agent called finish with success=false).
+GAVE_UP = "The agent reported that it could not complete the task"
+
+
+def build_handoff(
+    *,
+    summary: str,
+    reason: str,
+    last_failure: Optional[Dict[str, Any]] = None,
+    left_out: Optional[List[str]] = None,
+) -> str:
+    """What a run that stopped early leaves for the run that continues it: the
+    agent's own account, the command that still fails, and why it stopped.
+
+    It travels with the task record. The dashboard sends it back with the
+    follow-up task, so the next run starts from where this one was instead of
+    finding everything out again - on a serverless platform that run is served
+    by an instance that knows nothing about this one.
+    """
+    parts: List[str] = []
+    if summary.strip():
+        parts.append("Its own account when it stopped:\n" + clip(summary.strip(), 1500, tail_share=0.3))
+    if last_failure and last_failure.get("command"):
+        status = "timed out" if last_failure.get("timed_out") else f"exit code {last_failure.get('exit_code')}"
+        output = str(last_failure.get("output") or "").strip() or "(no output)"
+        parts.append(
+            f"The last command that failed and has not passed since: `{last_failure['command']}` ({status}). "
+            f"Its output ended with:\n{clip(output, 1500)}"
+        )
+    if left_out:
+        # What the run produced but the commit does not contain: the next run must not look for it.
+        parts.append("Not committed (build output, or too large to commit): " + listed(left_out))
+    parts.append(f"Why it stopped: {reason.strip()}")
+    return "\n\n".join(parts)
+
+
+STANDING_INSTRUCTIONS = (
+    "Standing instructions (they apply to every task here; where they contradict the task above, the task wins):"
+)
+
+
+def standing_instructions(*texts: str) -> str:
+    """The block that carries the owner's own rules into a task: what the
+    server is configured with (JULES_TASK_GUIDELINES), then what the caller
+    sent along. Empty when there are none."""
+    parts: List[str] = []
+    for text in texts:
+        cleaned = (text or "").strip()
+        if cleaned and cleaned not in parts:
+            parts.append(cleaned)
+    return f"{STANDING_INSTRUCTIONS}\n" + "\n\n".join(parts) if parts else ""
+
+
+# How the commit of unfinished work names the command that still failed.
+STILL_FAILING = "Still failing when the run stopped: "
+
+
+def failure_note(last_failure: Optional[Dict[str, Any]], limit: int = 900) -> str:
+    """The command that still failed when a run stopped, for the message of the
+    commit that keeps its work: the next run reads it there (see
+    ``handoff_from_commit``), and so does whoever looks at the history."""
+    if not last_failure or not last_failure.get("command"):
+        return ""
+    status = "timed out" if last_failure.get("timed_out") else f"exit code {last_failure.get('exit_code')}"
+    command = " ".join(str(last_failure["command"]).split())
+    lines = [line.rstrip() for line in str(last_failure.get("output") or "").splitlines() if line.strip()]
+    # Indented: a line of output is never taken for a paragraph or a trailer of the message.
+    output = "\n".join("    " + line for line in clip("\n".join(lines), limit).splitlines() if line.strip())
+    return f"{STILL_FAILING}`{clip(command, 200, tail_share=0.0)}` ({status})" + (f"\n{output}" if output else "")
+
+
+def handoff_from_commit(message: str) -> str:
+    """What the commit of unfinished work says about where the work stood: its
+    message without the title and the trailers. Empty for any other commit.
+
+    This is what a continuation starts from when nobody passed the handoff of
+    the earlier run along - a task started with ``/jules continue`` on GitHub,
+    or from a browser that did not run the first one.
+    """
+    text = message.strip()
+    if not text.startswith(UNFINISHED_PREFIX):
+        return ""
+    paragraphs = [part.strip("\n") for part in re.split(r"\n[ \t]*\n", text) if part.strip()]
+    if len(paragraphs) < 3 or not re.search(r"^Task-Id: \S+", paragraphs[-1], re.MULTILINE):
+        return ""  # not a commit a task made
+    body = paragraphs[1:-1]
+    if not any(part.startswith("Unfinished: ") for part in body):
+        return ""
+    return clip("\n\n".join(body), 3500, tail_share=0.5)
+
+
+def continue_note(handoff: str = "") -> str:
+    """What a task that continues unfinished work is told on top of its instructions."""
+    if not handoff.strip():
+        return CONTINUE_NOTE
+    return f"{CONTINUE_NOTE}\n\nWhat the previous run left behind:\n{clip(handoff.strip(), 4000, tail_share=0.5)}"
 
 
 def fix_marker(sha: str) -> str:
@@ -113,11 +211,12 @@ def build_follow_up_prompt(
     base: str,
     checks_text: Optional[str] = None,
     continuing: bool = False,
+    handoff: str = "",
 ) -> str:
     """Instructions for more work on a pull request that already exists."""
     parts = [instructions.strip()] if instructions.strip() else []
     if continuing:
-        parts.append(CONTINUE_NOTE)
+        parts.append(continue_note(handoff))
     shown = title[len(UNFINISHED_PREFIX) :] if title.startswith(UNFINISHED_PREFIX) else title
     parts.append(
         f"You are working on pull request #{number} \"{shown}\" (branch `{head}`, to be merged into "

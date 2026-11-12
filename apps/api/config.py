@@ -34,8 +34,31 @@ ANTHROPIC_MODEL_PREFERENCES = ("claude-sonnet-5-5", "claude-haiku-5-5", "claude-
 # Google's alias for its newest Flash model: it moves with the catalogue, so it
 # does not go stale the way a pinned version does.
 DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
-GEMINI_MODEL_PREFERENCES = ("gemini-flash-latest", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-lite-latest")
-DEFAULT_OPENROUTER_MODEL = "baidu/ernie-5.5-flash-preview:free"
+GEMINI_MODEL_PREFERENCES = ("gemini-flash-latest", "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite")
+# OpenRouter's free-models router: for each request it picks a free model that
+# is available and can do what the request needs (tool calls). A single free
+# model is throttled upstream whenever it is popular, and free "preview" models
+# come and go; the router has neither problem. A specific model is a setting
+# away (OPENROUTER_MODEL, or the model field in the dashboard's settings).
+DEFAULT_OPENROUTER_MODEL = "openrouter/free"
+
+# A provider can be given several models (GROQ_MODEL="a,b"): the first one is
+# used, and when it is rate limited, overloaded or gone the next one takes
+# over - limits are counted per model, so a second model is a second allowance.
+# These are the lists used when nothing is configured. Nothing here is a
+# version that goes stale on its own: Gemini's first entry is Google's alias
+# for its current Flash model, followed by the lighter model that has capacity
+# when the alias is busy; OpenRouter's is its router, which is a pool already.
+DEFAULT_MODELS: Dict[str, Tuple[str, ...]] = {
+    "groq": (DEFAULT_GROQ_MODEL, "openai/gpt-oss-20b"),
+    "gemini": (DEFAULT_GEMINI_MODEL, "gemini-3.5-flash-lite"),
+    "openrouter": (DEFAULT_OPENROUTER_MODEL,),
+    "openai": (DEFAULT_OPENAI_MODEL,),
+    "anthropic": (DEFAULT_ANTHROPIC_MODEL,),
+}
+MAX_MODELS_PER_PROVIDER = 4
+# Standing instructions (JULES_TASK_GUIDELINES, or sent along with a task): how long they may be.
+MAX_GUIDELINES_CHARS = 4000
 
 DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -161,6 +184,24 @@ def clean_model_name(value: Any) -> Optional[str]:
     return cleaned if _MODEL_NAME_RE.match(cleaned) else None
 
 
+def split_models(value: Any) -> List[str]:
+    """The model names in a setting such as ``"a, b"`` (or a list): valid ones
+    only, without repeats, in the order given, at most MAX_MODELS_PER_PROVIDER."""
+    if isinstance(value, str):
+        value = re.split(r"[,;\n]+", value)
+    models: List[str] = []
+    for item in value or []:
+        name = clean_model_name(item)
+        if name and name not in models:
+            models.append(name)
+    return models[:MAX_MODELS_PER_PROVIDER]
+
+
+def default_models(provider: str) -> str:
+    """The models of a provider when none are configured, as one setting."""
+    return ",".join(DEFAULT_MODELS.get(provider, ()))
+
+
 def clean_provider_order(values: Any) -> List[str]:
     """Provider names from a list or a comma-separated string: known ones only,
     lower-case, without repeats, in the order given."""
@@ -179,7 +220,8 @@ class Settings:
     environment: str
     on_vercel: bool
 
-    # LLM providers
+    # LLM providers. A ``*_model`` setting holds one model or several,
+    # separated by commas, in the order they are to be tried (see models_for).
     llm_provider_override: Optional[str]
     groq_api_key: Optional[str]
     groq_model: str
@@ -219,6 +261,9 @@ class Settings:
     openrouter_api_key: Optional[str] = None
     openrouter_model: str = DEFAULT_OPENROUTER_MODEL
     openrouter_base_url: str = DEFAULT_OPENROUTER_BASE_URL
+    # Instructions added to every task of this installation (conventions of the
+    # owner's projects: the stack, what a deployment needs, what to leave alone).
+    task_guidelines: str = ""
     # When the provider in use hits a limit or fails, carry on with the next one.
     llm_fallback: bool = True
     # Order in which the configured providers are tried (after the override).
@@ -242,8 +287,16 @@ class Settings:
     def api_key_for(self, provider: str) -> Optional[str]:
         return getattr(self, f"{provider}_api_key", None) if provider in LLM_PROVIDERS else None
 
+    def models_for(self, provider: str) -> List[str]:
+        """The models configured for a provider, in the order they are tried."""
+        if provider not in LLM_PROVIDERS:
+            return []
+        return split_models(getattr(self, f"{provider}_model", "")) or list(DEFAULT_MODELS[provider])
+
     def model_for(self, provider: str) -> Optional[str]:
-        return getattr(self, f"{provider}_model", None) if provider in LLM_PROVIDERS else None
+        """The model a provider is used with first."""
+        models = self.models_for(provider)
+        return models[0] if models else None
 
     @property
     def llm_preference(self) -> List[str]:
@@ -271,6 +324,24 @@ class Settings:
                 return []
             configured = [choice] + [name for name in configured if name != choice]
         return configured if self.llm_fallback else configured[:1]
+
+    @property
+    def llm_slots(self) -> List[Tuple[str, str]]:
+        """Every model a task can use, as ``(provider, model)``, in the order
+        they are tried when the one in use is rate limited, overloaded or fails.
+
+        Each provider of the chain with its first model, then each provider's
+        second model, and so on: every provider's best model is tried before
+        anybody's stand-in. With fallback switched off there is exactly one.
+        """
+        chain = self.llm_chain
+        if not chain:
+            return []
+        if not self.llm_fallback:
+            return [(chain[0], self.model_for(chain[0]) or "")]
+        lists = [(name, self.models_for(name)) for name in chain]
+        depth = max(len(models) for _name, models in lists)
+        return [(name, models[level]) for level in range(depth) for name, models in lists if level < len(models)]
 
     @property
     def llm_provider(self) -> Optional[str]:
@@ -319,9 +390,10 @@ class Settings:
                 changes[f"{provider}_api_key"] = key.strip()
                 brings_key = True
         for provider, model in (models or {}).items():
-            cleaned = clean_model_name(model)
+            # One model or several ("a, b"): this request's list replaces the server's.
+            cleaned = split_models(model)
             if provider in LLM_PROVIDERS and cleaned:
-                changes[f"{provider}_model"] = cleaned
+                changes[f"{provider}_model"] = ",".join(cleaned)
         cleaned_order = clean_provider_order(order)
         if cleaned_order:
             changes["llm_order"] = tuple(cleaned_order)
@@ -420,13 +492,13 @@ def get_settings() -> Settings:
         on_vercel=on_vercel,
         llm_provider_override=env_str("JULES_LLM_PROVIDER"),
         groq_api_key=env_str("GROQ_API_KEY"),
-        groq_model=env_str("GROQ_MODEL", DEFAULT_GROQ_MODEL) or DEFAULT_GROQ_MODEL,
+        groq_model=env_str("GROQ_MODEL") or default_models("groq"),
         groq_base_url=(env_str("GROQ_BASE_URL", DEFAULT_GROQ_BASE_URL) or DEFAULT_GROQ_BASE_URL).rstrip("/"),
         openai_api_key=env_str("OPENAI_API_KEY"),
-        openai_model=env_str("OPENAI_MODEL", DEFAULT_OPENAI_MODEL) or DEFAULT_OPENAI_MODEL,
+        openai_model=env_str("OPENAI_MODEL") or default_models("openai"),
         openai_base_url=(env_str("OPENAI_BASE_URL", DEFAULT_OPENAI_BASE_URL) or DEFAULT_OPENAI_BASE_URL).rstrip("/"),
         anthropic_api_key=env_str("ANTHROPIC_API_KEY"),
-        anthropic_model=env_str("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL) or DEFAULT_ANTHROPIC_MODEL,
+        anthropic_model=env_str("ANTHROPIC_MODEL") or default_models("anthropic"),
         anthropic_base_url=(
             env_str("ANTHROPIC_BASE_URL", DEFAULT_ANTHROPIC_BASE_URL) or DEFAULT_ANTHROPIC_BASE_URL
         ).rstrip("/"),
@@ -445,10 +517,10 @@ def get_settings() -> Settings:
         max_output_tokens=env_int("JULES_MAX_OUTPUT_TOKENS", 8192, minimum=256, maximum=64000),
         # Google's own tools read GOOGLE_API_KEY as well; either name works here.
         gemini_api_key=env_str("GEMINI_API_KEY") or env_str("GOOGLE_API_KEY"),
-        gemini_model=env_str("GEMINI_MODEL", DEFAULT_GEMINI_MODEL) or DEFAULT_GEMINI_MODEL,
+        gemini_model=env_str("GEMINI_MODEL") or default_models("gemini"),
         gemini_base_url=(env_str("GEMINI_BASE_URL", DEFAULT_GEMINI_BASE_URL) or DEFAULT_GEMINI_BASE_URL).rstrip("/"),
         openrouter_api_key=env_str("OPENROUTER_API_KEY"),
-        openrouter_model=env_str("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL) or DEFAULT_OPENROUTER_MODEL,
+        openrouter_model=env_str("OPENROUTER_MODEL") or default_models("openrouter"),
         openrouter_base_url=(
             env_str("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL) or DEFAULT_OPENROUTER_BASE_URL
         ).rstrip("/"),
@@ -460,6 +532,8 @@ def get_settings() -> Settings:
         ci_autofix=env_bool("JULES_CI_AUTOFIX", True),
         ci_autofix_attempts=env_int("JULES_CI_AUTOFIX_ATTEMPTS", 2, minimum=0, maximum=5),
         keep_unfinished_work=env_bool("JULES_KEEP_UNFINISHED_WORK", True),
+        # "\n" typed into a one-line field of a hosting dashboard is meant as a line break.
+        task_guidelines=(env_str("JULES_TASK_GUIDELINES") or "").replace("\\n", "\n").strip()[:MAX_GUIDELINES_CHARS],
     )
 
 

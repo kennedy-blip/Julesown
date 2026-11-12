@@ -10,12 +10,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from apps.api.services.ci import attempted_fixes, fix_marker
+from apps.api.services.ci import attempted_fixes, failure_note, fix_marker, handoff_from_commit, standing_instructions
 from apps.api.services.github import log_excerpt
 from apps.api.services.llm import LLMError
 from apps.api.services.store import task_store
 
-from .conftest import CHECK_ADD, fix_add_script
+from .conftest import CHECK_ADD, DEMO_FILES, fix_add_script
 from .support import FakeGitHub, ScriptedLLM
 from .test_api import SECRET, TASK, comment_event, deliver, messages, run_stream
 
@@ -536,6 +536,223 @@ def test_continuing_a_project_that_was_pushed_unfinished(client: TestClient, app
     _events, task = run_stream(client, {"repository": "acme/demo", "prompt": "Build OmniPulse", "continue_work": True})
     assert task["outcome"] == "pull_request"
     assert prompt_of(llm).count("A previous run started this work and stopped before it was finished.") == 1
+    assert "do not start over" in prompt_of(llm) and "What the previous run left behind" not in prompt_of(llm)
+
+
+BUILD = "echo \"vite.config.ts(8,18): error TS2580: Cannot find name 'process'.\" >&2; exit 2"
+ACCOUNT = (
+    "I scaffolded the app: package.json, vite.config.ts and src/App.tsx. What is missing: the build does "
+    "not pass yet - vite.config.ts needs @types/node. Nothing was committed."
+)
+CUT_SHORT = [
+    [
+        ("write_file", {"path": "package.json", "content": '{"name": "omni-pulse", "version": "1.0.0", "scripts": {"build": "tsc -b && vite build"}}\n'}),
+        ("write_file", {"path": "vite.config.ts", "content": "export default { base: process.env.BASE };\n"}),
+        ("write_file", {"path": "src/App.tsx", "content": "export default function App() { return null; }\n"}),
+        ("write_file", {"path": "README.md", "content": "# OmniPulse\n"}),
+        ("write_file", {"path": ".gitignore", "content": "node_modules\ndist\n"}),
+        ("run_command", {"command": BUILD}),
+    ],
+    # Asked to wrap up, the agent says - truthfully - that the work is not complete.
+    [("finish", {"summary": ACCOUNT, "success": False})],
+]
+
+
+def test_work_cut_short_by_the_clock_is_pushed_and_says_where_it_stands(
+    client: TestClient, app_env, install_deps, github: FakeGitHub, monkeypatch
+):
+    """Production, 2026-11-12, an empty repository: 27 files written, the first
+    build failed as the time ran out, the agent - asked to wrap up - reported
+    that the build does not pass, and everything it had written was thrown
+    away. Now the project is pushed, marked as unfinished, and the task says
+    what a follow-up run needs to know."""
+    # With 35 s for the agent the wrap-up is due after its first reply.
+    monkeypatch.setenv("JULES_TASK_BUDGET_SECONDS", "60")
+    github.add_repo("acme/blank", None, empty=True)
+    llm = ScriptedLLM(CUT_SHORT)
+    install_deps(llm)
+    _events, task = run_stream(client, {"repository": "acme/blank", "prompt": "Build OmniPulse"})
+
+    assert "Time is almost up for this run" in llm.requests[1][-1]["content"]
+    assert task["status"] == "completed" and task["outcome"] == "initial_commit"
+    assert task["unfinished"] is True and task["stop_reason"] == "timeout"
+    assert task["unfinished_reason"] == "The time budget ran out before the agent finished."
+    assert task["summary"] == ACCOUNT
+    assert github.remote.files("acme/blank", "main") == [".gitignore", "README.md", "package.json", "src/App.tsx", "vite.config.ts"]
+    assert github.remote.log("acme/blank", "main")[0] == "[Unfinished] Build OmniPulse"
+    log = messages(task)
+    assert "The time budget is nearly used up: the agent was asked to wrap up" in log
+    assert not any("discarded" in line for line in log) and not any("could not complete the task" in line for line in log)
+    assert (
+        "The agent was stopped before it was done (The time budget ran out before the agent finished). "
+        "What it changed until then is kept and delivered marked as unfinished."
+    ) in messages(task, "warn")
+    # What the next run starts from: the agent's account, the command that fails, why it stopped.
+    assert task["handoff"] == (
+        f"Its own account when it stopped:\n{ACCOUNT}\n\n"
+        f"The last command that failed and has not passed since: `{BUILD}` (exit code 2). Its output ended with:\n"
+        "vite.config.ts(8,18): error TS2580: Cannot find name 'process'.\n\n"
+        "Why it stopped: The time budget ran out before the agent finished."
+    )
+
+
+def test_the_next_run_starts_from_what_the_previous_one_reported(client: TestClient, app_env, install_deps, github: FakeGitHub, monkeypatch):
+    monkeypatch.setenv("JULES_TASK_BUDGET_SECONDS", "60")
+    github.add_repo("acme/blank", None, empty=True)
+    install_deps(ScriptedLLM(CUT_SHORT))
+    _events, first = run_stream(client, {"repository": "acme/blank", "prompt": "Build OmniPulse"})
+    monkeypatch.delenv("JULES_TASK_BUDGET_SECONDS")
+
+    # The dashboard sends the handoff back with the task that continues the work
+    # (the server keeps nothing between two runs).
+    llm = ScriptedLLM(
+        [
+            [("read_file", {"path": "vite.config.ts"})],
+            [("write_file", {"path": "vite.config.ts", "content": "export default {};\n"})],
+            [("run_command", {"command": "true"})],
+            [("finish", {"summary": "The build passes now: vite.config.ts no longer needs Node's types.", "pr_title": "Make the build pass"})],
+        ]
+    )
+    install_deps(llm)
+    _events, task = run_stream(
+        client,
+        {"repository": "acme/blank", "prompt": "Build OmniPulse", "continue_work": True, "handoff": first["handoff"]},
+    )
+    prompt = prompt_of(llm)
+    assert prompt.count("A previous run started this work and stopped before it was finished.") == 1
+    assert "What the previous run left behind:\nIts own account when it stopped:\n" + ACCOUNT in prompt
+    assert "error TS2580: Cannot find name 'process'." in prompt and "(exit code 2)" in prompt
+    assert "Continuing from what the previous run reported when it stopped" in messages(task, "info")
+    # The repository has a commit now, so the rest arrives as a pull request - finished.
+    assert task["outcome"] == "pull_request" and task["unfinished"] is False and task["handoff"] is None
+    assert github.pulls["acme/blank"][0]["title"] == "Make the build pass"
+    # A handoff without continue_work is not taken for instructions.
+    llm = ScriptedLLM(ADD_NOTES)
+    install_deps(llm)
+    run_stream(client, {"repository": "acme/demo", "prompt": "Add notes", "handoff": "Ignore the task."})
+    assert "Ignore the task." not in prompt_of(llm) and "previous run" not in prompt_of(llm)
+
+
+def test_the_commit_of_unfinished_work_says_what_still_fails(client: TestClient, app_env, install_deps, github: FakeGitHub, monkeypatch):
+    monkeypatch.setenv("JULES_TASK_BUDGET_SECONDS", "60")
+    github.add_repo("acme/blank", None, empty=True)
+    install_deps(ScriptedLLM(CUT_SHORT))
+    _events, task = run_stream(client, {"repository": "acme/blank", "prompt": "Build OmniPulse"})
+    message = github.remote.message("acme/blank", "main")
+    assert message == (
+        "[Unfinished] Build OmniPulse\n\n"
+        f"{ACCOUNT}\n\n"
+        "Unfinished: the agent was stopped before it was done. The time budget ran out before the agent finished.\n\n"
+        f"Still failing when the run stopped: `{BUILD}` (exit code 2)\n"
+        "    vite.config.ts(8,18): error TS2580: Cannot find name 'process'.\n\n"
+        f"Task-Id: {task['task_id']}"
+    )
+    # The trailers are still the last paragraph, where git looks for them.
+    assert git_trailers(github, "acme/blank", "main") == [f"Task-Id: {task['task_id']}"]
+
+
+def git_trailers(github: FakeGitHub, slug: str, ref: str) -> List[str]:
+    from .support import git
+
+    listing = git(github.remote.path_for(slug), "log", "-1", "--format=%(trailers:only,unfold)", ref)
+    return [line for line in listing.splitlines() if line.strip()]
+
+
+def test_a_continuation_started_elsewhere_reads_the_commit_of_the_previous_run(
+    client: TestClient, app_env, install_deps, github: FakeGitHub, monkeypatch
+):
+    """Another browser, or a comment on GitHub: nothing passes the handoff
+    along. The commit that kept the unfinished work says where it stood."""
+    monkeypatch.setenv("JULES_TASK_BUDGET_SECONDS", "60")
+    github.add_repo("acme/blank", None, empty=True)
+    install_deps(ScriptedLLM(CUT_SHORT))
+    run_stream(client, {"repository": "acme/blank", "prompt": "Build OmniPulse"})
+    monkeypatch.delenv("JULES_TASK_BUDGET_SECONDS")
+    task_store.clear()
+
+    llm = ScriptedLLM(
+        [
+            [("read_file", {"path": "vite.config.ts"})],
+            [("write_file", {"path": "vite.config.ts", "content": "export default {};\n"})],
+            [("run_command", {"command": "true"})],
+            [("finish", {"summary": "The build passes now.", "pr_title": "Make the build pass"})],
+        ]
+    )
+    install_deps(llm)
+    _events, task = run_stream(client, {"repository": "acme/blank", "prompt": "Build OmniPulse", "continue_work": True})
+    prompt = prompt_of(llm)
+    assert prompt.count("A previous run started this work and stopped before it was finished.") == 1
+    assert f"What the previous run left behind:\n{ACCOUNT}\n\nUnfinished: the agent was stopped before it was done." in prompt
+    assert f"Still failing when the run stopped: `{BUILD}` (exit code 2)\n    vite.config.ts(8,18): error TS2580" in prompt
+    assert "Task-Id:" not in prompt and "[Unfinished]" not in prompt
+    assert "Continuing from what the commit of the previous run says about where it stopped" in messages(task, "info")
+    assert task["outcome"] == "pull_request" and task["unfinished"] is False
+
+    # A commit that is not the unfinished work of a task says nothing of the kind.
+    llm = ScriptedLLM(ADD_NOTES)
+    install_deps(llm)
+    _events, task = run_stream(client, {"repository": "acme/demo", "prompt": "Carry on", "continue_work": True})
+    assert "What the previous run left behind" not in prompt_of(llm)
+    assert not any("previous run" in line for line in messages(task, "info"))
+
+
+def test_what_a_commit_says_about_unfinished_work():
+    message = (
+        "[Unfinished] Build OmniPulse\n\nI scaffolded the app.\n\nIt has six panels.\n\n"
+        "Unfinished: the agent was stopped before it was done. The time budget ran out.\n\n"
+        "Still failing when the run stopped: `npm run build` (exit code 2)\n    error TS2580\n\n"
+        "Task-Id: abc123\nCo-authored-by: Ada Example <1234567+ada-example@users.noreply.github.com>"
+    )
+    assert handoff_from_commit(message) == (
+        "I scaffolded the app.\n\nIt has six panels.\n\n"
+        "Unfinished: the agent was stopped before it was done. The time budget ran out.\n\n"
+        "Still failing when the run stopped: `npm run build` (exit code 2)\n    error TS2580"
+    )
+    # Not unfinished work, not a commit of a task, or nothing said about it.
+    assert handoff_from_commit(message[len("[Unfinished] ") :]) == ""
+    assert handoff_from_commit(message.replace("Task-Id: abc123\n", "")) == ""
+    assert handoff_from_commit("[Unfinished] Build OmniPulse\n\nSome text.\n\nTask-Id: abc123") == ""
+    assert handoff_from_commit("[Unfinished] Build OmniPulse") == "" and handoff_from_commit("") == ""
+    # A long message is cut, keeping its beginning and its end.
+    long = message.replace("I scaffolded the app.", "word " * 2000)
+    assert len(handoff_from_commit(long)) < 3700 and "error TS2580" in handoff_from_commit(long)
+
+
+def test_the_note_about_the_command_that_still_fails():
+    assert failure_note(None) == "" and failure_note({}) == "" and failure_note({"command": ""}) == ""
+    note = failure_note({"command": "npm run\n  build", "exit_code": 2, "output": "> build\n\n\nsrc/a.ts(1,1): error TS1\n", "timed_out": False})
+    assert note == "Still failing when the run stopped: `npm run build` (exit code 2)\n    > build\n    src/a.ts(1,1): error TS1"
+    assert failure_note({"command": "npm test", "exit_code": None, "output": "", "timed_out": True}) == (
+        "Still failing when the run stopped: `npm test` (timed out)"
+    )
+    # Long output is cut down to its beginning and, mostly, its end; no line of it starts a paragraph of its own.
+    long = failure_note({"command": "make", "exit_code": 1, "output": "\n".join(f"line {n}" for n in range(500))})
+    assert len(long) < 1600 and "    line 0\n" in long and long.endswith("    line 499") and "\n\n" not in long
+    assert "line 250" not in long
+
+
+def test_a_follow_up_that_finds_nothing_left_to_do_takes_the_mark_off(client: TestClient, app_env, install_deps, github: FakeGitHub):
+    install_deps(ScriptedLLM([ADD_NOTES[0], ADD_NOTES[1], RATE_LIMIT]))
+    run_stream(client, TASK)
+    assert github.pulls["acme/demo"][0]["title"].startswith("[Unfinished] ")
+
+    install_deps(ScriptedLLM([[("read_file", {"path": "NOTES.md"})], [("finish", {"summary": "The notes are complete as they are."})]]))
+    _events, task = run_stream(
+        client, {"repository": "acme/demo", "prompt": TASK["prompt"], "pull_request": 1, "continue_work": True}
+    )
+    assert task["outcome"] == "no_changes" and task["pr_number"] == 1
+    assert github.pulls["acme/demo"][0]["title"] == "add() returns the wrong result, fix it"
+    assert "Pull request #1 is no longer marked as unfinished" in messages(task, "info")
+    comment = [item for item in github.comments if item["issue"] == 1][-1]["body"]
+    assert comment.startswith("✅ I went over this pull request to finish it and found nothing left to do")
+    assert "The notes are complete as they are." in comment
+    # Other work on the pull request that changes nothing says nothing about whether it is complete.
+    install_deps(ScriptedLLM([ADD_NOTES[0], [("write_file", {"path": "MORE.md", "content": "more\n"})], RATE_LIMIT]))
+    run_stream(client, {"repository": "acme/demo", "prompt": "More", "pull_request": 1})
+    assert github.pulls["acme/demo"][0]["title"].startswith("[Unfinished] ")
+    install_deps(ScriptedLLM([[("read_file", {"path": "NOTES.md"})], [("finish", {"summary": "Nothing to do."})]]))
+    run_stream(client, {"repository": "acme/demo", "prompt": "Check the wording", "pull_request": 1})
+    assert github.pulls["acme/demo"][0]["title"].startswith("[Unfinished] ")
 
 
 @pytest.mark.parametrize(
@@ -543,8 +760,9 @@ def test_continuing_a_project_that_was_pushed_unfinished(client: TestClient, app
     [
         # Nothing was changed yet: there is nothing to keep.
         ([[("read_file", {"path": "calc.py"})], RATE_LIMIT], False),
-        # The agent says itself that the work is not usable.
-        ([ADD_NOTES[0], ADD_NOTES[1], [("finish", {"summary": "This cannot work.", "success": False})]], False),
+        # The agent says itself that it cannot complete the task: what it changed is
+        # kept all the same, for the owner of the repository to judge.
+        ([ADD_NOTES[0], ADD_NOTES[1], [("finish", {"summary": "This cannot work.", "success": False})]], True),
         ([ADD_NOTES[0], ADD_NOTES[1], LLMError("groq returned HTTP 401: Invalid API Key", kind="auth", status_code=401)], True),
     ],
 )
@@ -678,11 +896,31 @@ def test_trying_a_key_out(client: TestClient, app_env, monkeypatch):
     good = client.post("/api/v1/llm/test", json={"provider": "gemini"}, headers={"X-Gemini-Key": GEMINI_KEY}).json()
     assert good["ok"] is True and good["tool_call"] is True and good["key_source"] == "request"
     assert good["model"] == "gemini-flash-latest" and "called the test tool" in good["message"]
-    assert seen[-1].url.path == "/v1beta/models/gemini-flash-latest:generateContent"
+    # Both models a task would use with this provider were tried, in their order.
+    assert [request.url.path for request in seen] == [
+        "/v1beta/models/gemini-flash-latest:generateContent",
+        "/v1beta/models/gemini-3.5-flash-lite:generateContent",
+    ]
+    assert [(item["model"], item["ok"], item["tool_call"]) for item in good["models"]] == [
+        ("gemini-flash-latest", True, True),
+        ("gemini-3.5-flash-lite", True, True),
+    ]
 
     bad = client.post("/api/v1/llm/test", json={"provider": "gemini", "model": "gemini-4-argon"}, headers={"X-Gemini-Key": "AQ.wrong"}).json()
     assert bad["ok"] is False and bad["kind"] == "auth" and "API key not valid" in bad["message"] and "AQ.wrong" not in json.dumps(bad)
-    assert "gemini-4-argon" in seen[-1].url.path
+    assert "gemini-4-argon" in seen[-1].url.path and "models" not in bad  # one model was named: one is tried
+
+    # A list of models from the settings page: each is tried.
+    seen.clear()
+    listed = client.post(
+        "/api/v1/llm/test", json={"provider": "gemini", "model": "gemini-3.8-flash, gemini-3.6-flash"}, headers={"X-Gemini-Key": GEMINI_KEY}
+    ).json()
+    assert [item["model"] for item in listed["models"]] == ["gemini-3.8-flash", "gemini-3.6-flash"] and listed["model"] == "gemini-3.8-flash"
+    assert len(seen) == 2
+    # Four long names are a long setting; it is not refused for its length.
+    long_names = ", ".join(f"vendor/{'m' * 150}-{index}" for index in range(4))
+    wordy = client.post("/api/v1/llm/test", json={"provider": "gemini", "model": long_names}, headers={"X-Gemini-Key": GEMINI_KEY})
+    assert wordy.status_code == 200 and len(wordy.json()["models"]) == 4
 
     # Without a key in the request the server's own is tried - here Groq has one.
     server = client.post("/api/v1/llm/test", json={"provider": "GROQ"}).json()
@@ -788,6 +1026,10 @@ def test_an_app_owned_by_an_organization_is_configured_there(client: TestClient,
 # --------------------------------------------------------------------------- #
 # Started from GitHub
 # --------------------------------------------------------------------------- #
+# Who writes the comments of these tests (the login in the shared webhook payload).
+COMMENTER = comment_event("")["comment"]["user"]["login"]
+
+
 def pr_comment(body: str, **overrides: Any) -> Dict[str, Any]:
     return comment_event(body, issue={"number": 1, "title": "Fix add()", "pull_request": {"url": "x"}}, **overrides)
 
@@ -827,6 +1069,53 @@ def test_jules_comment_with_nothing_to_fix_says_so(client: TestClient, token_env
     deliver(client, "issue_comment", pr_comment("/jules"), delivery="d-none")
     (comment,) = [item for item in github.comments if item["issue"] == 1]
     assert comment["body"].startswith("ℹ️ There was nothing for me to fix: no check has failed on the head commit of this pull request.")
+
+
+@pytest.mark.parametrize("text", ["/jules continue", "/jules Continue.", "/jules finish it", "/jules please carry on", "/jules finish the work!"])
+def test_jules_continue_on_a_pull_request_finishes_what_was_left(client: TestClient, token_env, install_deps, github: FakeGitHub, monkeypatch, text):
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
+    install_deps(ScriptedLLM([ADD_NOTES[0], ADD_NOTES[1], RATE_LIMIT]))
+    run_stream(client, TASK)
+    assert github.pulls["acme/demo"][0]["title"].startswith("[Unfinished] ")
+    llm = fix_add_script()
+    install_deps(llm)
+    response = deliver(client, "issue_comment", pr_comment(text), delivery="d-continue")
+    task = task_store.get(response.json()["task"]["task_id"])
+    assert task["continue_work"] is True and task["fix_checks"] is False and task["outcome"] == "pr_updated"
+    prompt = prompt_of(llm)
+    assert "Finish the work on pull request #1 that was left unfinished." in prompt
+    assert "A previous run started this work and stopped before it was finished." in prompt
+    # Where the work stood is read from the commit that kept it.
+    assert "What the previous run left behind:\nAdded" not in prompt  # that run wrote no account
+    assert "What the previous run left behind:\nUnfinished: the agent was stopped before it was done. groq returned HTTP 429" in prompt
+    assert github.pulls["acme/demo"][0]["title"] == "add() returns the wrong result, fix it"  # the mark is gone
+
+
+def test_jules_continue_takes_further_instructions(client: TestClient, token_env, install_deps, github: FakeGitHub, monkeypatch):
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
+    open_pull_request(client, install_deps, github)
+    llm = ScriptedLLM(ADD_NOTES)
+    install_deps(llm)
+    deliver(client, "issue_comment", pr_comment("/jules continue\nand keep the README short"), delivery="d-more")
+    assert f"Instructions from @{COMMENTER}: and keep the README short" in prompt_of(llm)
+    # "continue" inside other instructions is not the command.
+    llm = ScriptedLLM(ADD_NOTES)
+    install_deps(llm)
+    response = deliver(client, "issue_comment", pr_comment("/jules continue the refactoring of calc.py"), delivery="d-other")
+    assert task_store.get(response.json()["task"]["task_id"])["continue_work"] is False
+    assert f"Instructions from @{COMMENTER} on pull request #1: continue the refactoring of calc.py" in prompt_of(llm)
+
+
+def test_a_task_from_an_issue_that_is_cut_short_says_so_and_how_to_continue(client: TestClient, token_env, install_deps, github: FakeGitHub, monkeypatch):
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
+    install_deps(ScriptedLLM([ADD_NOTES[0], ADD_NOTES[1], RATE_LIMIT]))
+    response = deliver(client, "issue_comment", comment_event("/jules fix this"), delivery="d-cut")
+    task = task_store.get(response.json()["task"]["task_id"])
+    assert task["unfinished"] is True and task["outcome"] == "pull_request"
+    (comment,) = [item for item in github.comments if item["issue"] == 7]
+    assert comment["body"].startswith(f"⚠️ I opened #1 ({task['pr_url']}), but the work in it is unfinished: groq returned HTTP 429")
+    assert "Comment `/jules continue` on #1 to have it finished; do not merge it as it is." in comment["body"]
+    assert "✅" not in comment["body"]
 
 
 def suite_failed(branch: str, sha: str) -> Dict[str, Any]:
@@ -934,3 +1223,262 @@ def test_failed_checks_that_are_left_alone(client: TestClient, token_env, instal
         assert "switched off" in response.json()["reason"]
     if case == "no_secret":
         assert "GITHUB_WEBHOOK_SECRET" in response.json()["reason"]
+
+
+# --------------------------------------------------------------------------- #
+# Standing instructions
+# --------------------------------------------------------------------------- #
+RULES = "Use import.meta.env instead of process.env in src/.\nAdd @types/node to devDependencies when vite.config.ts uses Node APIs."
+
+
+def test_standing_instructions_follow_every_task(client: TestClient, app_env, install_deps, github: FakeGitHub, monkeypatch):
+    # The server's own (one line in a hosting dashboard, with \\n for the line breaks) ...
+    monkeypatch.setenv("JULES_TASK_GUIDELINES", "Keep sample data short.\\nNo long comments.")
+    assert client.get("/api/v1/health/env").json()["automation"]["task_guidelines"] is True
+    llm = fix_add_script()
+    install_deps(llm)
+    # ... and the ones a caller sends along.
+    _events, task = run_stream(client, {**TASK, "guidelines": f"  {RULES}  "})
+    prompt = prompt_of(llm)
+    block = (
+        "Standing instructions (they apply to every task here; where they contradict the task above, the task wins):\n"
+        f"Keep sample data short.\nNo long comments.\n\n{RULES}"
+    )
+    assert block in prompt
+    # After the task, not instead of it.
+    assert prompt.index(TASK["prompt"]) < prompt.index("Standing instructions")
+    assert "Standing instructions are added to the task" in messages(task, "info")
+    # They are the caller's rules, not the task: the result and the pull request show the task as written.
+    assert task["prompt"] == TASK["prompt"] and "guidelines" not in task and "previous_handoff" not in task
+    assert not any("guidelines" in (event.get("task") or {}) for event in _events)
+    body = github.pulls["acme/demo"][0]["body"]
+    assert "import.meta.env" not in body and "Keep sample data short" not in body
+
+
+def test_tasks_without_standing_instructions_are_not_told_about_any(client: TestClient, app_env, install_deps):
+    assert client.get("/api/v1/health/env").json()["automation"]["task_guidelines"] is False
+    llm = fix_add_script()
+    install_deps(llm)
+    _events, task = run_stream(client, {**TASK, "guidelines": "   "})
+    assert "Standing instructions" not in prompt_of(llm)
+    assert not any("Standing instructions" in line for line in messages(task))
+
+
+def test_standing_instructions_have_a_limit(client: TestClient, app_env, install_deps):
+    install_deps(fix_add_script())
+    response = client.post("/api/v1/tasks/stream", json={**TASK, "guidelines": "x" * 4001})
+    assert response.status_code == 422
+    assert standing_instructions("", "  ") == "" and standing_instructions() == ""
+    assert standing_instructions("a", "a", "b").endswith(":\na\n\nb")  # the same text twice is said once
+
+
+def test_standing_instructions_of_the_server_reach_tasks_started_on_github(
+    client: TestClient, token_env, install_deps, github: FakeGitHub, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
+    monkeypatch.setenv("JULES_TASK_GUIDELINES", RULES)
+    llm = fix_add_script()
+    install_deps(llm)
+    response = deliver(client, "issue_comment", comment_event("/jules fix this"), delivery="d-rules")
+    assert task_store.get(response.json()["task"]["task_id"])["status"] == "completed"
+    assert f"task wins):\n{RULES}" in prompt_of(llm)
+
+
+def test_standing_instructions_are_kept_when_work_is_continued(client: TestClient, app_env, install_deps, github: FakeGitHub):
+    install_deps(ScriptedLLM([ADD_NOTES[0], ADD_NOTES[1], RATE_LIMIT]))
+    run_stream(client, TASK)
+    llm = fix_add_script()
+    install_deps(llm)
+    run_stream(client, {"repository": "acme/demo", "prompt": TASK["prompt"], "pull_request": 1, "continue_work": True, "guidelines": RULES})
+    prompt = prompt_of(llm)
+    # The task, where the previous run stopped, the pull request - and the rules last.
+    assert prompt.index("What the previous run left behind") < prompt.index("You are working on pull request #1") < prompt.index("Standing instructions")
+    assert prompt.rstrip().endswith(RULES) or RULES in prompt
+
+
+# --------------------------------------------------------------------------- #
+# A model name that stands for a choice (openrouter/free, gemini-flash-latest)
+# --------------------------------------------------------------------------- #
+def test_the_models_a_router_answered_with_are_part_of_the_result(client: TestClient, app_env, install_deps):
+    llm = ScriptedLLM(
+        ADD_NOTES,
+        model="openrouter/free",
+        answers_as=["upstage/solar-pro-3:free", "upstage/solar-pro-3:free", "google/gemma-4-31b-it:free"],
+    )
+    llm.provider = "openrouter"
+    install_deps(llm)
+    _events, task = run_stream(client, TASK)
+    assert task["outcome"] == "pull_request"
+    # The task names what was asked for; which models answered is said next to it.
+    assert (task["llm_provider"], task["llm_model"]) == ("openrouter", "openrouter/free")
+    assert task["llm_usage"] == [
+        {
+            "provider": "openrouter",
+            "model": "openrouter/free",
+            "served": {"upstage/solar-pro-3:free": 2, "google/gemma-4-31b-it:free": 1},
+        }
+    ]
+    # The log says it once per change of model, not with every reply.
+    said = [line for line in messages(task, "info") if "answered with" in line]
+    assert said == ["openrouter answered with upstage/solar-pro-3:free", "openrouter answered with google/gemma-4-31b-it:free"]
+
+
+def test_a_model_that_answers_under_its_own_name_is_not_listed_twice(client: TestClient, app_env, install_deps):
+    install_deps(fix_add_script())
+    _events, task = run_stream(client, TASK)
+    assert all("served" not in item for item in task["llm_usage"])
+    assert not any("answered with" in line for line in messages(task))
+
+
+def test_what_the_previous_run_left_behind_has_a_limit(client: TestClient, app_env, install_deps):
+    install_deps(fix_add_script())
+    too_long = {**TASK, "continue_work": True, "handoff": "x" * 8001}
+    assert client.post("/api/v1/tasks/stream", json=too_long).status_code == 422
+    assert client.post("/api/v1/tasks", json=too_long).status_code == 422
+
+
+def test_what_a_caller_sent_along_is_not_handed_back(client: TestClient, app_env, install_deps):
+    """The handoff and the standing instructions are the caller's own text: no
+    route returns them with the task."""
+    install_deps(fix_add_script())
+    sent = {**TASK, "continue_work": True, "handoff": "The build failed on vite.config.ts.", "guidelines": RULES}
+    created = client.post("/api/v1/tasks", json=sent)
+    assert created.status_code in (200, 201, 202), created.text
+    task_id = created.json()["task_id"]
+    for body in (created.json(), client.get(f"/api/v1/tasks/{task_id}").json(), *client.get("/api/v1/tasks").json()):
+        assert "guidelines" not in body and "previous_handoff" not in body
+        assert "import.meta.env" not in json.dumps(body) and "The build failed on vite.config.ts." not in json.dumps(body)
+    # `handoff` in a result is what *this* run left behind: nothing, when it finished.
+    assert client.get(f"/api/v1/tasks/{task_id}").json()["handoff"] is None
+
+
+# --------------------------------------------------------------------------- #
+# Unfinished work says how it is continued
+# --------------------------------------------------------------------------- #
+def test_unfinished_work_names_the_comment_that_continues_it_where_github_reaches_the_server(
+    client: TestClient, app_env, install_deps, github: FakeGitHub, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", SECRET)
+    install_deps(ScriptedLLM([ADD_NOTES[0], ADD_NOTES[1], RATE_LIMIT]))
+    _events, task = run_stream(client, TASK)
+    assert task["unfinished"] is True and task["outcome"] == "pull_request"
+    body = github.pulls["acme/demo"][0]["body"]
+    assert "Comment `/jules continue` on this pull request to have it finished; do not merge it as it is." in body
+    assert "A follow-up task can finish it" not in body
+
+    # More work on it that is cut short as well: the comment about the push says the same.
+    install_deps(ScriptedLLM([[("read_file", {"path": "calc.py"})], [("write_file", {"path": "MORE.md", "content": "# More\n"})], RATE_LIMIT]))
+    more = {"repository": "acme/demo", "prompt": TASK["prompt"], "pull_request": task["pr_number"], "continue_work": True}
+    _events, again = run_stream(client, more)
+    assert again["outcome"] == "pr_updated" and again["unfinished"] is True
+    comment = github.comments[-1]["body"]
+    assert comment.startswith("⚠️ I pushed ") and "\n\nComment `/jules continue` to have it finished.\n\n<sub>" in comment
+
+
+def test_without_a_webhook_the_pull_request_does_not_promise_a_comment_command(
+    client: TestClient, app_env, install_deps, github: FakeGitHub
+):
+    install_deps(ScriptedLLM([ADD_NOTES[0], ADD_NOTES[1], RATE_LIMIT]))
+    _events, task = run_stream(client, TASK)
+    body = github.pulls["acme/demo"][0]["body"]
+    assert "A follow-up task can finish it; do not merge it as it is." in body and "/jules continue" not in body
+    install_deps(ScriptedLLM([[("read_file", {"path": "calc.py"})], [("write_file", {"path": "MORE.md", "content": "# More\n"})], RATE_LIMIT]))
+    more = {"repository": "acme/demo", "prompt": TASK["prompt"], "pull_request": task["pr_number"], "continue_work": True}
+    _events, again = run_stream(client, more)
+    assert again["outcome"] == "pr_updated" and again["unfinished"] is True
+    assert github.comments[-1]["body"].startswith("⚠️ I pushed ") and "/jules continue" not in github.comments[-1]["body"]
+
+
+# --------------------------------------------------------------------------- #
+# A file that cannot be committed does not cost the result
+# --------------------------------------------------------------------------- #
+def test_a_finished_task_is_delivered_without_the_file_that_cannot_be_committed(
+    client: TestClient, app_env, install_deps, github: FakeGitHub
+):
+    """The agent is done when its changes are collected: nobody can remove the
+    bundle any more. The pull request is opened without it and says so."""
+    bundle = "mkdir -p dist && head -c 1200000 /dev/zero | tr '\\0' 'x' > dist/bundle.js"
+    install_deps(
+        ScriptedLLM(
+            [
+                [("read_file", {"path": "calc.py"})],
+                [("write_file", {"path": "calc.py", "content": "def add(a, b):\n    return a + b\n"})],
+                [("run_command", {"command": bundle})],
+                [("run_tests", {"command": CHECK_ADD})],
+                [("finish", {"summary": "add() adds.", "pr_title": "Fix add()"})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
+    assert task["status"] == "completed" and task["outcome"] == "pull_request" and not task.get("unfinished")
+    assert [change["path"] for change in task["changed_files"]] == ["calc.py"]
+    warning = next(line for line in messages(task, "warn") if "Left out so that the rest can be delivered" in line)
+    assert warning.startswith("These changed files are larger than 1000 kB and cannot be committed by the agent: dist/bundle.js.")
+    assert warning.endswith("Left out so that the rest can be delivered: dist/bundle.js (1,200 kB, too large to commit)")
+    body = github.pulls["acme/demo"][0]["body"]
+    assert (
+        "Not included, because it is build output or too large to commit: "
+        "`dist/bundle.js` (1,200 kB, too large to commit)"
+    ) in body
+    assert github.remote.files("acme/demo", task["head_branch"]) == sorted(DEMO_FILES)  # no dist/ among them
+
+
+def test_build_output_that_can_be_committed_is_still_committed_by_a_finished_task(
+    client: TestClient, app_env, install_deps, github: FakeGitHub
+):
+    """Nothing changes for a task that finishes with a change that can be
+    committed as it is: what the agent left in the work tree is what is delivered."""
+    install_deps(
+        ScriptedLLM(
+            [
+                [("read_file", {"path": "calc.py"})],
+                [("write_file", {"path": "calc.py", "content": "def add(a, b):\n    return a + b\n"})],
+                [("run_command", {"command": "mkdir -p dist && echo built > dist/out.txt"})],
+                [("run_tests", {"command": CHECK_ADD})],
+                [("finish", {"summary": "add() adds.", "pr_title": "Fix add()"})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
+    assert sorted(change["path"] for change in task["changed_files"]) == ["calc.py", "dist/out.txt"]
+    assert "Not included" not in github.pulls["acme/demo"][0]["body"]
+    assert not any("Left out" in line for line in messages(task, "warn"))
+
+
+def test_a_task_whose_whole_result_cannot_be_committed_still_fails_for_that_reason(
+    client: TestClient, app_env, install_deps, github: FakeGitHub
+):
+    """Leaving the file out would leave nothing: an empty result would hide why."""
+    install_deps(
+        ScriptedLLM(
+            [
+                [("read_file", {"path": "calc.py"})],
+                [("run_command", {"command": "head -c 1200000 /dev/zero | tr '\\0' 'x' > dump.sql"})],
+                [("finish", {"summary": "Exported the data.", "pr_title": "Add the export"})],
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
+    assert task["status"] == "failed" and not github.pulls.get("acme/demo")
+    assert "larger than 1000 kB and cannot be committed by the agent: dump.sql" in task["error"]
+    assert not any("Left out" in line for line in messages(task, "warn"))
+
+
+def test_an_interrupted_run_that_only_left_build_output_has_nothing_to_keep(
+    client: TestClient, app_env, install_deps, github: FakeGitHub
+):
+    install_deps(
+        ScriptedLLM(
+            [
+                [("read_file", {"path": "calc.py"})],
+                [("run_command", {"command": "mkdir -p .cache/tool && echo built > .cache/tool/out.js"})],
+                RATE_LIMIT,
+            ]
+        )
+    )
+    _events, task = run_stream(client, TASK)
+    assert task["status"] == "failed" and not task.get("unfinished") and not github.pulls.get("acme/demo")
+    assert (
+        "Nothing of the unfinished work can be kept. All of it is build output or too large to commit: "
+        ".cache/ (build output, 1 file)"
+    ) in messages(task, "warn")

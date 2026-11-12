@@ -13,6 +13,7 @@ request) run for real, offline, without touching github.com, E2B or an LLM.
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import os
 import re
@@ -174,6 +175,10 @@ class GitRemote:
         """Commit subjects reachable from ``ref``, newest first."""
         listing = git(self.path_for(slug), "log", "--format=%s", ref)
         return [line for line in listing.splitlines() if line]
+
+    def message(self, slug: str, ref: str) -> str:
+        """The whole message of the commit at ``ref``."""
+        return git(self.path_for(slug), "log", "-1", "--format=%B", ref)
 
     def mode(self, slug: str, ref: str, path: str) -> str:
         """Git file mode of ``path`` at ``ref`` (e.g. ``100755``)."""
@@ -1008,10 +1013,20 @@ class ScriptedLLM:
 
     provider = "scripted"
 
-    def __init__(self, steps: Sequence[Step], *, model: str = "scripted-model", tokens_per_minute: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        steps: Sequence[Step],
+        *,
+        model: str = "scripted-model",
+        tokens_per_minute: Optional[int] = None,
+        answers_as: Sequence[str] = (),
+    ) -> None:
         self.steps = list(steps)
         self.model = model
         self.tokens_per_minute = tokens_per_minute
+        # The model each answer names, in turn (the last one for the rest): what
+        # a router such as openrouter/free reports about the model it picked.
+        self.answers_as = list(answers_as)
         self.requests: List[List[Dict[str, Any]]] = []
         self.output_token_limits: List[int] = []
         self.closed = False
@@ -1025,13 +1040,18 @@ class ScriptedLLM:
         if callable(step):
             step = step(messages)
         if isinstance(step, BaseException):
-            raise step
+            # A copy: scripts share error objects, and a pool of providers notes
+            # on the error it passes on which provider has taken over.
+            raise copy.copy(step)
+        answering = self.model
+        if self.answers_as:
+            answering = self.answers_as[min(len(self.requests), len(self.answers_as)) - 1]
         if isinstance(step, str):
             return LLMResponse(
                 content=step,
                 tool_calls=[],
                 finish_reason="stop",
-                model=self.model,
+                model=answering,
                 assistant_message={"role": "assistant", "content": step},
                 tokens_per_minute_limit=self.tokens_per_minute,
             )
@@ -1045,7 +1065,7 @@ class ScriptedLLM:
             content="",
             tool_calls=calls,
             finish_reason="tool_calls",
-            model=self.model,
+            model=answering,
             assistant_message={"role": "assistant", "content": None, "tool_calls": wire},
             tokens_per_minute_limit=self.tokens_per_minute,
         )

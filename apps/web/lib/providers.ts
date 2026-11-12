@@ -1,22 +1,62 @@
 import type { HealthEnv, ProviderInfo } from './api';
-import { PROVIDER_IDS } from './settings';
+import { PROVIDER_IDS, splitModels } from './settings';
 import type { ProviderId, Settings } from './settings';
 
 /** What is known about the providers before the backend has answered. */
 const KNOWN_PROVIDERS: ProviderInfo[] = [
-  { id: 'groq', label: 'Groq', configured: false, model: 'openai/gpt-oss-120b', key_variable: 'GROQ_API_KEY', model_variable: 'GROQ_MODEL' },
-  { id: 'gemini', label: 'Google Gemini', configured: false, model: 'gemini-flash-latest', key_variable: 'GEMINI_API_KEY', model_variable: 'GEMINI_MODEL' },
-  { id: 'openrouter', label: 'OpenRouter', configured: false, model: 'baidu/ernie-5.5-flash-preview:free', key_variable: 'OPENROUTER_API_KEY', model_variable: 'OPENROUTER_MODEL' },
-  { id: 'openai', label: 'OpenAI', configured: false, model: '', key_variable: 'OPENAI_API_KEY', model_variable: 'OPENAI_MODEL' },
-  { id: 'anthropic', label: 'Anthropic', configured: false, model: '', key_variable: 'ANTHROPIC_API_KEY', model_variable: 'ANTHROPIC_MODEL' },
+  {
+    id: 'groq',
+    label: 'Groq',
+    configured: false,
+    model: 'openai/gpt-oss-120b',
+    models: ['openai/gpt-oss-120b', 'openai/gpt-oss-20b'],
+    key_variable: 'GROQ_API_KEY',
+    model_variable: 'GROQ_MODEL',
+  },
+  {
+    id: 'gemini',
+    label: 'Google Gemini',
+    configured: false,
+    model: 'gemini-flash-latest',
+    models: ['gemini-flash-latest', 'gemini-3.5-flash-lite'],
+    key_variable: 'GEMINI_API_KEY',
+    model_variable: 'GEMINI_MODEL',
+  },
+  {
+    id: 'openrouter',
+    label: 'OpenRouter',
+    configured: false,
+    model: 'openrouter/free',
+    models: ['openrouter/free'],
+    key_variable: 'OPENROUTER_API_KEY',
+    model_variable: 'OPENROUTER_MODEL',
+  },
+  { id: 'openai', label: 'OpenAI', configured: false, model: '', models: [], key_variable: 'OPENAI_API_KEY', model_variable: 'OPENAI_MODEL' },
+  { id: 'anthropic', label: 'Anthropic', configured: false, model: '', models: [], key_variable: 'ANTHROPIC_API_KEY', model_variable: 'ANTHROPIC_MODEL' },
 ];
 
-/** Every provider, with what the server says about it (its default model, whether it has a key). */
+/** Every provider, with what the server says about it (its default models, whether it has a key). */
 export function providersOf(health: HealthEnv | null): ProviderInfo[] {
   const reported = health && Array.isArray(health.providers) ? health.providers : [];
   return KNOWN_PROVIDERS.map((known) => reported.find((item) => item.id === known.id) || known);
 }
 
+/** The models the server gives a provider, in the order they are tried. */
+export function serverModels(info: ProviderInfo): string[] {
+  if (Array.isArray(info.models) && info.models.length > 0) return info.models;
+  return info.model ? [info.model] : [];
+}
+
+/**
+ * The models a task started from this browser uses with a provider: the ones
+ * entered here ("a, b") replace the server's list, as they do on the server.
+ */
+export function modelsFor(info: ProviderInfo, settings: Settings): string[] {
+  const mine = splitModels(settings.models[info.id]);
+  return mine.length > 0 ? mine : serverModels(info);
+}
+
+/** One model a task can use. A provider appears once for each of its models. */
 export interface ChainEntry {
   id: ProviderId;
   label: string;
@@ -33,7 +73,7 @@ export interface ChainEntry {
  * server's own (JULES_LLM_PROVIDER) is set aside when it has no key but this
  * browser brings one for another provider.
  */
-export function effectiveChain(health: HealthEnv | null, settings: Settings): ChainEntry[] {
+export function providerOrder(health: HealthEnv | null, settings: Settings): ProviderId[] {
   const providers = providersOf(health);
   const preferences = health && health.llm_preferences ? health.llm_preferences : null;
   const hasKeyHere = (id: ProviderId) => (settings.keys[id] || '').trim() !== '';
@@ -52,8 +92,42 @@ export function effectiveChain(health: HealthEnv | null, settings: Settings): Ch
   else chain = PROVIDER_IDS.some(hasKeyHere) ? usable : [];
 
   const fallback = settings.fallback && !(preferences && preferences.fallback === false);
-  return (fallback ? chain : chain.slice(0, 1)).map((id) => {
+  return fallback ? chain : chain.slice(0, 1);
+}
+
+/**
+ * Every model a task will use, in the order they are tried - the server's
+ * `Settings.llm_slots`: each provider with its first model, then each
+ * provider's second model, and so on, so that every provider's best model is
+ * tried before anybody's stand-in. Without fallback there is exactly one.
+ */
+export function effectiveChain(health: HealthEnv | null, settings: Settings): ChainEntry[] {
+  const providers = providersOf(health);
+  const preferences = health && health.llm_preferences ? health.llm_preferences : null;
+  const fallback = settings.fallback && !(preferences && preferences.fallback === false);
+  const lists = providerOrder(health, settings).map((id) => {
     const info = providers.find((item) => item.id === id) as ProviderInfo;
-    return { id, label: info.label, model: (settings.models[id] || '').trim() || info.model };
+    return { id, label: info.label, models: modelsFor(info, settings) };
   });
+  if (lists.length === 0) return [];
+  if (!fallback) return [{ id: lists[0].id, label: lists[0].label, model: lists[0].models[0] || '' }];
+  const chain: ChainEntry[] = [];
+  const depth = Math.max(...lists.map((item) => item.models.length), 1);
+  for (let level = 0; level < depth; level += 1) {
+    lists.forEach((item) => {
+      // A provider without a known model still takes its place: the server names the model.
+      if (level < item.models.length) chain.push({ id: item.id, label: item.label, model: item.models[level] });
+      else if (level === 0) chain.push({ id: item.id, label: item.label, model: '' });
+    });
+  }
+  return chain;
+}
+
+/** The providers of a chain, each once, in the order they are first used. */
+export function providersIn(chain: ChainEntry[]): ChainEntry[] {
+  const seen: ChainEntry[] = [];
+  chain.forEach((entry) => {
+    if (!seen.some((item) => item.id === entry.id)) seen.push(entry);
+  });
+  return seen;
 }

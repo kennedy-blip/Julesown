@@ -63,7 +63,6 @@ async def health_env_check():
     variables["GEMINI_API_KEY"] = bool(settings.gemini_api_key)  # GOOGLE_API_KEY counts too
     missing = settings.missing_requirements()
     provider = settings.llm_provider
-    chain = settings.llm_chain
     identity = settings.commit_identity
     return {
         "status": "HEALTHY" if not missing else "INCOMPLETE",
@@ -77,9 +76,10 @@ async def health_env_check():
         "llm": {
             "provider": provider,
             "model": settings.llm_model,
-            # Every provider a task can use, first choice first. With more than
-            # one, a task carries on with the next when one reaches its limit.
-            "chain": [{"provider": name, "model": settings.model_for(name)} for name in chain],
+            # Every model a task can use, in the order they are tried: with more
+            # than one, a task carries on with the next when one reaches its
+            # limit or fails. A provider appears once per model it is given.
+            "chain": [{"provider": name, "model": model} for name, model in settings.llm_slots],
             "fallback": settings.llm_fallback,
         }
         if provider
@@ -100,6 +100,8 @@ async def health_env_check():
                 "label": PROVIDER_LABELS[name],
                 "configured": bool(settings.api_key_for(name)),
                 "model": settings.model_for(name),
+                # Every model the provider is given, in the order they are tried.
+                "models": settings.models_for(name),
                 "key_variable": PROVIDER_KEY_VARIABLES[name],
                 "model_variable": PROVIDER_MODEL_VARIABLES[name],
             }
@@ -114,6 +116,8 @@ async def health_env_check():
             "ci_autofix": settings.ci_autofix,
             "ci_autofix_attempts": settings.ci_autofix_attempts,
             "keep_unfinished_work": settings.keep_unfinished_work,
+            # Whether the server adds instructions of its own to every task (JULES_TASK_GUIDELINES).
+            "task_guidelines": bool(settings.task_guidelines),
         },
         "github": {"auth_mode": settings.github_auth_mode},
         "sandbox": {"configured": bool(settings.e2b_api_key), "provider": "e2b"},

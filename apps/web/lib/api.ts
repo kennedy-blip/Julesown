@@ -33,6 +33,11 @@ export interface ProviderUsage {
   output_tokens?: number;
   /** Why the provider was not used again in the run, if it was taken out. */
   out?: string | null;
+  /**
+   * The models that answered, when the configured one is a router or an alias
+   * that chooses for each request (openrouter/free, gemini-flash-latest): name -> answers.
+   */
+  served?: Record<string, number>;
 }
 
 export interface FailedCheck {
@@ -105,12 +110,17 @@ export interface TaskRecord {
   fix_checks?: boolean;
   continue_work?: boolean;
   failed_checks?: FailedCheck[];
-  /** The agent was stopped before it was done; what it had changed was delivered anyway. */
+  /** The agent stopped before the task was done; what it had changed was delivered anyway. */
   unfinished?: boolean;
-  /** timeout | llm_error | max_turns */
+  /** timeout | llm_error | max_turns (it was interrupted) | gave_up (it reported that it cannot complete the task) */
   stop_reason?: string | null;
-  /** Why the agent was stopped, in words. */
+  /** Why the agent stopped, in words. */
   unfinished_reason?: string | null;
+  /**
+   * Where unfinished work stands: the agent's own account, the command that
+   * still fails, why it stopped. Sent back with the task that continues it.
+   */
+  handoff?: string | null;
   /** bot | coauthor | user, as it was applied to the commit. */
   commit_authorship?: string | null;
   sandbox: string | null;
@@ -159,8 +169,10 @@ export interface ProviderInfo {
   label: string;
   /** The server has a key for it in its environment. */
   configured: boolean;
-  /** The model the server uses unless told otherwise. */
+  /** The model the server uses first unless told otherwise. */
   model: string;
+  /** Every model the server gives the provider, in the order they are tried. */
+  models?: string[];
   key_variable: string;
   model_variable: string;
 }
@@ -180,7 +192,13 @@ export interface HealthEnv {
   llm_preferences?: { order: string[]; first_choice: string | null; fallback: boolean };
   providers?: ProviderInfo[];
   commits?: { authorship: string; author_configured: boolean; author_name: string | null };
-  automation?: { ci_autofix: boolean; ci_autofix_attempts: number; keep_unfinished_work: boolean };
+  automation?: {
+    ci_autofix: boolean;
+    ci_autofix_attempts: number;
+    keep_unfinished_work: boolean;
+    /** The server adds instructions of its own to every task (JULES_TASK_GUIDELINES). */
+    task_guidelines?: boolean;
+  };
   /** What the server itself still lacks, by kind: a description, or null when it is there. */
   needs?: { llm: string | null; sandbox: string | null; github: string | null };
   github: { auth_mode: 'app' | 'token' | 'none' };
@@ -202,6 +220,21 @@ export interface ProviderTest {
   kind: string | null;
   message: string;
   key_source?: 'request' | 'server' | null;
+  /** The model that answered, when the one asked for is a router or an alias. */
+  answered_by?: string | null;
+  /** With several models: what each of them did, in the order they are tried. */
+  models?: ProviderModelTest[];
+}
+
+/** How one model of a provider did in the test. */
+export interface ProviderModelTest {
+  model: string;
+  ok: boolean;
+  tool_call: boolean;
+  latency_ms: number | null;
+  kind: string | null;
+  message: string;
+  answered_by?: string | null;
 }
 
 export interface GitHubIdentity {
@@ -499,6 +532,8 @@ export interface TaskRequest {
   fixChecks?: boolean;
   /** The task finishes work an earlier run left unfinished. */
   continueWork?: boolean;
+  /** With continueWork: what the run that is continued reported when it stopped. */
+  handoff?: string | null;
 }
 
 /**
@@ -524,7 +559,12 @@ export async function streamTask(
   if (request.pullRequest) body.pull_request = request.pullRequest;
   else if (request.branch.trim()) body.branch = request.branch.trim();
   if (request.fixChecks) body.fix_checks = true;
-  if (request.continueWork) body.continue_work = true;
+  if (request.continueWork) {
+    body.continue_work = true;
+    // The server keeps nothing between two runs: where the first one stopped travels with the second.
+    const handoff = (request.handoff || '').trim();
+    if (handoff) body.handoff = handoff.slice(0, 8000);
+  }
 
   const res = await fetch('/api/v1/tasks/stream', {
     method: 'POST',

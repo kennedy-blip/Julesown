@@ -9,7 +9,10 @@ import pytest
 from apps.api.services.agent import CodingAgent
 from apps.api.services.common import Deadline
 from apps.api.services.llm import (
+    COOLDOWN_ROUTER_PICK,
     COOLDOWN_UNKNOWN_RATE_LIMIT,
+    PATIENCE_ALONE,
+    PATIENCE_UNPROVEN,
     FailoverClient,
     LLMError,
 )
@@ -359,3 +362,230 @@ def test_recovered_reply_is_logged_and_executed(checkout: RepoCheckout):
     assert run(agent).finished and agent.files_read == ["calc.py"]
     assert ("info", "groq refused the model's reply over its form; the call in it was used as meant (read_file)") in events
     assert len(llm.requests) == 2  # nothing was asked for again
+
+
+# --------------------------------------------------------------------------- #
+# Several models of one provider
+# --------------------------------------------------------------------------- #
+def test_a_second_model_of_the_same_provider_has_its_own_limit():
+    """Limits are counted per model: when one is used up, the provider's next
+    model carries on - before any waiting."""
+    clock = Clock()
+    big = provider("groq", ["one", rate_limit(GROQ_LIMIT, 31.7), "big again"], model="gpt-oss-120b")
+    small = provider("groq", ["two", rate_limit(retry_after=50.0)], model="gpt-oss-20b")
+    pool = FailoverClient([big, small], clock=clock)
+    assert pool.chain == ["groq / gpt-oss-120b", "groq / gpt-oss-20b"]
+    assert ask(pool).content == "one"
+    error = failure(pool)
+    assert error.switched_to == "groq / gpt-oss-20b" and (pool.provider, pool.model) == ("groq", "gpt-oss-20b")
+    assert ask(pool).content == "two"
+    clock.sleep(35)  # the first model's limit has lifted when the second one's is reached
+    assert failure(pool).switched_to == "groq / gpt-oss-120b"
+    assert ask(pool).content == "big again"
+    assert [(item["model"], item["requests"], item["failures"]) for item in pool.usage()] == [
+        ("gpt-oss-120b", 2, 1),
+        ("gpt-oss-20b", 1, 1),
+    ]
+
+
+def test_a_rejected_key_takes_out_every_model_of_that_provider():
+    clock = Clock()
+    first = provider("openrouter", [LLMError("openrouter returned HTTP 401: No auth credentials found", kind="auth", status_code=401)], model="some:free")
+    groq = provider("groq", ["groq answers", "and again"])
+    router = provider("openrouter", ["never asked"], model="openrouter/free")
+    pool = FailoverClient([first, groq, router], clock=clock)
+    assert failure(pool).switched_to == "groq / groq-model"
+    assert ask(pool).content == "groq answers"
+    assert [(item["model"], item["out"]) for item in pool.usage()] == [
+        ("some:free", "its API key was rejected"),
+        ("groq-model", None),
+        ("openrouter/free", "its API key was rejected"),
+    ]
+    assert router.requests == []
+
+
+def test_a_model_that_is_gone_leaves_the_providers_other_model_in_use():
+    clock = Clock()
+    gone = provider("gemini", [LLMError("gemini returned HTTP 404: models/x is not found", kind="model_unavailable", status_code=404)], model="x")
+    lite = provider("gemini", ["lite answers"], model="gemini-3.5-flash-lite")
+    pool = FailoverClient([gone, lite], clock=clock)
+    assert failure(pool).switched_to == "gemini / gemini-3.5-flash-lite"
+    assert ask(pool).content == "lite answers"
+
+
+def test_the_model_a_router_chose_is_reported():
+    """`openrouter/free` picks a model per request; which ones answered is part of the result."""
+
+    class Router(ScriptedLLM):
+        served = ["upstage/solar-pro-3:free", "upstage/solar-pro-3:free", "google/gemma-4-31b-it:free"]
+
+        def complete(self, messages, tools, *, max_output_tokens, timeout):
+            response = super().complete(messages, tools, max_output_tokens=max_output_tokens, timeout=timeout)
+            response.model = self.served[len(self.requests) - 1]
+            return response
+
+    router = Router(["a", "b", "c"], model="openrouter/free")
+    router.provider = "openrouter"
+    pool = FailoverClient([router, provider("groq", [])], clock=Clock())
+    for _ in range(3):
+        ask(pool)
+    assert pool.usage()[0]["served"] == {"upstage/solar-pro-3:free": 2, "google/gemma-4-31b-it:free": 1}
+    assert "served" not in pool.usage()[1]
+
+
+UPSTREAM = (
+    "openrouter returned HTTP 429: Provider returned error (google/gemma-4-31b-it:free is temporarily "
+    "rate-limited upstream. Please retry shortly, or add your own key to accumulate your rate limits)"
+)
+FREE_PER_DAY = (
+    "openrouter returned HTTP 429: Rate limit exceeded: free-models-per-day. Add 10 credits to unlock "
+    "1000 free model requests per day"
+)
+
+
+def test_a_router_whose_pick_is_throttled_is_asked_again_shortly():
+    """`openrouter/free` picks a model for every request. One that is throttled
+    upstream says nothing about the next pick: the router is free again in a moment."""
+    clock = Clock()
+    router = provider("openrouter", [rate_limit(UPSTREAM, None), "another model answers"], model="openrouter/free")
+    pool = FailoverClient([router], clock=clock)
+    error = failure(pool)
+    assert error.kind == "rate_limit" and error.retry_after == COOLDOWN_ROUTER_PICK == 3.0 and not error.switched_to
+    clock.sleep(COOLDOWN_ROUTER_PICK)
+    assert ask(pool).content == "another model answers"
+
+    # With somebody else ready the request goes there at once - and the router is not out for long.
+    clock = Clock()
+    router = provider("openrouter", [rate_limit(UPSTREAM, None), "the router again"], model="openrouter/free")
+    groq = provider("groq", ["groq answers", rate_limit(GROQ_LIMIT, 31.7)])
+    pool = FailoverClient([router, groq], clock=clock)
+    assert failure(pool).switched_to == "groq / groq-model"
+    assert ask(pool).content == "groq answers"
+    clock.sleep(5)
+    assert failure(pool).switched_to == "openrouter / openrouter/free"
+    assert ask(pool).content == "the router again"
+
+
+def test_a_single_model_that_is_throttled_upstream_is_left_alone_for_a_while():
+    clock = Clock()
+    pinned = provider("openrouter", [rate_limit(UPSTREAM, None)], model="google/gemma-4-31b-it:free")
+    pool = FailoverClient([pinned], clock=clock)
+    assert failure(pool).retry_after == COOLDOWN_UNKNOWN_RATE_LIMIT
+    # A limit of the account, which names when it lifts, is honoured for a router too.
+    router = provider("openrouter", [rate_limit("openrouter returned HTTP 429: Rate limit exceeded: free-models-per-min.", 20.0)], model="openrouter/free")
+    assert failure(FailoverClient([router], clock=clock)).retry_after == 20.0
+
+
+def test_openrouters_daily_allowance_is_one_for_all_its_free_models():
+    clock = Clock()
+    pinned = provider("openrouter", [rate_limit(FREE_PER_DAY, None, daily=True)], model="baidu/ernie-5.5-flash-preview:free")
+    groq = provider("groq", ["groq answers", rate_limit(GROQ_LIMIT, 31.7)])
+    router = provider("openrouter", ["never asked"], model="openrouter/free")
+    paid = provider("openrouter", ["a paid model answers"], model="openai/gpt-5.5-mini")
+    pool = FailoverClient([pinned, groq, router, paid], clock=clock)
+    assert failure(pool).switched_to == "groq / groq-model"
+    assert ask(pool).content == "groq answers"
+    # The router would be refused for the same reason: it is not asked. A paid model is another matter.
+    assert failure(pool).switched_to == "openrouter / openai/gpt-5.5-mini"
+    assert ask(pool).content == "a paid model answers" and router.requests == []
+    assert [(item["model"], item["out"]) for item in pool.usage()] == [
+        ("baidu/ernie-5.5-flash-preview:free", "its daily limit is used up"),
+        ("groq-model", None),
+        ("openrouter/free", "its daily limit is used up"),
+        ("openai/gpt-5.5-mini", None),
+    ]
+    # Another provider's daily limit is counted per model.
+    big = provider("groq", [rate_limit("groq returned HTTP 429: tokens per day (TPD): Limit 200000", 600.0, daily=True)], model="openai/gpt-oss-120b")
+    small = provider("groq", ["the smaller model answers"], model="openai/gpt-oss-20b")
+    pool = FailoverClient([big, small], clock=clock)
+    assert failure(pool).switched_to == "groq / openai/gpt-oss-20b" and ask(pool).content == "the smaller model answers"
+
+
+def test_the_agent_asks_the_router_again_when_its_pick_was_throttled(checkout: RepoCheckout):
+    clock = Clock()
+    router = provider("openrouter", [READ, rate_limit(UPSTREAM, None), rate_limit(UPSTREAM, None), FINISH], model="openrouter/free")
+    agent, events, _waits = make_agent(checkout, FailoverClient([router], clock=clock), sleep=clock.sleep)
+    outcome = run(agent)
+    assert outcome.finished and outcome.turns == 2
+    waiting = [message for _level, message in events if message.startswith("Waiting")]
+    assert waiting == ["Waiting 4s for openrouter's rate limit"] * 2
+
+
+# --------------------------------------------------------------------------- #
+# How long a model is waited for
+# --------------------------------------------------------------------------- #
+class Timed(ScriptedLLM):
+    """Every answer takes ``seconds`` of the pool's clock."""
+
+    def __init__(self, steps, clock: Clock, seconds: float, **options: Any) -> None:
+        super().__init__(steps, **options)
+        self.clock, self.seconds = clock, seconds
+
+    def complete(self, messages, tools, *, max_output_tokens, timeout):
+        self.clock.now += self.seconds
+        return super().complete(messages, tools, max_output_tokens=max_output_tokens, timeout=timeout)
+
+
+def test_patience_with_a_model_depends_on_what_it_has_shown():
+    """Production, 2026-11-12: Gemini accepted a request and did not answer.
+    The run waited 90 of its 270 seconds for it - while another provider was
+    free to take over."""
+    clock = Clock()
+    slow = Timed(["one", "two", rate_limit(retry_after=30.0)], clock, 20.0, model="slow-model")
+    slow.provider = "openrouter"
+    other = provider("gemini", ["three"])
+    pool = FailoverClient([slow, other], clock=clock)
+    # It has not answered yet in this run, and another provider is ready.
+    assert pool.patience() == PATIENCE_UNPROVEN == 45.0
+    ask(pool)
+    # It answers, and takes 20 seconds to: three times that plus a margin is still plausible.
+    assert pool.patience() == 70.0
+    ask(pool)
+    assert failure(pool).switched_to == "gemini / gemini-model"
+    # The one in use now has shown nothing yet; the other is free again in 30 seconds.
+    # Giving up before that would only add a wait, so: until then, and a little longer.
+    assert pool.patience() == 45.0
+    clock.sleep(10)
+    assert pool.patience() == 45.0  # free in 20 s: 35 s would be enough, the 45 s stay
+    # With nobody else to turn to, waiting is all there is.
+    assert FailoverClient([provider("groq", [])], clock=clock).patience() == PATIENCE_ALONE == 90.0
+    lonely = FailoverClient(
+        [provider("groq", [LLMError("groq returned HTTP 401", kind="auth", status_code=401)]), provider("gemini", [])],
+        clock=clock,
+    )
+    failure(lonely)
+    assert lonely.provider == "gemini" and lonely.patience() == PATIENCE_ALONE
+
+
+def test_patience_never_exceeds_the_longest_wait():
+    clock = Clock()
+    slow = Timed(["one"], clock, 60.0)
+    slow.provider = "openrouter"
+    pool = FailoverClient([slow, provider("gemini", [rate_limit(retry_after=200.0)])], clock=clock)
+    ask(pool)
+    assert pool.patience() == PATIENCE_ALONE  # 3 x 60 s would be more
+
+
+def test_the_agent_waits_no_longer_than_the_pool_advises(remote: GitRemote, tmp_path):
+    remote.create("acme/demo", DEMO_FILES)
+    checkout = RepoCheckout.clone(LocalWorkspace(tmp_path / "sandbox"), clone_url=remote.clone_url("acme/demo"), branch="main")
+    timeouts: List[float] = []
+
+    class Recording(ScriptedLLM):
+        def complete(self, messages, tools, *, max_output_tokens, timeout):
+            timeouts.append(timeout)
+            return super().complete(messages, tools, max_output_tokens=max_output_tokens, timeout=timeout)
+
+    first = Recording([READ, FINISH])
+    first.provider = "openrouter"
+    pool = FailoverClient([first, provider("groq", [])])
+    agent = CodingAgent(llm=pool, checkout=checkout, emit=lambda _level, _message: None, deadline=Deadline(300), sleep=lambda _s: None)
+    assert agent.run(prompt="Look", repository="acme/demo", branch="main").finished
+    # First request: nothing is known about the model, and another one is ready.
+    assert timeouts[0] == 45.0 and 45.0 <= timeouts[1] <= 90.0
+    # A single provider is given the full time.
+    alone = Recording([READ, FINISH])
+    timeouts.clear()
+    agent = CodingAgent(llm=alone, checkout=checkout, emit=lambda _level, _message: None, deadline=Deadline(300), sleep=lambda _s: None)
+    agent.run(prompt="Look", repository="acme/demo", branch="main")
+    assert timeouts == [90.0, 90.0]

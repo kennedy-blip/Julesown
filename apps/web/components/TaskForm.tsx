@@ -17,6 +17,7 @@ import {
 import { looksLikeRepository } from '@/lib/api';
 import type { RepoSummary } from '@/lib/api';
 import type { Readiness } from '@/lib/health';
+import { providersIn } from '@/lib/providers';
 import type { ChainEntry } from '@/lib/providers';
 import { routeHref } from '@/lib/route';
 import type { Draft } from '@/lib/settings';
@@ -51,7 +52,7 @@ interface TaskFormProps {
   blockedHref?: string | null;
   repositories: RepoSummary[];
   repoCheck: RepoCheckState;
-  /** The model providers a task will use, first choice first. */
+  /** Every model a task will use, in the order they are tried (a provider once per model). */
   chain: ChainEntry[];
   readiness: Readiness;
 }
@@ -116,6 +117,8 @@ export function TaskForm({
 
   const status = READINESS[readiness];
   const first = chain[0];
+  // The providers behind the chain, each once: what the label names.
+  const providers = providersIn(chain);
   const via = repoCheck.phase === 'ok' ? (repoCheck.authMode === 'app' ? ' · via GitHub App' : repoCheck.authMode === 'token' ? ' · via token' : '') : '';
   const visibility = repoCheck.phase === 'ok' ? (repoCheck.isPrivate === null ? '' : repoCheck.isPrivate ? ' (private)' : ' (public)') : '';
 
@@ -134,7 +137,7 @@ export function TaskForm({
       aside={
         first ? (
           <>
-            {chain.length === 1 && (
+            {providers.length === 1 && (
               <a
                 href={routeHref('settings', 'models')}
                 className="hidden md:inline text-xs text-blue-400 hover:text-blue-300 whitespace-nowrap"
@@ -147,13 +150,20 @@ export function TaskForm({
             <a
               href={routeHref('settings', 'models')}
               className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md bg-slate-800/70 hover:bg-slate-800 border border-slate-700/70 text-xs text-slate-300 max-w-[220px] sm:max-w-[420px] min-w-0"
-              title={`Model providers for a task, first choice first: ${chain.map((item) => `${item.label} (${item.model})`).join(' → ')}. Click to change.`}
+              title={`Models for a task, in the order they are tried: ${chain.map((item) => `${item.label} (${item.model || 'default model'})`).join(' → ')}. Click to change.`}
               data-testid="model-label"
-              data-providers={chain.map((item) => item.id).join(',')}
+              data-providers={providers.map((item) => item.id).join(',')}
+              data-models={chain.map((item) => item.model).join(',')}
             >
               <span className="font-medium text-slate-100 flex-shrink-0">{first.label}</span>
               <span className="font-mono text-slate-400 truncate">{first.model}</span>
-              {chain.slice(1).map((item) => (
+              {/* One provider with several models: the others stand in for the first. */}
+              {providers.length === 1 && chain.length > 1 && (
+                <span className="flex-shrink-0 text-slate-500" data-testid="model-more">
+                  +{chain.length - 1}
+                </span>
+              )}
+              {providers.slice(1).map((item) => (
                 <span key={item.id} className="hidden sm:inline-flex items-center gap-1.5 flex-shrink-0 text-slate-400">
                   <ArrowRight className="w-3 h-3 text-slate-600" />
                   {item.label}

@@ -36,14 +36,31 @@ MAX_FORMAT_RETRIES = 3
 MAX_PROVIDER_SWITCHES = 6
 MAX_REPORTED_FILES = 60
 # When this little of the time budget is left, the model is asked once to wrap
-# up, so that a run which is nearly done ends with a result instead of a
-# timeout that throws its work away. The larger value applies once the
+# up: to say what is done and what is missing. What it has changed is kept
+# either way (the runner delivers it marked as unfinished), and its report is
+# what a follow-up run continues from. The larger value applies once the
 # provider's rate limit has made the run wait: the next reply may be a minute away.
 WRAP_UP_SECONDS = 40.0
 WRAP_UP_SECONDS_RATE_LIMITED = 80.0
+# Once this share of the agent's time is used it is told how much is left, so
+# that it checks what it has (build, tests) while there is time to fix it.
+# Runs shorter than TIME_CHECK_MIN_SECONDS get no such reminder.
+TIME_CHECK_SHARE = 0.5
+TIME_CHECK_MIN_SECONDS = 120.0
+TIME_UP = "The time budget ran out before the agent finished."
 INITIAL_CONTEXT_CHARS = 24_000
 MAX_CONTEXT_CHARS = 160_000
 MIN_CONTEXT_CHARS = 8_000
+# Files the agent wrote stay in the conversation word for word only while it is
+# shorter than this; beyond it the oldest large ones are replaced by an outline
+# (see ``outline_of``). Every request repeats the whole conversation, so a
+# project of thirty files would otherwise be sent thirty times over.
+SOFT_CONTEXT_CHARS = 48_000
+OUTLINE_MIN_CHARS = 1_500
+# How long one model call may take. With other providers to fall back on the
+# pool decides (see FailoverClient.patience): a provider that hangs is given up
+# on sooner than one that has been answering.
+MODEL_CALL_SECONDS = 90.0
 _TPM_LIMIT_RE = re.compile(r"Limit\s+(\d+)", re.IGNORECASE)
 
 COMMAND_ENV = {
@@ -77,6 +94,8 @@ script in package.json is npm's placeholder that only prints "Error: no test spe
 run a test command: for a code change do a quick sanity check with run_command instead (such as a \
 syntax check) and say in your summary that the project has no automated tests. A change that only \
 touches documentation needs no install, build or test run.
+- When a command you rely on fails (an install, the build, the tests), fix what it reports before \
+you do anything else: read the error, change only what it points at and run the command again.
 - Reply only by calling the provided tools; no other tools exist. Explanations belong in the \
 summary you pass to finish.
 - Do not run git commit, git push or branch commands and do not try to open a pull request: after \
@@ -104,7 +123,15 @@ files or CI workflows only if the task asks for them.
 - Always add a README.md (what the project is, how to run it locally, how to deploy it) and a \
 .gitignore that fits the stack. If the app needs environment variables, list them in .env.example \
 - never commit a real .env.
-- Paths are relative to the repository root. You can write several files in one reply.
+- Paths are relative to the repository root. You can write several files in one reply; a file \
+you wrote is on disk as you sent it, so do not read it back. Keep files lean: sample or mock data \
+a handful of entries, no filler code, no long comments - what you write costs time, and the time \
+of a run is limited.
+- With a build step (a bundler, TypeScript, a compiler) work in this order: the manifest, the \
+configuration, the .gitignore and a minimal entry point first; then install and run the build once, \
+while a mistake in the configuration is cheap to find; then the features; then the build again. When an \
+install, a build or a test fails, fix what it reports before you write anything else: change only \
+what the error points at and run the command again.
 - Check your work before you finish with run_command, using what the stack offers: install and \
 build, or a syntax check (for example node --check). If you wrote tests, run them with run_tests. \
 Say in the summary what you ran and what you could not check.
@@ -313,6 +340,16 @@ class AgentOutcome:
     verification: List[VerificationRun] = field(default_factory=list)
     # Repository files whose content the model was shown, in the order it saw them.
     files_read: List[str] = field(default_factory=list)
+    # Files the agent wrote or edited with its own tools (as opposed to what a
+    # command it ran left behind: installed dependencies, build output).
+    files_written: List[str] = field(default_factory=list)
+    # The last command that failed and was not run again with success since:
+    # ``command``, ``exit_code``, ``timed_out`` and the end of its ``output``.
+    # It is where a follow-up run picks the work up.
+    last_failure: Optional[Dict[str, Any]] = None
+    # The models that answered when the configured name is a router or an alias
+    # that chooses for each request (openrouter/free, gemini-flash-latest): name -> answers.
+    served: Dict[str, int] = field(default_factory=dict)
 
     @property
     def finished(self) -> bool:
@@ -335,15 +372,109 @@ def history_size(messages: List[Dict[str, Any]]) -> int:
     return total
 
 
-def compact_history(messages: List[Dict[str, Any]], budget: int, *, keep_recent: int = 4) -> bool:
+_OUTLINE_LINE_RE = re.compile(
+    r"^\s{0,2}(?:export\b|module\.exports\b|def\s|async\s+def\s|class\s|function\s|async\s+function\s|"
+    r"interface\s|type\s+[A-Z]|enum\s|struct\s|fn\s|func\s|pub\s|#{1,3}\s)"
+)
+_OUTLINED_MARK = "["
+# What compaction puts in the place of old file content: the outline note at
+# the start (see ``_outlined_write``) or the cut mark at the end (see
+# ``compact_history``). A model that copies its own earlier call would write
+# that note into the file, so content that carries one is refused.
+_STAND_IN_RE = re.compile(
+    r"\A\[\d+ lines, written to [^\n]{1,300} as sent\. They are not repeated here"
+    r"|\[\.\.\. \d+ characters omitted \.\.\.\]\s*\Z"
+)
+
+
+def is_stand_in(content: str) -> bool:
+    """Whether ``content`` is what the conversation keeps of an older file
+    instead of the file's content."""
+    return bool(_STAND_IN_RE.search(content))
+
+
+def outline_of(content: str, *, limit: int = 1200) -> str:
+    """What a file declares, in a few lines: its exports, functions, classes
+    and headings - enough to remember what is in it without repeating it."""
+    lines = content.splitlines()
+    picked = [line.rstrip()[:140] for line in lines if _OUTLINE_LINE_RE.match(line)]
+    if not picked:
+        picked = [line.rstrip()[:140] for line in lines[:8] if line.strip()]
+    text = "\n".join(picked[:40])
+    if len(text) > limit:
+        text = text[:limit].rsplit("\n", 1)[0] + "\n..."
+    return text
+
+
+def _outlined_write(path: str, content: str) -> str:
+    """What stands in for the content of a file the agent wrote some turns ago."""
+    count = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
+    # The model can no longer see what is in the file: before it changes the
+    # file it has to look, or it would rewrite it from this outline.
+    return (
+        f"{_OUTLINED_MARK}{count} lines, written to {path or 'the file'} as sent. They are not repeated "
+        "here to keep the conversation short: read the file with read_file before you change it. "
+        "It declares:]\n" + outline_of(content)
+    )
+
+
+def _outline_old_writes(messages: List[Dict[str, Any]], target: int, *, keep_recent: int) -> bool:
+    """Replace the content of files written a while ago by an outline, oldest
+    first, until the history is no longer than ``target`` characters.
+
+    The model's latest reply is left as it is, however many files it wrote:
+    what it does next (run the build, fix what that reports) is about them.
+    """
+    changed = False
+    latest_reply = max(
+        (index for index, message in enumerate(messages) if message.get("role") == "assistant"), default=len(messages)
+    )
+    for index in range(2, max(2, min(len(messages) - keep_recent, latest_reply))):
+        message = messages[index]
+        if message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            function = call.get("function", {})
+            raw = function.get("arguments") or ""
+            if function.get("name") != "write_file" or len(raw) <= OUTLINE_MIN_CHARS:
+                continue
+            try:
+                arguments = json.loads(raw)
+            except ValueError:
+                continue
+            content = arguments.get("content") if isinstance(arguments, dict) else None
+            if not isinstance(content, str) or len(content) <= OUTLINE_MIN_CHARS:
+                continue
+            arguments["content"] = _outlined_write(str(arguments.get("path") or ""), content)
+            function["arguments"] = json.dumps(arguments)
+            # Provider-native blocks (Anthropic's content, Gemini's parts)
+            # would no longer match the shortened call.
+            for key in [key for key in message if key.startswith("_")]:
+                message.pop(key, None)
+            changed = True
+        if history_size(messages) <= target:
+            break
+    return changed
+
+
+def compact_history(
+    messages: List[Dict[str, Any]], budget: int, *, keep_recent: int = 4, soft_budget: Optional[int] = None
+) -> bool:
     """Shrink old tool traffic until the history fits ``budget`` characters.
 
+    Above ``soft_budget`` (if given) the files the agent wrote a while ago are
+    reduced to an outline: the model wrote them, the sandbox has them, and
+    every further request would otherwise carry them again. Above ``budget``
+    old tool output and what is left of large arguments is cut as well.
     The system prompt, the task and the most recent messages are never touched.
     Returns True if anything was shortened.
     """
-    if history_size(messages) <= budget:
-        return False
     changed = False
+    target = min(budget, soft_budget) if soft_budget else budget
+    if history_size(messages) > target:
+        changed = _outline_old_writes(messages, target, keep_recent=keep_recent)
+    if history_size(messages) <= budget:
+        return changed
     for index in range(2, max(2, len(messages) - keep_recent)):
         message = messages[index]
         if message.get("role") == "tool":
@@ -504,6 +635,7 @@ class CodingAgent:
         self.verification: List[VerificationRun] = []
         # What the model has looked at. It decides whether a write is "blind".
         self.files_read: List[str] = []
+        self.files_written: set = set()
         self._known_content: set[str] = set()  # files whose current content the model has seen
         self._inspections = 0  # read_file / search_code / run_command calls so far
         self._blind_write_refused = False
@@ -512,7 +644,16 @@ class CodingAgent:
         self._finish_questioned = False
         self._gaps_questioned = False  # a new project was sent back once for what it lacks
         self._wrap_up_sent = False  # the model was told that time is nearly up
+        self._time_check_sent = False  # ... and, earlier, how much time is left
+        self._agent_seconds = 0.0  # the time the agent had when it started
         self._rate_limited = False  # the provider's rate limit has made this run wait
+        # Commands that failed, by command line, with their position among the
+        # commands run: a failure counts until the same command passes.
+        self._commands_run = 0
+        self._failed_commands: Dict[str, tuple[int, Dict[str, Any]]] = {}
+        self._last_command_failed = False
+        self._answering_model = ""  # the model that answered last, when a router chose it
+        self._served: Dict[str, int] = {}  # every model a router chose, with how often it answered
 
     # ------------------------------------------------------------------ #
     # Budgets
@@ -541,7 +682,10 @@ class CodingAgent:
 
     @property
     def _has_fallback(self) -> bool:
-        return len(getattr(self.llm, "chain", None) or ()) > 1
+        """Whether a second provider is configured (a provider's own second
+        model is no help when the key, the account or the service is the problem)."""
+        chain = getattr(self.llm, "chain", None) or ()
+        return len({str(label).split(" / ", 1)[0] for label in chain}) > 1
 
     def _recompute_budgets(self) -> None:
         """Size the context window (characters) and reply length (tokens).
@@ -686,9 +830,20 @@ class CodingAgent:
         content = args.get("content")
         if not isinstance(content, str):
             raise ToolError("content must be a string")
+        if is_stand_in(content):
+            if relative not in self._known_content:
+                self._unwritten.add(relative)  # it is still to be written
+            raise ToolError(
+                f"{relative} was not written: what you sent is not the content of a file but the note "
+                "that stands in for one in this conversation. Older file contents are shortened here to "
+                "save space; the files themselves are complete on disk. Send the whole content of the "
+                "file - or, if it is on disk already as it should be, leave it alone.",
+                log=f"write_file {relative} held back: the content was the conversation's shortened copy, not a file",
+            )
         self._check_blind_write(absolute, relative)
         self.workspace.write_file(absolute, content)
         self._known_content.add(relative)
+        self.files_written.add(relative)
         self._unwritten.discard(relative)
         line_count = content.count("\n") + (0 if content.endswith("\n") or not content else 1)
         self.emit("edit", f"write_file {relative} ({line_count} lines)")
@@ -839,6 +994,12 @@ class CodingAgent:
             raise ToolError("old_text is required")
         if not isinstance(new_text, str):
             raise ToolError("new_text must be a string")
+        if is_stand_in(new_text):
+            raise ToolError(
+                f"{relative} was not changed: new_text ends with the mark this conversation puts where "
+                "older text was cut to save space - it is not the text itself. Send the complete new text.",
+                log=f"replace_in_file {relative} held back: new_text was the conversation's shortened copy",
+            )
         try:
             current = self.workspace.read_file(absolute)
         except FileNotFoundError:
@@ -865,6 +1026,7 @@ class CodingAgent:
             )
         self.workspace.write_file(absolute, current.replace(old_text, new_text, 1))
         self._known_content.add(relative)
+        self.files_written.add(relative)
         self._unwritten.discard(relative)
         self.emit("edit", f"replace_in_file {relative}")
         return f"Updated {relative}."
@@ -921,7 +1083,30 @@ class CodingAgent:
                     no_tests=nothing_to_test,
                 )
             )
+        self._commands_run += 1
+        self._last_command_failed = bool(result.timed_out or (result.exit_code != 0 and not nothing_to_test))
+        if self._last_command_failed:
+            self._failed_commands[command.strip()] = (
+                self._commands_run,
+                {
+                    "command": command.strip(),
+                    "exit_code": result.exit_code,
+                    "timed_out": bool(result.timed_out),
+                    "output": clip(output, 1500),
+                },
+            )
+        else:
+            self._failed_commands.pop(command.strip(), None)
         return f"{status}\n{clip(output, self._result_limit) or '(no output)'}{note}"
+
+    def _unresolved_failure(self) -> Optional[Dict[str, Any]]:
+        """The most recent command that failed and has not passed since, if it
+        is one of the last few commands (an old failure the agent has moved on
+        from says little about where the work stands)."""
+        if not self._failed_commands:
+            return None
+        position, record = max(self._failed_commands.values(), key=lambda item: item[0])
+        return dict(record) if self._commands_run - position <= 3 else None
 
     def _execute(self, call: ToolCall) -> str:
         if call.error:
@@ -992,12 +1177,16 @@ class CodingAgent:
             if time_left <= 5.0:
                 raise LLMError("The time budget ran out while waiting for the model.", kind="timeout")
             self._recompute_budgets()  # sized for the provider that answers this request
+            # With fallbacks the pool says how long the provider in use is
+            # worth waiting for; alone, it gets the full time.
+            patience = getattr(self.llm, "patience", None)
+            allowed = patience() if callable(patience) else MODEL_CALL_SECONDS
             try:
                 return self.llm.complete(
                     messages + [correction] if correction else messages,
                     AGENT_TOOLS,
                     max_output_tokens=self.max_output_tokens,
-                    timeout=min(90.0, time_left),
+                    timeout=min(MODEL_CALL_SECONDS, max(10.0, float(allowed)), time_left),
                 )
             except LLMError as exc:
                 if exc.switched_to and switches < MAX_PROVIDER_SWITCHES:
@@ -1008,7 +1197,7 @@ class CodingAgent:
                     correction = None  # it was about a reply the new model never wrote
                     format_retries = transient_retries = 0
                     self._recompute_budgets()
-                    compact_history(messages, self.context_budget)
+                    compact_history(messages, self.context_budget, soft_budget=SOFT_CONTEXT_CHARS)
                     continue
                 # With one provider there is nothing to fall back on: say how to change that.
                 alone = not self._has_fallback
@@ -1128,14 +1317,16 @@ class CodingAgent:
             if self.new_project:
                 where += " - it has no code yet."
         task = f"{where}\n\nTask:\n{prompt.strip()}\n"
+        self._agent_seconds = max(self._time_left(), 0.0)
         if self.new_project:
-            # A project is easy to make too big for one run. Whatever is not
-            # finished when the time is up is lost, so the model is told how
-            # much time there is.
-            minutes = max(1, int(round(max(self._time_left(), 0.0) / 60.0)))
+            # A project is easy to make too big for one run, so the model is
+            # told how much time there is - and that running out of it does not
+            # lose the work: getting something small to build comes first.
+            minutes = max(1, int(round(self._agent_seconds / 60.0)))
             task += (
-                f"\nTime budget: about {minutes} minute{'s' if minutes != 1 else ''} for the whole task, "
-                "including installs and builds. Plan a small, complete first version.\n"
+                f"\nTime budget: about {minutes} minute{'s' if minutes != 1 else ''} for this run, "
+                "including installs and builds. Get a small version working first, then extend it. "
+                "If the time runs out, what you have is kept and a follow-up run continues from it.\n"
             )
         if file_listing:
             task += f"\n{file_listing}\n"
@@ -1175,31 +1366,62 @@ class CodingAgent:
                 model=self.llm.model,
                 verification=list(self.verification),
                 files_read=list(self.files_read),
+                files_written=sorted(self.files_written),
+                last_failure=self._unresolved_failure(),
+                served=dict(self._served),
                 **extra,
             )
 
         while turn < self.max_turns:
             if self._time_left() <= 5.0:
-                return outcome("timeout", error="The time budget ran out before the agent finished.")
+                return outcome("timeout", error=TIME_UP)
             wrap_up_at = WRAP_UP_SECONDS_RATE_LIMITED if self._rate_limited else WRAP_UP_SECONDS
             if turn >= 1 and not self._wrap_up_sent and self._time_left() <= wrap_up_at:
-                # Work that is not finished when the time is up is thrown away.
-                # One more reply still fits: better a result that says what is
-                # missing than no result.
+                # One more reply still fits. What the agent has changed is kept
+                # whatever it answers; its account of what is done and what is
+                # missing is what a follow-up run starts from.
                 self._wrap_up_sent = True
                 self.emit("info", "The time budget is nearly used up: the agent was asked to wrap up")
                 messages.append(
                     {
                         "role": "user",
                         "content": (
-                            "Time is almost up: there is room for one more reply. Call finish now. If "
-                            "what you have done is usable as it is, summarise it and say plainly what "
-                            "is missing or unchecked. If it is not usable, call finish with success=false."
+                            "Time is almost up for this run: there is room for one more reply. Start "
+                            "nothing new and call finish now, with a title for the work (pr_title). In "
+                            "the summary say what is done, what is still missing or unchecked and - if "
+                            "a command failed last - what it reported. Your work is kept as it is and a "
+                            "follow-up run continues from your summary. Pass success=false if the work "
+                            "is not complete or the last build or test run failed."
+                        ),
+                    }
+                )
+            elif (
+                turn >= 1
+                and not self._time_check_sent
+                and not self._wrap_up_sent
+                and self._agent_seconds >= TIME_CHECK_MIN_SECONDS
+                and self._time_left() <= self._agent_seconds * (1.0 - TIME_CHECK_SHARE)
+            ):
+                # Models do not feel time pass. Told once how much is left, they
+                # can check what they have while there is still time to fix it.
+                self._time_check_sent = True
+                left = int(max(self._time_left() - wrap_up_at, 10.0) // 10 * 10)
+                self.emit("info", f"About {left}s of working time are left: the agent was told to check its work")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Time check: about {left} seconds of working time are left in this run. Get "
+                            "what you have into a state that builds or runs, and check it now with the "
+                            "project's build or test command (a change to documentation alone needs no "
+                            "such check). Fix what that reports before you add anything else. A smaller "
+                            "result that works beats a larger one that does not; whatever is still "
+                            "missing at the end is continued in a follow-up run."
                         ),
                     }
                 )
             turn += 1
-            compact_history(messages, self.context_budget)
+            compact_history(messages, self.context_budget, soft_budget=SOFT_CONTEXT_CHARS)
             try:
                 response = self._complete(messages)
             except LLMError as exc:
@@ -1207,6 +1429,13 @@ class CodingAgent:
                     return outcome("timeout", error=exc.message)
                 return outcome("llm_error", error=exc.message)
             self._apply_token_limit(response.tokens_per_minute_limit, response.provider)
+            answering = str(response.model or "")
+            if answering and answering != self.llm.model:
+                # A router (openrouter/free) or an alias (gemini-flash-latest) chose the model.
+                self._served[answering] = self._served.get(answering, 0) + 1
+                if answering != self._answering_model:
+                    self._answering_model = answering
+                    self.emit("info", f"{response.provider or self.llm.provider} answered with {answering}")
             if response.recovered:
                 # The provider had refused the reply over its form (a prefixed
                 # tool name, a line break inside JSON); what it meant was clear.
@@ -1270,12 +1499,17 @@ class CodingAgent:
                     succeeded = call.arguments.get("success", True)
                     if isinstance(succeeded, str):
                         succeeded = succeeded.strip().lower() not in ("false", "0", "no")
+                    if self._wrap_up_sent:
+                        # Asked to stop because time is nearly up. If it says the
+                        # work is not complete - or the last command it ran failed,
+                        # whatever it says - the run was cut short: its work is
+                        # kept as unfinished. Otherwise it made it; sending it
+                        # back now would turn a result into a timeout.
+                        if succeeded is False or self._last_command_failed:
+                            return outcome("timeout", summary=summary, pr_title=title, error=TIME_UP)
+                        return outcome("finished", summary=summary, pr_title=title)
                     if succeeded is False:
                         return outcome("gave_up", summary=summary, error=summary or "The agent gave up.")
-                    if self._wrap_up_sent:
-                        # Asked to stop because time is nearly up: sending it back
-                        # now would turn a result into a timeout.
-                        return outcome("finished", summary=summary, pr_title=title)
                     gaps = self._new_project_gaps() if self.new_project and not self._gaps_questioned else []
                     if gaps:
                         self._gaps_questioned = True

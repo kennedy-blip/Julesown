@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List
 import httpx
 import pytest
 
-from apps.api.config import DEFAULT_GEMINI_MODEL, DEFAULT_OPENROUTER_MODEL, get_settings
+from apps.api.config import DEFAULT_GEMINI_MODEL, DEFAULT_OPENROUTER_MODEL, get_settings, split_models
 from apps.api.services.llm import (
     GEMINI_FOREIGN_CALL_SIGNATURE,
     FailoverClient,
@@ -350,7 +350,9 @@ def test_openrouter_request(monkeypatch):
     request, body = recorder.requests[0], recorder.bodies[0]
     assert str(request.url) == "https://openrouter.ai/api/v1/chat/completions"
     assert request.headers["authorization"] == "Bearer sk-or-test" and request.headers["x-title"] == "Jules Clone"
-    assert body["model"] == DEFAULT_OPENROUTER_MODEL == "baidu/ernie-5.5-flash-preview:free"
+    # Asked of OpenRouter's free-models router; the answer names the model it picked.
+    assert body["model"] == DEFAULT_OPENROUTER_MODEL == "openrouter/free"
+    assert response.model == "baidu/ernie-5.5-flash-preview:free"
     assert body["max_tokens"] == 900 and "max_completion_tokens" not in body
     assert body["tool_choice"] == "auto" and body["temperature"] == 0.2 and body["reasoning_effort"] == "low"
     assert response.provider == "openrouter" and response.tool_calls[0].name == "read_file"
@@ -550,25 +552,54 @@ def test_prefixed_tool_names_in_an_accepted_reply_are_understood():
 # --------------------------------------------------------------------------- #
 def test_every_configured_provider_joins_the_chain(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "gsk")
+    # One provider is a chain already: its model, and the one that stands in for it.
+    alone = create_llm_client(get_settings())
+    assert isinstance(alone, FailoverClient)
+    assert alone.chain == ["groq / openai/gpt-oss-120b", "groq / openai/gpt-oss-20b"]
+    # A model that is named is the only one used.
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-120b")
     single = create_llm_client(get_settings())
-    assert isinstance(single, OpenAICompatibleClient) and single.provider == "groq"
+    assert isinstance(single, OpenAICompatibleClient) and (single.provider, single.model) == ("groq", "openai/gpt-oss-120b")
+    monkeypatch.delenv("GROQ_MODEL")
 
     monkeypatch.setenv("GEMINI_API_KEY", "AQ.key")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
     pool = create_llm_client(get_settings())
     assert isinstance(pool, FailoverClient)
-    assert pool.chain == ["groq / openai/gpt-oss-120b", f"gemini / {DEFAULT_GEMINI_MODEL}", f"openrouter / {DEFAULT_OPENROUTER_MODEL}"]
+    # Every provider's first model comes before anybody's stand-in.
+    assert pool.chain == [
+        "groq / openai/gpt-oss-120b",
+        f"gemini / {DEFAULT_GEMINI_MODEL}",
+        "openrouter / openrouter/free",
+        "groq / openai/gpt-oss-20b",
+        "gemini / gemini-3.5-flash-lite",
+    ]
     assert (pool.provider, pool.model, pool.model_env_var) == ("groq", "openai/gpt-oss-120b", "GROQ_MODEL")
 
     monkeypatch.setenv("JULES_LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_MODEL", "gemini-4-argon")
-    assert create_llm_client(get_settings()).chain[:2] == ["gemini / gemini-4-argon", "groq / openai/gpt-oss-120b"]
+    assert create_llm_client(get_settings()).chain == [
+        "gemini / gemini-4-argon",
+        "groq / openai/gpt-oss-120b",
+        "openrouter / openrouter/free",
+        "groq / openai/gpt-oss-20b",
+    ]
     monkeypatch.setenv("JULES_LLM_FALLBACK", "false")
     assert isinstance(create_llm_client(get_settings()), GeminiClient)
     monkeypatch.delenv("JULES_LLM_PROVIDER")
     monkeypatch.delenv("JULES_LLM_FALLBACK")
     monkeypatch.setenv("JULES_LLM_ORDER", "openrouter,gemini")
-    assert [label.split(" / ")[0] for label in create_llm_client(get_settings()).chain] == ["openrouter", "gemini", "groq"]
+    assert [label.split(" / ")[0] for label in create_llm_client(get_settings()).chain] == ["openrouter", "gemini", "groq", "groq"]
+    # Several models for OpenRouter as well: each is an entry of its own.
+    monkeypatch.setenv("OPENROUTER_MODEL", "baidu/ernie-5.5-flash-preview:free, openrouter/free")
+    assert create_llm_client(get_settings()).chain == [
+        "openrouter / baidu/ernie-5.5-flash-preview:free",
+        "gemini / gemini-4-argon",
+        "groq / openai/gpt-oss-120b",
+        "openrouter / openrouter/free",
+        "groq / openai/gpt-oss-20b",
+    ]
+    monkeypatch.delenv("OPENROUTER_MODEL")
     # The order covers every provider, with or without a key: what the dashboard is told.
     assert get_settings().llm_preference == ["openrouter", "gemini", "groq", "openai", "anthropic"]
 
@@ -589,7 +620,9 @@ def test_keys_of_one_request_are_used_for_that_request_only(monkeypatch):
         primary="gemini",
     )
     assert mine.llm_chain == ["gemini", "groq"] and mine.gemini_api_key == "AQ.browser"
-    assert mine.gemini_model == "gemini-4-argon" and mine.openrouter_model == DEFAULT_OPENROUTER_MODEL
+    # A model named with the request is the one used; a name that cannot be one changes nothing.
+    assert mine.models_for("gemini") == ["gemini-4-argon"]
+    assert mine.models_for("openrouter") == ["openrouter/free"]
     assert mine.groq_api_key == "gsk-server"  # an empty value does not erase the server's key
     assert base.llm_chain == ["groq"] and base.gemini_api_key is None  # the server's own settings are untouched
     # Preferring a provider that has no key changes nothing: a preference is not a requirement.
@@ -635,9 +668,49 @@ def test_probe_reports_a_working_key(monkeypatch):
     result = probe_provider(settings, "gemini", transport=probe_transport(handler))
     assert result["ok"] is True and result["tool_call"] is True and result["kind"] is None
     assert result["provider"] == "gemini" and result["model"] == "gemini-flash-latest" and result["latency_ms"] >= 0
-    assert result["message"] == "Google Gemini accepted the key and gemini-flash-latest called the test tool."
+    # An alias answers with the model that is behind it at the moment.
+    assert result["message"] == (
+        "Google Gemini accepted the key and gemini-flash-latest (answered by gemini-3.8-flash) called the test tool."
+    )
+    assert result["answered_by"] == "gemini-3.8-flash"
     # The same kind of request the agent makes: with a tool to call.
     assert seen[0]["tools"][0]["functionDeclarations"][0]["name"] == "confirm"
+    # Every model the provider is given was tried: a task may end up on any of them.
+    assert [item["model"] for item in result["models"]] == ["gemini-flash-latest", "gemini-3.5-flash-lite"]
+    assert all(item["ok"] and item["tool_call"] for item in result["models"]) and len(seen) == 2
+
+
+def test_probe_tries_every_model_and_says_which_one_fails(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if body["model"] == "gone:free":
+            return httpx.Response(404, json={"error": {"code": 404, "message": "No endpoints found for gone:free."}})
+        answer = chat_completion("upstage/solar-pro-3:free", tool_calls=[{"id": "c", "type": "function", "function": {"name": "confirm", "arguments": "{}"}}])
+        return httpx.Response(200, json=answer)
+
+    settings = get_settings().with_overrides(api_keys={"openrouter": "sk-or-browser"}, models={"openrouter": "gone:free, openrouter/free"})
+    result = probe_provider(settings, "openrouter", transport=probe_transport(handler))
+    # The result is about the first model; the list says what each one did.
+    assert result["ok"] is False and result["kind"] == "model_unavailable" and result["model"] == "gone:free"
+    first, second = result["models"]
+    assert (first["model"], first["ok"], first["kind"]) == ("gone:free", False, "model_unavailable")
+    assert (second["model"], second["ok"], second["tool_call"]) == ("openrouter/free", True, True)
+    # The router answers with a model of its choice.
+    assert second["answered_by"] == "upstage/solar-pro-3:free"
+    assert second["message"] == "OpenRouter accepted the key and openrouter/free (answered by upstage/solar-pro-3:free) called the test tool."
+
+
+def test_probe_stops_at_a_rejected_key(monkeypatch):
+    calls: List[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return gemini_error(400, "INVALID_ARGUMENT", "API key not valid. Please pass a valid API key.")
+
+    settings = get_settings().with_overrides(api_keys={"gemini": "AQ.wrong"})
+    result = probe_provider(settings, "gemini", transport=probe_transport(handler))
+    # The other model would say the same about the key: it is not asked.
+    assert result["kind"] == "auth" and len(result["models"]) == 1 and len(calls) == 1
 
 
 def test_probe_describes_what_is_wrong(monkeypatch):
@@ -656,3 +729,103 @@ def test_probe_describes_what_is_wrong(monkeypatch):
 
     assert probe_provider(settings, "groq")["kind"] == "no_key"
     assert probe_provider(settings, "skynet")["kind"] == "unknown_provider"
+
+
+# --------------------------------------------------------------------------- #
+# Several models per provider
+# --------------------------------------------------------------------------- #
+def test_a_model_setting_can_name_several_models():
+    assert split_models("openai/gpt-oss-120b") == ["openai/gpt-oss-120b"]
+    assert split_models(" a:free , openrouter/free;b\nc ") == ["a:free", "openrouter/free", "b", "c"]
+    # Not names, repeats and more than a provider may have are dropped.
+    assert split_models("a, not a name, a, <script>, b") == ["a", "b"]
+    assert split_models("a,b,c,d,e,f") == ["a", "b", "c", "d"]
+    assert split_models(["a", 3, None, "b"]) == ["a", "b"] and split_models(None) == [] and split_models("") == []
+
+
+def test_defaults_give_every_provider_a_model_that_stands_in(monkeypatch):
+    settings = get_settings()
+    assert settings.models_for("groq") == ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+    # Google's alias for its current Flash model, then the lighter one.
+    assert settings.models_for("gemini") == ["gemini-flash-latest", "gemini-3.5-flash-lite"]
+    # OpenRouter's router over whatever free model is available: a pool by itself.
+    assert settings.models_for("openrouter") == ["openrouter/free"]
+    assert settings.model_for("openrouter") == DEFAULT_OPENROUTER_MODEL and settings.model_for("nobody") is None
+    # Nothing that is used unasked is a version Google has announced the end of.
+    assert not any("2.5" in model or "2.0" in model for model in settings.models_for("gemini"))
+    # What is configured replaces the list - one model or several.
+    monkeypatch.setenv("OPENROUTER_MODEL", "baidu/ernie-5.5-flash-preview:free,openrouter/free")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash, gemini-3.6-flash ,gemini-3.5-flash-lite")
+    settings = get_settings()
+    assert settings.models_for("openrouter") == ["baidu/ernie-5.5-flash-preview:free", "openrouter/free"]
+    assert settings.models_for("gemini") == ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    # A setting nothing can be made of falls back to the defaults.
+    monkeypatch.setenv("GEMINI_MODEL", "not a model")
+    assert get_settings().models_for("gemini") == ["gemini-flash-latest", "gemini-3.5-flash-lite"]
+
+
+def test_the_order_in_which_models_are_tried(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk")
+    monkeypatch.setenv("GEMINI_API_KEY", "AQ.key")
+    monkeypatch.setenv("JULES_LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    settings = get_settings()
+    # The providers of the run of 2026-11-12, in its order: the router instead of
+    # one free model, and what stands in behind Groq's and Gemini's models.
+    assert settings.llm_chain == ["openrouter", "groq", "gemini"]
+    assert settings.llm_slots == [
+        ("openrouter", "openrouter/free"),
+        ("groq", "openai/gpt-oss-120b"),
+        ("gemini", "gemini-flash-latest"),
+        ("gemini", "gemini-3.5-flash-lite"),
+    ]
+    # Without fallback there is one provider and one model.
+    assert settings.with_overrides(fallback=False).llm_slots == [("openrouter", "openrouter/free")]
+    # The browser's own list for a provider replaces the server's.
+    mine = settings.with_overrides(
+        models={"openrouter": "baidu/ernie-5.5-flash-preview:free, openrouter/free", "gemini": "gemini-3.8-flash,gemini-3.6-flash"}
+    )
+    assert mine.llm_slots == [
+        ("openrouter", "baidu/ernie-5.5-flash-preview:free"),
+        ("groq", "openai/gpt-oss-120b"),
+        ("gemini", "gemini-3.8-flash"),
+        ("openrouter", "openrouter/free"),
+        ("gemini", "gemini-3.6-flash"),
+    ]
+    assert get_settings().with_overrides(api_keys={}).llm_slots == settings.llm_slots
+    monkeypatch.delenv("OPENROUTER_API_KEY")
+    monkeypatch.delenv("GROQ_API_KEY")
+    monkeypatch.delenv("GEMINI_API_KEY")
+    assert get_settings().llm_slots == []
+
+
+def test_each_model_of_a_provider_gets_its_own_client(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    monkeypatch.setenv("OPENROUTER_MODEL", "baidu/ernie-5.5-flash-preview:free, openrouter/free")
+    models: List[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        models.append(body["model"])
+        if body["model"] != "openrouter/free":
+            return httpx.Response(429, json={"error": {"code": 429, "message": "Provider returned error", "metadata": {"raw": "baidu/ernie-5.5-flash-preview:free is temporarily rate-limited upstream."}}})
+        return httpx.Response(200, json=chat_completion("google/gemma-4-31b-it:free", content="hello"))
+
+    pool = create_llm_client(get_settings(), transport=httpx.MockTransport(handler))
+    assert pool.chain == ["openrouter / baidu/ernie-5.5-flash-preview:free", "openrouter / openrouter/free"]
+    with pytest.raises(LLMError) as caught:
+        pool.complete([{"role": "user", "content": "hi"}], [], max_output_tokens=64, timeout=5)
+    # The model is limited upstream; OpenRouter's free router is asked instead, at once.
+    assert caught.value.kind == "rate_limit" and caught.value.switched_to == "openrouter / openrouter/free"
+    answer = pool.complete([{"role": "user", "content": "hi"}], [], max_output_tokens=64, timeout=5)
+    assert answer.content == "hello" and answer.model == "google/gemma-4-31b-it:free"
+    assert models == ["baidu/ernie-5.5-flash-preview:free", "openrouter/free"]
+    assert pool.usage()[1]["served"] == {"google/gemma-4-31b-it:free": 1}
+
+
+def test_openrouter_alone_is_its_router(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    client = create_llm_client(get_settings())
+    # One entry: the router is a pool of models by itself.
+    assert isinstance(client, OpenAICompatibleClient) and (client.provider, client.model) == ("openrouter", "openrouter/free")

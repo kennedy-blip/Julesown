@@ -15,10 +15,20 @@ from apps.api.services.agent import (
     CodingAgent,
     compact_history,
     history_size,
+    is_stand_in,
+    outline_of,
 )
 from apps.api.services.common import Deadline, Redactor, clip, plain_text
 from apps.api.services.llm import LLMError, LLMResponse, ToolCall
-from apps.api.services.sandbox import KEY_FILE_BYTES, KEY_FILES_TOTAL_BYTES, README_BYTES, RepoCheckout, SandboxError
+from apps.api.services.sandbox import (
+    KEY_FILE_BYTES,
+    KEY_FILES_TOTAL_BYTES,
+    README_BYTES,
+    RepoCheckout,
+    SandboxError,
+    _in_batches,
+    build_output_root,
+)
 
 from .conftest import CHECK_ADD, DEMO_FILES
 from .support import GitRemote, LocalWorkspace, ScriptedLLM, git
@@ -151,6 +161,166 @@ def test_oversized_change_is_refused(checkout: RepoCheckout):
     with pytest.raises(SandboxError) as caught:
         checkout.collect_changes()
     assert "huge.bin" in str(caught.value)
+
+
+def test_salvaging_leaves_out_what_cannot_be_committed_instead_of_failing(checkout: RepoCheckout):
+    """A run that was stopped cannot tidy up any more. One bundle that is too
+    large must not cost everything else it did."""
+    root = Path(checkout.directory)
+    (root / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (root / "package.json").write_text('{"name": "demo", "scripts": {"build": "vite build"}}\n')
+    (root / "src").mkdir()
+    (root / "src" / "app.js").write_text("export const app = 1;\n")
+    (root / "huge.bin").write_bytes(b"0" * 1_200_000)
+    (root / "dist" / "assets").mkdir(parents=True)
+    (root / "dist" / "index.html").write_text("<!doctype html>\n")
+    (root / "dist" / "assets" / "index-abc.js").write_text("console.log(1);\n")
+    (root / "tsconfig.tsbuildinfo").write_text("{}\n")
+    with pytest.raises(SandboxError):
+        checkout.collect_changes()
+
+    changeset = checkout.collect_changes(salvage=True)
+    assert sorted(change.path for change in changeset.changes) == ["calc.py", "package.json", "src/app.js"]
+    assert changeset.left_out == [
+        "dist/ (build output, 2 files)",
+        "huge.bin (1,200 kB, too large to commit)",
+        "tsconfig.tsbuildinfo (build output)",
+    ]
+    # The tree that will be committed is the tree the commit is checked against: without them.
+    in_tree = git(root, "ls-tree", "-r", "--name-only", changeset.tree_sha).splitlines()
+    assert "src/app.js" in in_tree and "calc.py" in in_tree
+    assert not any(path.startswith("dist/") or path in ("huge.bin", "tsconfig.tsbuildinfo") for path in in_tree)
+    # Nothing was deleted from the work tree: only the commit goes without them.
+    assert (root / "huge.bin").exists() and (root / "dist" / "index.html").exists()
+    # A file the agent wrote itself is its work wherever it lies: only what a command left there is output.
+    own = checkout.collect_changes(salvage=True, written=["dist/index.html", "src/app.js"])
+    assert sorted(change.path for change in own.changes) == ["calc.py", "dist/index.html", "package.json", "src/app.js"]
+    assert "dist/ (build output, 1 file)" in own.left_out and len(own.left_out) == 3
+    in_tree = git(root, "ls-tree", "-r", "--name-only", own.tree_sha).splitlines()
+    assert "dist/index.html" in in_tree and "dist/assets/index-abc.js" not in in_tree
+
+
+def test_salvaging_keeps_a_build_directory_the_repository_tracks(remote: GitRemote, tmp_path):
+    """Some repositories commit their dist/ (a GitHub Action, a published
+    bundle). There a new file in it is part of the work."""
+    kept = checkout_of(
+        remote,
+        tmp_path,
+        {"package.json": "{}\n", "dist/index.js": "module.exports = 1;\n", "README.md": "# Action\n", "big.txt": "small\n"},
+    )
+    root = Path(kept.directory)
+    (root / "dist" / "extra.js").write_text("module.exports = 2;\n")
+    (root / "coverage").mkdir()
+    (root / "coverage" / "lcov.info").write_text("TN:\n")
+    (root / "big.txt").write_bytes(b"x" * 1_300_000)  # a file of the repository that became too large
+    (root / "README.md").write_text("# Action\n\nMore.\n")
+    changeset = kept.collect_changes(salvage=True)
+    assert sorted(change.path for change in changeset.changes) == ["README.md", "dist/extra.js"]
+    assert changeset.left_out == ["big.txt (1,300 kB, too large to commit)", "coverage/ (build output, 1 file)"]
+    # big.txt stays in the commit as it was in the repository.
+    assert git(root, "cat-file", "-p", f"{changeset.tree_sha}:big.txt") == "small"
+
+
+def test_salvaging_takes_paths_literally_and_copes_with_many_files(checkout: RepoCheckout):
+    """Brackets are common in the paths of web projects (app/[id]/page.js): to
+    git they are a pattern, one that also matches other files. And a build can
+    leave thousands of files."""
+    root = Path(checkout.directory)
+    (root / "app" / "[Id]").mkdir(parents=True)
+    (root / "app" / "[Id]" / "page.js").write_text("export default 1;\n")
+    (root / "app" / "[Id]" / "data.bin").write_bytes(b"1" * 1_100_000)
+    (root / "app" / "I").mkdir()
+    (root / "app" / "I" / "data.bin").write_text("what the pattern app/[Id]/data.bin matches as well\n")
+    (root / "packages" / "[web]" / "build" / "static").mkdir(parents=True)
+    (root / "packages" / "[web]" / "package.json").write_text("{}\n")
+    for index in range(1200):
+        name = f"chunk-{index:04d}-0123456789abcdef0123456789abcdef.js"
+        (root / "packages" / "[web]" / "build" / "static" / name).write_text(f"// {index}\n")
+    changeset = checkout.collect_changes(salvage=True)
+    assert sorted(change.path for change in changeset.changes) == [
+        "app/I/data.bin",
+        "app/[Id]/page.js",
+        "packages/[web]/package.json",
+    ]
+    assert changeset.left_out == [
+        "app/[Id]/data.bin (1,100 kB, too large to commit)",
+        "packages/[web]/build/ (build output, 1200 files)",
+    ]
+    in_tree = git(root, "ls-tree", "-r", "--name-only", changeset.tree_sha).splitlines()
+    assert "app/[Id]/page.js" in in_tree and "app/I/data.bin" in in_tree
+    assert "app/[Id]/data.bin" not in in_tree and not any(path.startswith("packages/[web]/build/") for path in in_tree)
+
+
+def test_shell_arguments_are_split_before_a_command_line_grows_too_long():
+    shas = [f"{index:040x}" for index in range(5000)]
+    batches = _in_batches(shas)
+    assert [sha for batch in batches for sha in batch] == shas and len(batches) > 1
+    assert all(sum(len(sha) + 3 for sha in batch) <= 40_000 for batch in batches)
+    assert _in_batches([]) == [] and _in_batches(["x" * 90_000, "y"]) == [["x" * 90_000], ["y"]]
+
+
+def test_where_build_output_may_lie():
+    assert build_output_root("dist/assets/index.js") == "dist"
+    assert build_output_root("packages/app/build/static/js/main.js") == "packages/app/build"
+    assert build_output_root("target/debug/app") == "target" and build_output_root("coverage/lcov.info") == "coverage"
+    assert build_output_root("apps/web/.turbo/cache/a.log") == "apps/web/.turbo"
+    # A file is not a directory, and source directories are not output.
+    for path in ("dist", "build.gradle", "src/build.ts", "src/app.js", "public/index.html", "bin/run", "docs/out.md"):
+        assert build_output_root(path) is None
+
+
+def test_a_directory_is_build_output_only_next_to_a_manifest(remote: GitRemote, tmp_path):
+    """"build", "out", "target" and "coverage" are ordinary names as well: a
+    folder of that name is taken for output only where a build would put it."""
+    mono = checkout_of(
+        remote,
+        tmp_path,
+        {"README.md": "# Mono\n", "packages/api/pyproject.toml": "[project]\nname = 'api'\n", "src/policy.py": "x = 1\n"},
+    )
+    root = Path(mono.directory)
+    for path in (
+        "src/coverage/rules.py",  # a module of an insurance application, moved here by a command
+        "docs/out/notes.md",
+        "packages/api/build/lib/api.py",  # beside the pyproject.toml of the repository
+        "packages/web/package.json",  # a manifest this run created ...
+        "packages/web/dist/index.js",  # ... and what its build left beside it
+        "packages/web/src/target/a.js",
+        "tools/.cache/blob",  # a tool's cache needs no manifest to be recognised
+    ):
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+        (root / path).write_text("content\n")
+    changeset = mono.collect_changes(salvage=True)
+    assert sorted(change.path for change in changeset.changes) == [
+        "docs/out/notes.md",
+        "packages/web/package.json",
+        "packages/web/src/target/a.js",
+        "src/coverage/rules.py",
+    ]
+    assert changeset.left_out == [
+        "packages/api/build/ (build output, 1 file)",
+        "packages/web/dist/ (build output, 1 file)",
+        "tools/.cache/ (build output, 1 file)",
+    ]
+
+
+def test_salvaging_changes_nothing_when_everything_can_be_committed(checkout: RepoCheckout):
+    (Path(checkout.directory) / "notes.md").write_text("# Notes\n")
+    strict, salvaged = checkout.collect_changes(), checkout.collect_changes(salvage=True)
+    assert [change.path for change in salvaged.changes] == ["notes.md"] and salvaged.left_out == []
+    assert salvaged.tree_sha == strict.tree_sha
+
+
+def test_salvaging_when_the_change_is_too_large_in_total(checkout: RepoCheckout):
+    root = Path(checkout.directory)
+    for index in range(5):
+        (root / f"data{index}.txt").write_bytes(bytes([97 + index]) * (900_000 - index * 1000))
+    (root / "main.py").write_text("print('hi')\n")
+    with pytest.raises(SandboxError, match="in total"):
+        checkout.collect_changes()
+    changeset = checkout.collect_changes(salvage=True)
+    # The largest new files go first, until the rest fits (4,000 kB).
+    assert sorted(change.path for change in changeset.changes) == ["data1.txt", "data2.txt", "data3.txt", "data4.txt", "main.py"]
+    assert changeset.left_out == ["data0.txt (900 kB, the change was too large in total)"]
 
 
 # --------------------------------------------------------------------------- #
@@ -944,9 +1114,203 @@ def test_compact_history_keeps_task_and_recent_messages():
     assert messages[0]["content"] == "system" and messages[1]["content"] == "the task"
     assert len(messages[3]["content"]) < 300 and "dropped to save context" in messages[3]["content"]
     shortened = json.loads(messages[2]["tool_calls"][0]["function"]["arguments"])
-    assert shortened["path"] == "a.py" and "characters omitted" in shortened["content"]
+    # A file the agent wrote is replaced by a note about it, not cut off mid-way.
+    assert shortened["path"] == "a.py" and shortened["content"].startswith("[1 lines, written to a.py as sent.")
+    # The model is told to look before it changes a file it can no longer see.
+    assert "read the file with read_file before you change it" in shortened["content"] and len(shortened["content"]) < 400
     assert messages[5]["content"] == big  # inside the protected recent window
     assert history_size(messages) <= 7000
+
+
+def test_files_written_a_while_ago_are_kept_as_an_outline():
+    """Every request repeats the conversation. A project of many files would
+    be sent over and over; what a later file needs from an earlier one is what
+    that one declares."""
+    component = (
+        "import React from 'react';\n\n"
+        "export interface CardProps {\n  title: string;\n  children: React.ReactNode;\n}\n\n"
+        "export function Card({ title, children }: CardProps) {\n"
+        + "  // filler\n" * 150
+        + "  return <section>{children}</section>;\n}\n\n"
+        "export const Badge = ({ label }: { label: string }) => <span>{label}</span>;\n"
+    )
+
+    def write(call_id: str, path: str, content: str):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "write_file", "arguments": json.dumps({"path": path, "content": content})}}],
+            "_gemini_parts": [{"functionCall": {"name": "write_file"}}],
+        }
+
+    def result(call_id: str, path: str):
+        return {"role": "tool", "tool_call_id": call_id, "content": f"Wrote {path} (160 lines)."}
+
+    small = '{"name": "demo", "scripts": {"build": "vite build"}}\n'
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "the task"},
+        write("1", "package.json", small), result("1", "package.json"),
+        write("2", "src/ui.tsx", component), result("2", "src/ui.tsx"),
+        write("3", "src/more.tsx", component), result("3", "src/more.tsx"),
+        write("4", "src/App.tsx", component), result("4", "src/App.tsx"),
+    ]
+    before = history_size(messages)
+    # Below the soft budget nothing is touched...
+    assert compact_history(messages, budget=100_000, soft_budget=before + 1) is False
+    # ...above it the oldest large file goes first, and only as many as needed.
+    assert compact_history(messages, budget=100_000, soft_budget=before - 100, keep_recent=2) is True
+    first = json.loads(messages[4]["tool_calls"][0]["function"]["arguments"])
+    assert first["path"] == "src/ui.tsx"
+    assert first["content"].startswith("[162 lines, written to src/ui.tsx as sent.")
+    # What other files need to know about it is still there.
+    for declared in ("export interface CardProps {", "export function Card({ title, children }: CardProps) {", "export const Badge"):
+        assert declared in first["content"]
+    assert "// filler" not in first["content"] and len(first["content"]) < 600
+    # Provider-native copies of the call would still hold the whole file.
+    assert "_gemini_parts" not in messages[4] and "_gemini_parts" in messages[6]
+    # A small file stays as it is (a manifest is short and everything depends on it)...
+    assert json.loads(messages[2]["tool_calls"][0]["function"]["arguments"])["content"] == small
+    # ...and so do the files that were not needed to get under the budget, and the newest one.
+    assert json.loads(messages[6]["tool_calls"][0]["function"]["arguments"])["content"] == component
+    assert json.loads(messages[8]["tool_calls"][0]["function"]["arguments"])["content"] == component
+    # Tool results are not touched by this.
+    assert messages[5]["content"] == "Wrote src/ui.tsx (160 lines)."
+    # Asked for less, the next ones follow; the most recent messages never.
+    assert compact_history(messages, budget=100_000, soft_budget=1000, keep_recent=2) is True
+    assert json.loads(messages[6]["tool_calls"][0]["function"]["arguments"])["content"].startswith("[162 lines")
+    assert json.loads(messages[8]["tool_calls"][0]["function"]["arguments"])["content"] == component
+    # An outline is not outlined again.
+    again = json.loads(messages[4]["tool_calls"][0]["function"]["arguments"])["content"]
+    assert again == first["content"]
+
+
+def test_the_latest_reply_is_never_outlined_however_many_files_it_wrote():
+    """A reply that writes six files is followed by six results: it is more
+    than four messages back at once. The build that comes next is about
+    exactly these files."""
+    big = "export const value = 1;\n" * 200
+
+    def reply(start: int, count: int):
+        calls = [
+            {"id": str(start + offset), "type": "function", "function": {"name": "write_file", "arguments": json.dumps({"path": f"src/f{start + offset}.ts", "content": big})}}
+            for offset in range(count)
+        ]
+        results = [{"role": "tool", "tool_call_id": str(start + offset), "content": f"Wrote src/f{start + offset}.ts (200 lines)."} for offset in range(count)]
+        return [{"role": "assistant", "content": None, "tool_calls": calls}] + results
+
+    messages = [{"role": "system", "content": "system"}, {"role": "user", "content": "the task"}] + reply(1, 2) + reply(10, 6)
+    assert compact_history(messages, budget=1_000_000, soft_budget=1000) is True
+    earlier = [json.loads(call["function"]["arguments"])["content"] for call in messages[2]["tool_calls"]]
+    latest = [json.loads(call["function"]["arguments"])["content"] for call in messages[5]["tool_calls"]]
+    assert all(content.startswith("[200 lines, written to src/f") for content in earlier)
+    assert latest == [big] * 6
+    # A reminder after the results (the time check) does not change which reply is the latest.
+    messages.append({"role": "user", "content": "Time check: ..."})
+    assert compact_history(messages, budget=1_000_000, soft_budget=1000) is False
+    # Once the model has replied again, the six files are old ones.
+    messages += reply(20, 1)
+    assert compact_history(messages, budget=1_000_000, soft_budget=1000) is True
+    assert all(json.loads(call["function"]["arguments"])["content"].startswith("[200 lines") for call in messages[5]["tool_calls"])
+    assert json.loads(messages[-2]["tool_calls"][0]["function"]["arguments"])["content"] == big
+
+
+def test_outline_of_a_file():
+    python = "import os\n\nclass Store:\n    def get(self):\n        return 1\n\ndef main():\n    pass\n"
+    assert outline_of(python) == "class Store:\ndef main():"
+    markdown = "# Title\n\nText.\n\n## Usage\n\nMore text.\n"
+    assert outline_of(markdown) == "# Title\n## Usage"
+    # Nothing recognisable: the beginning of the file.
+    assert outline_of("alpha\n\nbeta\ngamma\n") == "alpha\nbeta\ngamma"
+    assert len(outline_of("export const x = 1;\n" * 500)) <= 1204
+
+
+def test_the_shortened_copy_of_a_file_is_not_written_back_as_the_file(checkout: RepoCheckout):
+    """Older file contents are shortened in the conversation. A model that
+    copies its own earlier call would write that note into a file - and the
+    note would be committed as if it were the code."""
+    outlined = (
+        "[162 lines, written to src/chart.py as sent. They are not repeated here to keep the conversation "
+        "short: read the file with read_file before you change it. It declares:]\ndef draw(points):"
+    )
+    cut = "def add(a, b):\n" + "    # filler\n" * 8 + " [... 3880 characters omitted ...]"
+    real = "def draw(points):\n    return len(points)\n"
+    llm = ScriptedLLM(
+        [
+            [("read_file", {"path": "calc.py"})],
+            [("write_file", {"path": "src/chart.py", "content": outlined})],
+            [("write_file", {"path": "calc.py", "content": cut})],
+            [("replace_in_file", {"path": "calc.py", "old_text": "return a - b", "new_text": cut})],
+            [("write_file", {"path": "src/chart.py", "content": real})],
+            [("finish", {"summary": "Added the chart helper."})],
+        ]
+    )
+    before = (Path(checkout.directory) / "calc.py").read_text()
+    agent, events = make_agent(checkout, llm)
+    assert run(agent).finished
+    _source, no_outline, no_cut, no_cut_edit, wrote = llm.tool_results()
+    assert no_outline.startswith("Error: src/chart.py was not written: what you sent is not the content of a file")
+    assert "Send the whole content of the file" in no_outline
+    assert no_cut.startswith("Error: calc.py was not written:")
+    assert no_cut_edit.startswith("Error: calc.py was not changed: new_text ends with the mark")
+    assert wrote == "Wrote src/chart.py (2 lines)."
+    # Nothing of the notes reached the files.
+    assert (Path(checkout.directory) / "src/chart.py").read_text() == real
+    assert (Path(checkout.directory) / "calc.py").read_text() == before
+    assert ("warn", "write_file src/chart.py held back: the content was the conversation's shortened copy, not a file") in events
+
+
+def test_a_file_the_model_never_sent_in_full_holds_the_finish_back(checkout: RepoCheckout):
+    outlined = (
+        "[40 lines, written to notes.md as sent. They are not repeated here to keep the conversation short: "
+        "read the file with read_file before you change it. It declares:]\n# Notes"
+    )
+    llm = ScriptedLLM(
+        [
+            [("read_file", {"path": "calc.py"})],
+            [("write_file", {"path": "notes.md", "content": outlined})],
+            [("finish", {"summary": "Added notes."})],  # ... but notes.md does not exist
+            [("write_file", {"path": "notes.md", "content": "# Notes\n"})],
+            [("finish", {"summary": "Added notes."})],
+        ]
+    )
+    agent, events = make_agent(checkout, llm)
+    outcome = run(agent)
+    assert outcome.finished and outcome.turns == 5
+    assert ("warn", "finish held back: notes.md was never written - the agent was asked to complete it") in events
+    assert (Path(checkout.directory) / "notes.md").read_text() == "# Notes\n"
+
+
+def test_what_counts_as_a_shortened_copy():
+    assert is_stand_in("[12 lines, written to a.py as sent. They are not repeated here to keep the conversation short")
+    assert is_stand_in("x = 1\n [... 250 characters omitted ...]") and is_stand_in("abc [... 9 characters omitted ...]\n")
+    # Ordinary content that merely looks similar.
+    for content in ("", "[1, 2, 3]\n", "[12 lines, written by hand]\n", "# Log\n[... 250 characters omitted ...] and then it went on\n"):
+        assert not is_stand_in(content)
+    # What compaction itself produces is recognised.
+    component = "export function Card() {\n" + "  // filler\n" * 300 + "}\n"
+    call = {"id": "1", "type": "function", "function": {"name": "write_file", "arguments": json.dumps({"path": "src/ui.tsx", "content": component})}}
+    later = {"role": "assistant", "content": "Now the build."}
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "t"},
+        {"role": "assistant", "content": None, "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "1", "content": "Wrote src/ui.tsx (302 lines)."},
+        later,
+    ]
+    assert compact_history(messages, budget=100_000, soft_budget=500, keep_recent=0) is True
+    assert is_stand_in(json.loads(messages[2]["tool_calls"][0]["function"]["arguments"])["content"])
+    # ... and so is the cut that is made when even the latest reply has to shrink to fit a provider.
+    other = {"id": "2", "type": "function", "function": {"name": "write_file", "arguments": json.dumps({"path": "b.txt", "content": "word " * 400})}}
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "t"},
+        {"role": "assistant", "content": None, "tool_calls": [other]},
+        {"role": "tool", "tool_call_id": "2", "content": "Wrote b.txt (1 lines)."},
+    ]
+    assert compact_history(messages, budget=300, keep_recent=0) is True
+    cut = json.loads(messages[2]["tool_calls"][0]["function"]["arguments"])["content"]
+    assert cut.endswith("characters omitted ...]") and is_stand_in(cut)
 
 
 # --------------------------------------------------------------------------- #

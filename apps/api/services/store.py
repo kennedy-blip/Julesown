@@ -98,10 +98,11 @@ class TaskStore:
             "fix_checks": False,
             "continue_work": False,
             "failed_checks": [],
-            # The agent was stopped before it was done; its work was delivered anyway.
+            # The agent stopped before the task was done; its work was delivered anyway.
             "unfinished": False,
-            "stop_reason": None,  # timeout | llm_error | max_turns
+            "stop_reason": None,  # timeout | llm_error | max_turns | gave_up
             "unfinished_reason": None,  # the same in words, for people
+            "handoff": None,  # where the work stands, for the task that continues it
             "commit_authorship": None,
             "sandbox": None,
             "source": source,

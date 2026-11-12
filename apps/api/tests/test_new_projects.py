@@ -20,6 +20,7 @@ from apps.api.routers.webhooks import build_result_comment
 from apps.api.services.agent import (
     NEW_PROJECT_PROMPT,
     SYSTEM_PROMPT,
+    TIME_UP,
     WRAP_UP_SECONDS,
     WRAP_UP_SECONDS_RATE_LIMITED,
     CodingAgent,
@@ -154,8 +155,12 @@ def test_the_two_sets_of_instructions():
             assert phrase in prompt
         # Rules for changing existing code have no place in an empty repository.
         assert "Look before you write" not in prompt and "smallest change" not in prompt
+        # How a run that has little time gets something that builds.
+        for phrase in ("Keep files lean", "then install and run the build once", "fix what it reports before you write anything else"):
+            assert phrase in prompt
+    assert "fix what it reports before you do anything else" in SYSTEM_PROMPT
     # It is sent with every request of a run: it has to stay small.
-    assert len(NEW_PROJECT_PROMPT) < 2600
+    assert len(NEW_PROJECT_PROMPT) < 3000
 
 
 def test_empty_repository_gets_the_new_project_instructions(tmp_path):
@@ -167,8 +172,10 @@ def test_empty_repository_gets_the_new_project_instructions(tmp_path):
     assert system == system_prompt_for(new_project=True, first_commit=True)
     assert task.startswith("Repository: acme/blank - empty, it has no commits yet.")
     assert "becomes its first commit on branch `main`" in task and "Build a task list app" in task
-    # How much time there is: whatever is unfinished when it is up is lost.
-    assert "Time budget: about 5 minutes for the whole task" in task
+    # How much time there is - and that running out of it does not lose the work.
+    assert "Time budget: about 5 minutes for this run, including installs and builds." in task
+    assert "Get a small version working first" in task
+    assert "If the time runs out, what you have is kept and a follow-up run continues from it." in task
     assert "commit " not in task.split("Task:")[0].replace("first commit", "")  # there is no commit to name
 
 
@@ -401,8 +408,8 @@ class SlowLLM(ScriptedLLM):
 
 
 def test_agent_is_asked_to_wrap_up_before_the_time_is_gone(tmp_path):
-    """A run that is out of time loses everything it did. With room for one more
-    reply left, the model is told so - once."""
+    """With room for one more reply left, the model is told so - once - and
+    asked for an account of where the work stands."""
     clock = Clock()
     # 200 s for the agent (225 minus the 25 s kept for the commit); each reply takes 60 s.
     deadline = Deadline(225, clock=clock)
@@ -422,12 +429,135 @@ def test_agent_is_asked_to_wrap_up_before_the_time_is_gone(tmp_path):
     # Asked before the fourth reply (20 s left), not earlier (80 s left after the second).
     wrap_up = [request[-1] for request in llm.requests if request[-1]["role"] == "user" and "Time is almost up" in request[-1]["content"]]
     assert len(wrap_up) == 1 and llm.requests[3][-1] == wrap_up[0] and len(llm.requests) == 4
-    assert "say plainly what is missing or unchecked" in wrap_up[0]["content"]
-    assert "success=false" in wrap_up[0]["content"]
+    assert "say what is done, what is still missing or unchecked" in wrap_up[0]["content"]
+    # Nothing is lost by stopping here, and the model is told so: it has no reason to rush something in.
+    assert "Your work is kept as it is and a follow-up run continues from your summary." in wrap_up[0]["content"]
+    assert "Pass success=false if the work is not complete or the last build or test run failed." in wrap_up[0]["content"]
     assert ("info", "The time budget is nearly used up: the agent was asked to wrap up") in events
     # The missing README would normally send the model back. Not now: there is no time for it.
     assert not [message for _level, message in events if "held back" in message]
     assert outcome.summary == "The page and its script work; there is no README yet."
+    # Earlier - with half of its time gone - it was told how much is left.
+    checks = [request[-1] for request in llm.requests if request[-1]["role"] == "user" and request[-1]["content"].startswith("Time check:")]
+    assert len(checks) == 1 and llm.requests[2][-1] == checks[0]
+    assert "about 40 seconds of working time are left" in checks[0]["content"]
+    assert "check it now with the project's build or test command" in checks[0]["content"]
+    assert ("info", "About 40s of working time are left: the agent was told to check its work") in events
+
+
+def wrap_up_run(tmp_path, last_steps, *, build: str = ""):
+    """A run of 200 s in which every reply takes 60 s: the wrap-up is asked for
+    before the fourth reply. ``build`` is a command the agent runs third."""
+    clock = Clock()
+    third = [("run_command", {"command": build})] if build else [("write_file", {"path": "style.css", "content": "body {}\n"})]
+    llm = SlowLLM(
+        [
+            [("write_file", {"path": "index.html", "content": INDEX_HTML})],
+            [("write_file", {"path": "app.js", "content": "console.log(1);\n"})],
+            third,
+            last_steps,
+        ],
+        clock,
+        seconds_per_reply=60,
+    )
+    agent, events = make_agent(empty_checkout(tmp_path), llm, deadline=Deadline(225, clock=clock))
+    return run(agent), llm, events
+
+
+def test_work_that_is_not_done_when_time_is_up_is_reported_as_cut_short(tmp_path):
+    """Asked to wrap up, the model says the work is not complete. That is not
+    the agent giving up on the task: it ran out of time, and what it wrote is
+    kept (the runner delivers it as unfinished)."""
+    outcome, llm, _events = wrap_up_run(
+        tmp_path,
+        [("finish", {"summary": "The page is there. Missing: the README and the styles for the list.", "success": False})],
+    )
+    assert "Time is almost up" in llm.requests[3][-1]["content"]
+    assert outcome.stop_reason == "timeout" and not outcome.finished
+    assert outcome.error == TIME_UP == "The time budget ran out before the agent finished."
+    # Its account of where the work stands is what a follow-up run starts from.
+    assert outcome.summary == "The page is there. Missing: the README and the styles for the list."
+
+
+def test_a_failed_last_command_means_unfinished_whatever_the_model_says(tmp_path):
+    outcome, _llm, _events = wrap_up_run(
+        tmp_path,
+        [("finish", {"summary": "Built the app.", "pr_title": "Create the app"})],
+        build="echo 'vite.config.ts(8,18): error TS2580: Cannot find name process.' >&2; exit 2",
+    )
+    assert outcome.stop_reason == "timeout" and outcome.error == TIME_UP
+    assert outcome.summary == "Built the app." and outcome.pr_title == "Create the app"
+    assert outcome.last_failure == {
+        "command": "echo 'vite.config.ts(8,18): error TS2580: Cannot find name process.' >&2; exit 2",
+        "exit_code": 2,
+        "timed_out": False,
+        "output": "vite.config.ts(8,18): error TS2580: Cannot find name process.",
+    }
+
+
+def test_work_that_is_done_when_time_is_up_is_finished(tmp_path):
+    outcome, _llm, _events = wrap_up_run(
+        tmp_path,
+        [("finish", {"summary": "Built the app; the build passes.", "pr_title": "Create the app"})],
+        build="echo built",
+    )
+    assert outcome.finished and outcome.last_failure is None
+
+
+def test_giving_up_with_time_left_is_still_giving_up(tmp_path):
+    llm = ScriptedLLM([PROJECT, [("finish", {"summary": "This cannot be built without a paid API.", "success": False})]])
+    agent, _events = make_agent(empty_checkout(tmp_path), llm)
+    outcome = run(agent)
+    assert outcome.stop_reason == "gave_up" and outcome.error == "This cannot be built without a paid API."
+
+
+def test_the_command_that_still_fails_is_remembered(tmp_path):
+    """Where a follow-up run has to start: the last command that failed and has
+    not passed since."""
+    broken = [("write_file", {"path": "build.sh", "content": "exit 3\n"}), ("write_file", {"path": "README.md", "content": README})]
+    steps = [
+        broken,
+        [("run_command", {"command": "sh build.sh"})],  # fails
+        [("run_command", {"command": "cat build.sh"})],  # looking at it is not fixing it
+        FINISH,
+    ]
+    agent, _events = make_agent(empty_checkout(tmp_path), ScriptedLLM(steps), deadline=Deadline(300))
+    outcome = run(agent)
+    assert outcome.last_failure is not None
+    assert outcome.last_failure["command"] == "sh build.sh" and outcome.last_failure["exit_code"] == 3
+
+    # Run again with success, it is settled.
+    steps = [
+        broken,
+        [("run_command", {"command": "sh build.sh"})],
+        [("write_file", {"path": "build.sh", "content": "exit 0\n"})],
+        [("run_command", {"command": "sh build.sh"})],
+        FINISH,
+    ]
+    agent, _events = make_agent(empty_checkout(tmp_path / "second"), ScriptedLLM(steps), deadline=Deadline(300))
+    assert run(agent).last_failure is None
+
+    # A failure the agent has long moved on from is not where the work stands.
+    steps = [
+        broken,
+        [("run_command", {"command": "sh build.sh"})],
+        [("run_command", {"command": "true"})],
+        [("run_command", {"command": "echo 1"})],
+        [("run_command", {"command": "echo 2"})],
+        [("run_command", {"command": "echo 3"})],
+        FINISH,
+    ]
+    agent, _events = make_agent(empty_checkout(tmp_path / "third"), ScriptedLLM(steps), deadline=Deadline(300))
+    assert run(agent).last_failure is None
+
+
+def test_no_time_check_in_a_short_run(tmp_path):
+    """Half of a minute is no news to anybody."""
+    clock = Clock()
+    llm = SlowLLM([PROJECT, [("write_file", {"path": "style.css", "content": "body {}\n"})], FINISH], clock, seconds_per_reply=30)
+    agent, _events = make_agent(empty_checkout(tmp_path), llm, deadline=Deadline(135, clock=clock))  # 110 s for the agent
+    assert run(agent).finished
+    assert not any(str(message.get("content")).startswith("Time check:") for request in llm.requests for message in request)
 
 
 def test_wrap_up_comes_earlier_when_the_rate_limit_slows_the_run(tmp_path):
@@ -644,11 +774,52 @@ def test_passing_tests_of_a_new_project(client: TestClient, token_env, install_d
 
 
 def test_agent_failure_leaves_the_repository_empty(client: TestClient, token_env, install_deps, github: FakeGitHub, blank: str):
-    install_deps(ScriptedLLM([PROJECT, [("finish", {"summary": "This cannot be built here.", "success": False})]]))
+    """An agent that gives up before it has created anything leaves nothing behind."""
+    install_deps(ScriptedLLM([[("finish", {"summary": "This cannot be built here.", "success": False})]]))
     _events, task = run_stream(client, {"repository": blank, "prompt": "Build it"})
     assert task["status"] == "failed" and task["stage"] == "agent"
+    assert task["error"] == "The agent reported that it could not complete the task: This cannot be built here."
     assert github.remote.is_empty(blank) and github.calls("PUT", r"/contents/") == []
-    assert any("Unfinished work in the sandbox was discarded (3 files changed" in line for line in messages(task, "warn"))
+
+
+def test_a_project_the_agent_gave_up_on_is_pushed_as_unfinished(client: TestClient, token_env, install_deps, github: FakeGitHub, blank: str):
+    """What was built is not thrown away: it is pushed, and says that it is unfinished."""
+    install_deps(ScriptedLLM([PROJECT, [("finish", {"summary": "This cannot be built here.", "success": False})]]))
+    _events, task = run_stream(client, {"repository": blank, "prompt": "Build it"})
+    assert task["status"] == "completed" and task["outcome"] == "initial_commit"
+    assert task["unfinished"] is True and task["stop_reason"] == "gave_up"
+    assert github.remote.files(blank, "main") == ["README.md", "app.js", "index.html"]
+    assert github.remote.log(blank, "main")[0].startswith("[Unfinished] Build it")
+    assert not any("discarded" in line for line in messages(task, "warn"))
+    assert any(line.startswith("The project is unfinished: what the agent had built when it stopped was pushed") for line in messages(task, "warn"))
+
+
+def test_build_output_does_not_cost_an_interrupted_run_its_work(
+    client: TestClient, token_env, install_deps, github: FakeGitHub, blank: str
+):
+    """The first build has run, the .gitignore is not written yet, and the run
+    is cut short: the bundle is too large to commit. Everything else is kept."""
+    bundle = sys.executable + " -c \"import os; os.makedirs('dist/assets'); open('dist/assets/index.js', 'w').write('x' * 1200000)\""
+    install_deps(
+        ScriptedLLM(
+            [
+                [
+                    ("write_file", {"path": "package.json", "content": '{"name": "pulse", "version": "1.0.0", "scripts": {"build": "vite build"}}\n'}),
+                    ("write_file", {"path": "src/main.js", "content": "console.log('pulse');\n"}),
+                ],
+                [("run_command", {"command": bundle})],
+                LLMError("groq returned HTTP 429: Rate limit reached.", kind="rate_limit", status_code=429, retry_after=900.0),
+            ]
+        )
+    )
+    _events, task = run_stream(client, {"repository": blank, "prompt": "Build Pulse"})
+    assert task["status"] == "completed" and task["outcome"] == "initial_commit" and task["unfinished"] is True
+    assert github.remote.files(blank, "main") == ["package.json", "src/main.js"]
+    warnings = messages(task, "warn")
+    assert "Not kept, because it is no part of the work or cannot be committed: dist/ (build output, 1 file)" in warnings
+    assert not any("cannot be kept" in line or "discarded" in line for line in warnings)
+    # The run that continues is told that the bundle is not in the repository.
+    assert "Not committed (build output, or too large to commit): dist/ (build output, 1 file)" in task["handoff"]
 
 
 def test_a_private_empty_repository_needs_no_clone_token(

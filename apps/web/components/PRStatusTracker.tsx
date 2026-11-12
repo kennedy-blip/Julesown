@@ -244,27 +244,51 @@ function ChecksBlock({
   );
 }
 
+/** The models a router or an alias answered with, most used first: "a ×3, b". */
+function servedBy(item: ProviderUsage): string {
+  const served = item.served && typeof item.served === 'object' ? item.served : {};
+  return Object.keys(served)
+    .filter((name) => typeof served[name] === 'number' && served[name] > 0)
+    .sort((a, b) => served[b] - served[a])
+    .map((name) => (served[name] > 1 ? `${name} ×${served[name]}` : name))
+    .join(', ');
+}
+
 function ModelsUsed({ usage }: { usage: ProviderUsage[] }) {
   return (
     <div data-testid="models-used">
-      <SectionLabel>Model providers</SectionLabel>
+      <SectionLabel>Models</SectionLabel>
       <ul className={`${INSET} divide-y divide-slate-800`}>
         {usage.map((item, index) => {
           const requests = item.requests || 0;
+          const served = servedBy(item);
           return (
-            <li key={`${item.provider}-${index}`} className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-3 py-2 text-xs" data-provider={item.provider}>
-              <span className="flex items-center gap-2 min-w-0">
-                <span className={`font-medium ${requests > 0 ? 'text-slate-100' : 'text-slate-500'}`}>{providerName(item.provider)}</span>
+            <li
+              key={`${item.provider}-${index}`}
+              className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-3 py-2 text-xs"
+              data-provider={item.provider}
+              data-model={item.model}
+            >
+              <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5 min-w-0">
+                {/* A single model reports no counts: it is the one that answered. */}
+                <span className={`font-medium ${requests > 0 || typeof item.requests !== 'number' ? 'text-slate-100' : 'text-slate-500'}`}>
+                  {providerName(item.provider)}
+                </span>
                 <span className="font-mono text-slate-500 truncate">{item.model}</span>
+                {served && (
+                  <span className="text-slate-400 break-all" data-testid="model-served" title="The model that answered: this name stands for a choice the provider makes for each request">
+                    answered by <span className="font-mono text-slate-300">{served}</span>
+                  </span>
+                )}
               </span>
               <span className="flex items-center gap-2 text-slate-400 tabular-nums">
                 {requests > 0 ? (
                   <span>
                     {plural(requests, 'request', 'requests')} · {compact(item.input_tokens)} in / {compact(item.output_tokens)} out
                   </span>
-                ) : (
+                ) : typeof item.requests === 'number' ? (
                   <span className="text-slate-500">{item.failures ? 'did not answer' : 'not needed'}</span>
-                )}
+                ) : null}
                 {item.out && <Badge tone="warn">{item.out.replace(/^its? /, '')}</Badge>}
               </span>
             </li>
@@ -318,6 +342,9 @@ export function PRStatusTracker({
   const prState = prUrl ? pullRequestState(session) : null;
   const open = !!prUrl && prState !== 'merged' && prState !== 'closed';
   const unfinished = isUnfinished(session) && (firstCommit || open);
+  // It stopped by itself (it reported that it cannot do the task), as opposed to being cut short.
+  const gaveUp = !!task && task.stop_reason === 'gave_up';
+  const handoff = task && typeof task.handoff === 'string' && task.handoff.trim() ? task.handoff.trim() : '';
   const tests = summarizeTests(task, session.state);
   const failureText = (task && task.error) || session.note || 'The task failed without an error message.';
 
@@ -440,10 +467,13 @@ export function PRStatusTracker({
             <span
               className="text-xs font-mono text-slate-300 truncate block"
               data-testid="model-used"
-              title={answered.map((item) => `${item.provider} / ${item.model}`).join(' → ') || undefined}
+              title={answered.map((item) => `${item.provider} / ${item.model}${servedBy(item) ? ` (answered by ${servedBy(item)})` : ''}`).join(' → ') || undefined}
             >
               {answered.length > 1
-                ? answered.map((item) => providerName(item.provider)).join(' → ')
+                ? answered
+                    .map((item) => providerName(item.provider))
+                    .filter((name, index, all) => index === 0 || all[index - 1] !== name)
+                    .join(' → ')
                 : task && task.llm_model
                   ? `${providerName(task.llm_provider)} · ${task.llm_model}`
                   : '—'}
@@ -459,23 +489,44 @@ export function PRStatusTracker({
 
         {/* ---- Unfinished work ---- */}
         {unfinished && task && (
-          <Callout tone="warn" icon={<AlertTriangle className="w-4 h-4 text-amber-300" />} data-testid="unfinished">
-            <div className="font-semibold text-amber-200 mb-1">The work is unfinished</div>
+          <Callout
+            tone="warn"
+            icon={<AlertTriangle className="w-4 h-4 text-amber-300" />}
+            data-testid="unfinished"
+            data-stop-reason={task.stop_reason || undefined}
+          >
+            <div className="font-semibold text-amber-200 mb-1">
+              {gaveUp ? 'The agent stopped: it could not complete the task' : 'The work is unfinished'}
+            </div>
             <p>
               {firstCommit
                 ? 'What the agent had built was pushed so that nothing is lost; the project may not build yet. Continuing delivers the rest as a pull request.'
                 : 'What the agent had changed is in the pull request so that nothing is lost. Do not merge it as it is: continuing adds the rest to it.'}
+              {gaveUp && ' Read its summary first: it says what stood in the way, and a new run may need to be told how to get past it.'}
             </p>
             {task.unfinished_reason && (
               <p className="mt-1.5 text-amber-100/70 break-words" data-testid="unfinished-reason">
                 Why it stopped: <Linkified text={task.unfinished_reason} />
               </p>
             )}
-            <div className="mt-2.5">
+            {handoff && (
+              <details className="mt-2 group" data-testid="handoff">
+                <summary className="cursor-pointer text-amber-100/90 hover:text-amber-50 select-none">
+                  Where it stopped - what the next run is told
+                </summary>
+                <pre className="mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-black/30 border border-amber-500/20 px-3 py-2 text-[11px] leading-relaxed font-mono text-amber-50/90">
+                  {handoff}
+                </pre>
+              </details>
+            )}
+            <div className="mt-2.5 flex flex-wrap items-center gap-3">
               <Button variant="primary" onClick={onContinue} disabled={!!startBlocked} title={startBlocked || undefined} data-testid="continue-work">
                 <Play className="w-3.5 h-3.5 fill-current" />
                 Continue the work
               </Button>
+              <span className="text-xs text-amber-100/60">
+                A new run picks it up from there{handoff ? '' : ' - it reads what is in the repository first'}.
+              </span>
             </div>
           </Callout>
         )}
@@ -492,7 +543,8 @@ export function PRStatusTracker({
           />
         )}
 
-        {usage.length > 1 && <ModelsUsed usage={usage} />}
+        {/* Worth a table when more than one model took part, or a router's name hides which one answered. */}
+        {(usage.length > 1 || usage.some((item) => servedBy(item) !== '')) && <ModelsUsed usage={usage} />}
 
         {verification.length > 0 && (
           <div>

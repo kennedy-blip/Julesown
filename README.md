@@ -10,12 +10,15 @@ search box. A repository that is still **empty** works too: the agent builds the
 description and pushes it as the repository's first commit, laid out so that it can be deployed on
 Vercel or another host afterwards.
 
-The agent is not tied to one model provider. With keys for more than one (Groq, Google Gemini,
-OpenRouter, OpenAI, Anthropic) it **carries on with the next** when one reaches its rate limit or
-fails. It can **add more work to a pull request**, **repair the checks that failed** on it (a test run
-on GitHub Actions, a deployment on Vercel) and, when a run is cut short, it **delivers what it had**
-marked as unfinished instead of throwing it away. Provider keys, the choice of model and who the
-commits are attributed to can be set in the dashboard's **Settings**.
+The agent is not tied to one model. Each provider (Groq, Google Gemini, OpenRouter, OpenAI,
+Anthropic) can be given several models, and with keys for more than one provider the agent
+**carries on with the next model** when the one in use reaches its rate limit or fails. It can
+**add more work to a pull request**, **repair the checks that failed** on it (a test run on GitHub
+Actions, a deployment on Vercel) and, when a run stops before the work is done, it **delivers what
+it had** marked as unfinished - together with a note of where it stopped, so that the next run
+**continues from there** instead of starting over. Provider keys, the models, your own **standing
+instructions** for every task and who the commits are attributed to can be set in the dashboard's
+**Settings**.
 
 ---
 
@@ -34,8 +37,9 @@ configuration check → GitHub access → E2B sandbox → git clone → agent lo
    It is given the file list, the repository's manifests (`package.json`, `pyproject.toml`, …) and
    the start of the README together with the task, and it has to look before it writes
    (see [What the agent's work is based on](#-what-the-agents-work-is-based-on)). When the model
-   provider reaches a limit or fails, the same conversation continues with the next one
-   (see [Model providers and fallback](#-model-providers-and-fallback)).
+   in use reaches a limit or fails, the same conversation continues with the next one
+   (see [Model providers and fallback](#-model-providers-and-fallback)). Rules of your own that
+   apply to every task are added after the task (see [Standing instructions](#-standing-instructions)).
 5. **Commit** – the files that changed are committed to a new branch `jules/task-<id>` through the
    GitHub API. The base branch is never modified.
 6. **Pull request** – a pull request is opened from that branch. Its description contains the agent's
@@ -54,9 +58,10 @@ Nothing in this pipeline is simulated:
 - If any step fails, the task is reported as **failed** with the reason (missing key, App not
   installed, rate limit, time budget…). If the agent changes nothing, the task finishes with
   **no changes** and no pull request.
-- A run that is stopped after the agent had already changed files is not reported as a clean result
-  and not thrown away either: the changes are delivered **marked as unfinished**
-  (see [Unfinished work](#-unfinished-work)).
+- A run that stops after the agent had already changed files - because the time ran out, the
+  models were exhausted, or the agent itself reported that it could not complete the task - is not
+  reported as a clean result and not thrown away either: the changes are delivered **marked as
+  unfinished** (see [Unfinished work](#-unfinished-work)).
 - Test status is what actually happened in the sandbox: *passed*, *failed*, *no tests* or *not run*.
   A pull request opened with failing or missing tests says so.
   - *No tests* means a test command was run but had nothing to test – for example `npm test` in a
@@ -148,48 +153,98 @@ agent back **once** if something is missing: no README, dependencies without a `
 A repository that only has a README gets the same instructions, and – because it has commits – the
 result as a pull request.
 
-**Size.** A new project has to fit into one run (see [Limits](#️-limits-worth-knowing)). The agent is
-told how much time it has, and when the time is nearly used up it is asked once to wrap up, so that a
-run ends with a result that says what is missing rather than with a timeout that loses everything.
+**Size and time.** One run is short (see [Limits](#️-limits-worth-knowing)): a small project fits
+into it, a larger one takes two or three. The agent is told so and works accordingly:
+
+- It is told how much time the run has, to keep files lean (a handful of sample entries, no filler)
+  and not to read back what it has just written.
+- With a build step it writes the manifest, the configuration, the `.gitignore` and a minimal entry
+  point first and runs the install and the build **once, early**, while a mistake in the
+  configuration is cheap to find. A command that fails is fixed before anything else is written.
+- At half time it is told how many seconds are left and to check what it has.
+- When the time is nearly used up it is asked once to wrap up: to say what is done, what is missing
+  and what the last failing command reported.
+
+Whatever it has built by then is **kept**: a project whose build does not pass yet is pushed as
+`[Unfinished] …` with that report, and the next run continues from it
+(see [Unfinished work](#-unfinished-work)). Nothing is discarded because the time ran out.
 
 ---
 
 ## 🧠 Model providers and fallback
 
-| Provider | Key | Default model |
+| Provider | Key | Default models |
 | --- | --- | --- |
-| Groq | `GROQ_API_KEY` | `openai/gpt-oss-120b` |
-| Google Gemini | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | `gemini-flash-latest` |
-| OpenRouter | `OPENROUTER_API_KEY` | `baidu/ernie-5.5-flash-preview:free` |
+| Groq | `GROQ_API_KEY` | `openai/gpt-oss-120b`, then `openai/gpt-oss-20b` |
+| Google Gemini | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | `gemini-flash-latest`, then `gemini-3.5-flash-lite` |
+| OpenRouter | `OPENROUTER_API_KEY` | `openrouter/free` |
 | OpenAI | `OPENAI_API_KEY` | `gpt-6-luna` |
 | Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` |
 
-One key is enough to run tasks. Every provider that has a key is part of the **chain** a task uses, in
-the order of the table (change it with `JULES_LLM_ORDER`, or name the first choice with
-`JULES_LLM_PROVIDER`). The agent works with the first one and switches when it has to:
+One key is enough to run tasks.
 
-- **Rate limit** – the next provider that is ready takes over at once and stays in use; the agent
-  does not hop back. Only when *every* provider is limited does it wait, for the shortest of the
-  waits. If that wait is longer than the time the task has left, the run ends there.
-- **Daily limit, rejected key, no credit, unknown model, request the provider refuses** – that
-  provider is out for the rest of the run.
-- **Outage or timeout** – the provider is set aside for a short while and tried again later.
+**Several models per provider.** A provider can be given up to four models, separated by commas
+(`GEMINI_MODEL=gemini-flash-latest,gemini-3.5-flash-lite`, or the **Models** field in the
+dashboard's Settings). Providers count their limits per model, so a second model is a second
+allowance: when the first is rate limited, overloaded or withdrawn, the next one carries on.
+
+**Defaults that do not go stale.** None of the default names is a version that is retired on its
+own schedule:
+
+- `gemini-flash-latest` is Google's own alias for its current Flash model. Google moves it when a new
+  version is released, so there is no need to follow which version (2.5, 3.x, …) is current or
+  being shut down. The task log says which model answered behind the alias.
+- `openrouter/free` is OpenRouter's router for its free models: for every request it picks a free
+  model that is available and supports what the request needs (tool calls). A single free model is
+  throttled whenever it is popular and may be withdrawn; the router has neither problem. The log
+  and the result say which models answered. To pin one, or to list several, set `OPENROUTER_MODEL`
+  (for example `qwen/qwen3-coder:free,openrouter/free`).
+
+**The chain.** Every provider that has a key takes part, in the order of the table (change it with
+`JULES_LLM_ORDER`, or name the first choice with `JULES_LLM_PROVIDER`). A task tries every
+provider's first model before anybody's second one - with keys for all three free providers:
+
+```text
+groq openai/gpt-oss-120b → gemini gemini-flash-latest → openrouter openrouter/free
+  → groq openai/gpt-oss-20b → gemini gemini-3.5-flash-lite
+```
+
+The agent works with the first one and switches when it has to:
+
+- **Rate limit** – the next model that is ready takes over at once and stays in use; the agent
+  does not hop back. Only when *every* model is limited does it wait, for the shortest of the
+  waits. If that wait is longer than the time the task has left, the run ends there (and what it
+  had changed is kept).
+- **A router whose pick is throttled** – when `openrouter/free` lands on a model that is rate
+  limited upstream (and no waiting time is named), the next request gets another pick: the router
+  is asked again after 3 seconds instead of being set aside like a single model (30 seconds).
+- **Daily limit** – that model is out for the rest of the run. OpenRouter counts one daily
+  allowance for all its free models, so there it takes out every free model at once; paid models
+  on the same key stay usable.
+- **Rejected key, no credit** – every model of that provider is out for the rest of the run.
+- **Unknown model, request the provider refuses** – that model is out for the rest of the run.
+- **Outage or timeout** – the model is set aside for a short while and tried again later.
+- **A model that does not answer** – a request is not waited for longer than the model has earned:
+  45 seconds for one that has not answered yet in this run; one that has gets three times its
+  slowest answer, between 45 and 90 seconds. With nothing else to switch to, it gets the full 90.
 - **Replies the provider refuses for their form** (Groq does this when an open model calls a tool
   that does not exist) – the reply is rebuilt from what the provider returned when that is possible;
-  after two refusals in a row the next provider takes over.
+  after two refusals in a row the next model takes over.
 
-The conversation carries over: the next provider receives everything the agent has read and done so
-far. The task log says when and why it switched, and the result lists which providers answered
-(`llm_usage` in the task record). `JULES_LLM_FALLBACK=false` restricts tasks to the first choice.
+The conversation carries over: the next model receives everything the agent has read and done so
+far. The task log says when and why it switched, and the result lists what each model did
+(`llm_usage` in the task record; for a router or an alias also `served`, the models that actually
+answered). `JULES_LLM_FALLBACK=false` restricts tasks to the first model of the first provider.
 
 **Where the keys live.** A key can be an environment variable of the deployment, or be entered in the
 dashboard under **Settings → AI models**. A key entered there is kept in that browser
 (`localStorage`) and sent to your own backend with each task you start, in a request header
 (`X-Groq-Key`, `X-Gemini-Key`, `X-OpenRouter-Key`, `X-OpenAI-Key`, `X-Anthropic-Key`). The backend
 uses it for that one task, in place of its own key for that provider; it is not stored and is masked
-in logs and error messages. The same page chooses the model per provider and the first choice, and
-its **Test** button sends one small request with a tool to the provider (`POST /api/v1/llm/test`) to
-show whether the key is accepted, the model exists and it can call tools.
+in logs and error messages. The same page sets the models per provider and the first choice, and
+its **Test** button sends one small request with a tool to **each** of the provider's models
+(`POST /api/v1/llm/test`) to show whether the key is accepted, each model exists and can call
+tools - and, for a router or an alias, which model answered.
 
 Tasks that GitHub starts (a `/jules` comment, an automatic fix of failed checks) do not pass through
 a browser. They use the keys of the deployment, so for fallback there, set the keys as environment
@@ -214,20 +269,85 @@ request, not only for ones Jules opened. The task ends with the outcome `pr_upda
 
 ### 🧩 Unfinished work
 
-A run can be cut short: the time budget is used up, every model provider is exhausted, or the turn
-limit is reached. If the agent had changed files by then, they are not discarded:
+A run can stop before the work is done: the time budget is used up, every model is exhausted, the
+turn limit is reached - or the agent itself reports that it cannot complete the task (a build it
+could not get to pass, something it needs that is not in the repository). If it had changed files
+by then, they are **not discarded**:
 
 - In a repository with code, a pull request titled **`[Unfinished] …`** is opened (or the commit is
   added to the pull request the task was working on). Its description starts with a warning that says
   why the agent stopped, and that it should not be merged as it is.
 - In an empty repository the files are pushed as the first commit, marked the same way.
+- The commit message records where the work stands: the agent's own account, why it stopped and the
+  command that still failed, with the end of its output.
+- A run that was stopped cannot tidy up after itself. What a build left behind before the
+  `.gitignore` was written, and files too large to commit, are **left out** rather than costing
+  the rest; the log and the handoff name them, so the next run knows they are not in the
+  repository. Build output means: new files in `dist/`, `build/`, `out/`, `target/`, `coverage/`
+  or `htmlcov/` next to the project's manifest (`package.json`, `pyproject.toml`, `Cargo.toml` …),
+  in a tool's cache directory (`.vite`, `.turbo`, `.cache` …), and `*.tsbuildinfo`. A file the agent
+  wrote itself, or a directory the repository already keeps, is never taken for it.
 
-The result in the dashboard then offers **Continue the work**: the same task again as a follow-up on
-that pull request (or, for a first commit, as a task that delivers the rest as a pull request), with
-the instruction to look at what is there first. From GitHub, a `/jules <what is still missing>`
-comment on the pull request continues it as well. When a follow-up finishes, the mark is taken off
-the title. `JULES_KEEP_UNFINISHED_WORK=false` restores the old behaviour, where an interrupted run
-leaves nothing behind.
+```text
+[Unfinished] Build OmniPulse
+
+I scaffolded the app: package.json, vite.config.ts and src/. The build does not pass yet.
+
+Unfinished: the agent was stopped before it was done. The time budget ran out before the agent finished.
+
+Still failing when the run stopped: `npm run build` (exit code 2)
+    vite.config.ts(8,18): error TS2580: Cannot find name 'process'.
+
+Task-Id: 28b06a3f362a4553804385d0471f48a2
+```
+
+**Continuing.** The next run does not start over. It is told that a previous run began the work,
+what that run reported (the task record's `handoff`: its account, the failing command and its
+output, why it stopped), to look at what is there, and to fix the failing command first:
+
+- **Dashboard** – the result offers **Continue the work**. It sends the same task again with the
+  handoff of the run it continues: as a follow-up on the pull request, or - after a first commit -
+  as a task that delivers the rest as a pull request. *Where it stopped* in the result shows what
+  the next run will be told.
+- **GitHub** – comment `/jules continue` on the pull request, or on the issue the work was started
+  from (for a first commit). Lines after it are further instructions. The run reads where the work
+  stands from the message of the unfinished commit.
+- **API** – `"continue_work": true`, with the previous task's `handoff` (optional: without it, the
+  commit message is read).
+
+When a continuation finishes, the mark is taken off the title; one that finds nothing left to do
+takes it off as well. If the agent *gave up* rather than ran out of time, read its summary before
+continuing: it says what stood in the way, and the next run may need to be told how to get past it.
+`JULES_KEEP_UNFINISHED_WORK=false` restores the old behaviour, where a run that stops early leaves
+nothing behind.
+
+---
+
+## 📌 Standing instructions
+
+Rules that should hold for every task - the conventions of your stack, what your deployments need,
+what to leave alone - do not have to be repeated in each prompt:
+
+- **Dashboard** – **Settings → Instructions**. The text is kept in that browser and sent with
+  every task started from it (request field `guidelines`).
+- **Server** – the environment variable `JULES_TASK_GUIDELINES` (up to 4,000 characters; write `\n`
+  for a line break). It applies to every task of the deployment, including the ones GitHub starts
+  (a `/jules` comment, an automatic fix of failed checks), which do not pass through a browser.
+
+The agent is given them after the task, under the heading *Standing instructions*; the server's come
+first, then the browser's. Where they contradict a task, the task wins. They are not part of the
+prompt shown in the result or quoted in the pull request.
+
+Some rules are **built in** and need not be written down: read before writing, keep changes small,
+fix a failing install, build or test before doing anything else, and - in an empty repository - get
+a small version building first and extend it from there. Good standing instructions are the things
+only you know, for example:
+
+```text
+- In a Vite app read configuration from import.meta.env, never from process.env.
+- If vite.config.ts uses Node APIs (path, process, __dirname), add @types/node to devDependencies.
+- Deployments are on Vercel: no server of its own, no hard-coded localhost addresses.
+```
 
 ---
 
@@ -295,13 +415,13 @@ always opened by the GitHub App: only commits can carry another author.
 │       │   ├── tasks.py            # Create/stream/look up tasks; state of a task's pull request and its checks
 │       │   ├── github.py           # Repository list, pre-flight check, checks of a commit, account lookup, automation status, App redirect landing
 │       │   ├── llm.py              # Trying a provider key out
-│       │   ├── webhooks.py         # GitHub webhook: `/jules` commands, failed checks
+│       │   ├── webhooks.py         # GitHub webhook: `/jules` commands (also `/jules continue`), failed checks
 │       │   └── health.py           # Liveness and configuration diagnostics
 │       ├── services/
 │       │   ├── runner.py           # The pipeline above, end to end (new pull request, more work on one, first commit, unfinished work)
-│       │   ├── agent.py            # Tool-calling loop and tools; instructions for existing and for new projects
-│       │   ├── llm.py              # Groq / Gemini / OpenRouter / OpenAI / Anthropic clients and the fallback between them
-│       │   ├── ci.py               # Reading failed checks: check runs, annotations, job logs, commit statuses
+│       │   ├── agent.py            # Tool-calling loop and tools; instructions for existing and for new projects; time check and wrap-up
+│       │   ├── llm.py              # Groq / Gemini / OpenRouter / OpenAI / Anthropic clients and the fallback between their models
+│       │   ├── ci.py               # Reading failed checks; what a continued task is told (handoff, standing instructions)
 │       │   ├── verification.py     # What a test command's result means; documentation-only changes
 │       │   ├── sandbox.py          # E2B sandbox adapter, clone and change collection
 │       │   ├── github.py           # GitHub App + token auth, repository listing, commits, branches, pull requests
@@ -326,7 +446,7 @@ Model provider keys can also be entered in the dashboard instead
 
 | Variable | Purpose |
 | --- | --- |
-| `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` — at least one, here or in the dashboard's Settings | The model that drives the agent. With several, a task starts with the first in that order and carries on with the next when it has to. |
+| `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` — at least one, here or in the dashboard's Settings | The models that drive the agent. With several, a task starts with the first in that order and carries on with the next when it has to. |
 | `E2B_API_KEY` | Sandbox in which the repository is cloned, edited and tested. |
 | `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` **or** `GITHUB_TOKEN` | Credentials used to push the branch and open the pull request. See [GitHub setup](#-github-setup). |
 
@@ -346,14 +466,15 @@ With neither set, tasks are **locked** on Vercel / `ENVIRONMENT=production` and 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GROQ_MODEL` / `GEMINI_MODEL` / `OPENROUTER_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | see [the table above](#-model-providers-and-fallback) | Model to use. If the configured model has been retired, the backend picks an available one from the provider's model list and says so in the task log. |
+| `GROQ_MODEL` / `GEMINI_MODEL` / `OPENROUTER_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | see [the table above](#-model-providers-and-fallback) | The model to use, or up to four separated by commas in the order they are tried. If a configured model has been retired, the backend picks an available one from the provider's model list and says so in the task log. |
 | `JULES_LLM_PROVIDER` | – | The provider tasks start with (`groq`, `gemini`, `openrouter`, `openai`, `anthropic`). |
 | `JULES_LLM_ORDER` | `groq,gemini,openrouter,openai,anthropic` | The order in which providers that have a key are used. |
-| `JULES_LLM_FALLBACK` | `true` | `false`: a task uses only the first provider. |
+| `JULES_LLM_FALLBACK` | `true` | `false`: a task uses only the first model of the first provider. |
+| `JULES_TASK_GUIDELINES` | – | Instructions added to every task of this deployment (see [Standing instructions](#-standing-instructions)). `\n` stands for a line break. |
 | `GROQ_REASONING_EFFORT` / `OPENROUTER_REASONING_EFFORT` / `OPENAI_REASONING_EFFORT` | `low` / `low` / `none` | Reasoning effort sent to the model (`default` omits the parameter). |
 | `GEMINI_THINKING_LEVEL` | `low` | How much Gemini thinks before it answers (`minimal`, `low`, `medium`, `high`; `default` leaves it to Google). |
 | `GROQ_TEMPERATURE` / `OPENROUTER_TEMPERATURE` | `0.2` | Sampling temperature, `0`–`2` (`default` leaves it to the provider). A low value makes malformed tool calls and made-up content less likely. |
-| `JULES_KEEP_UNFINISHED_WORK` | `true` | Deliver what an interrupted run had changed, marked as unfinished (see [Unfinished work](#-unfinished-work)). |
+| `JULES_KEEP_UNFINISHED_WORK` | `true` | Deliver what a run that stopped early had changed, marked as unfinished (see [Unfinished work](#-unfinished-work)). |
 | `JULES_CI_AUTOFIX` / `JULES_CI_AUTOFIX_ATTEMPTS` | `true` / `2` | Fix failed checks of Jules' own pull requests unasked, and how often per pull request (see [Failed checks](#-failed-checks)). |
 | `JULES_COMMIT_AUTHORSHIP` | `bot` | `bot`, `coauthor` or `user`, with `JULES_COMMIT_AUTHOR_NAME` and `JULES_COMMIT_AUTHOR_EMAIL` (see [Who the commits are attributed to](#-who-the-commits-are-attributed-to)). |
 | `JULES_TASK_BUDGET_SECONDS` | `270` | Time one task may take. On Vercel it is additionally capped by the function's remaining time. |
@@ -417,6 +538,11 @@ The same line as a comment **on a pull request** adds the work to that pull requ
 opening another one, and `/jules fix the checks` (or `/jules` alone) there repairs its failed checks
 – see [More work on a pull request](#-more-work-on-a-pull-request) and [Failed checks](#-failed-checks).
 
+`/jules continue` (also `finish it`, `carry on`, `resume`) completes work that a run left
+unfinished: on the `[Unfinished]` pull request, or on the issue a new project was started from.
+When a task that GitHub started ends unfinished, its comment says so and names this command
+– see [Unfinished work](#-unfinished-work).
+
 To have failed checks of Jules' own pull requests fixed **unasked**, also subscribe the webhook to
 **Check suite** (GitHub Actions and other check runs) and/or **Status** (commit statuses, which is how
 Vercel reports a deployment). *Workflow run* is understood as well.
@@ -455,7 +581,7 @@ and every task leaves one summary line in the function logs (Vercel → your dep
 | `GET /api/v1/github/checks?repository=…&ref=…` | The checks of a commit or branch, in the same form. |
 | `GET /api/v1/github/identity?login=…` | Name and `noreply` e-mail address of a GitHub account, for commit authorship. |
 | `GET /api/v1/github/automation` | Whether failed checks can be fixed unasked: webhook secret, the App's event subscriptions and permissions, and where to change them. |
-| `POST /api/v1/llm/test` | Try a provider out: `{"provider": "gemini", "model": "optional"}` with the key in its `X-<Provider>-Key` header (or the server's key without it). Costs one small request. |
+| `POST /api/v1/llm/test` | Try a provider out: `{"provider": "gemini", "model": "optional, one or several"}` with the key in its `X-<Provider>-Key` header (or the server's key without it). One small request per model; `models[]` says how each did and `answered_by` which model answered behind a router or an alias. |
 | `GET /api/v1/github/repos` | Every repository the configured credentials can work on (all pages, up to 2,000), most recently pushed first, with `total`, `truncated` and, for a GitHub App, `installations` (account, `repository_selection`: `all` or `selected`, and where to change it). |
 | `GET /api/v1/github/check?repository=…&branch=…` | Check, without running anything, that a task could act on a repository. `empty: true` means it has no commits and a task will create its first commit. |
 | `GET /api/v1/health`, `GET /api/v1/health/env` | Liveness and configuration diagnostics. |
@@ -471,7 +597,9 @@ Request body for both task endpoints (JSON, sent with `Content-Type: application
   "pull_request": 12,                   // optional: add the result to this pull request
   "fix_checks": true,                   // optional: the task is the failed checks (of the pull request, else of the branch)
   "continue_work": true,                // optional: carry on with work that was left unfinished
-  "llm": {"primary": "gemini", "fallback": true, "models": {"gemini": "gemini-flash-latest"}},
+  "handoff": "…",                       // optional with continue_work: the `handoff` of the task being continued
+  "guidelines": "…",                    // optional: standing instructions, given to the agent after the task
+  "llm": {"primary": "gemini", "fallback": true, "models": {"gemini": "gemini-flash-latest, gemini-3.5-flash-lite"}},
   "commit": {"mode": "coauthor", "name": "Ada Example", "email": "1234567+ada-example@users.noreply.github.com"}
 }
 ```
@@ -489,8 +617,9 @@ Fields of a task record that describe how far the result can be trusted:
 | `docs_only` | `true` when the change only touches documentation files. |
 | `files_read` | Repository files whose content the agent saw before it finished. |
 | `outcome` | `pull_request`, `pr_updated` (a commit was added to an existing pull request), `no_changes`, or `initial_commit` (the repository was empty: `commit_sha` and `commit_url` name its first commit and there is no pull request). |
-| `unfinished`, `stop_reason`, `unfinished_reason` | The agent was stopped before it was done (`timeout`, `llm_error` or `max_turns`) and what it had changed was delivered anyway; `unfinished_reason` says why in words. |
-| `llm_chain[]`, `llm_usage[]` | The providers the task could use, and what each did: `provider`, `model`, `requests`, `failures`, `input_tokens`, `output_tokens` and, if it dropped out, why (`out`). |
+| `unfinished`, `stop_reason`, `unfinished_reason` | The agent stopped before the work was done - it was interrupted (`timeout`, `llm_error`, `max_turns`) or reported that it could not complete the task (`gave_up`) - and what it had changed was delivered anyway; `unfinished_reason` says why in words. |
+| `handoff` | For unfinished work: where it stands (the agent's account, the command that still fails with the end of its output, why it stopped). Send it back as `handoff` with `continue_work` to have the next run start from it. |
+| `llm_chain[]`, `llm_usage[]` | The models the task could use, and what each did: `provider`, `model`, `requests`, `failures`, `input_tokens`, `output_tokens`, if it dropped out, why (`out`), and - for a router or an alias - `served`: the models that answered, with how often. |
 | `failed_checks[]` | For a task that fixes checks: the checks that had failed when it started (`name`, `kind`, `url`). |
 | `commit_authorship` | `bot`, `coauthor` or `user`: who the commit was attributed to. |
 | `empty_repository`, `new_project` | The repository had no commits / no code when the task started. |
@@ -500,22 +629,32 @@ Fields of a task record that describe how far the result can be trusted:
 ## ⚠️ Limits worth knowing
 
 - **Scope of a task.** The time budget suits focused changes ("fix this failing test", "add input
-  validation to X"), not large refactorings. A project built from scratch has to be small for the
-  same reason: on a rate-limited model a run produces a handful of files, not an application with
-  dozens. Ask for a first version and extend it with follow-up tasks.
+  validation to X"), not large refactorings. One run is a few minutes (on Vercel's Hobby plan a
+  function may run 300 seconds), and a model needs most of that to write a project of twenty or
+  thirty files - before the first build has told it what is wrong. Such a project takes two or
+  three runs: the first leaves an `[Unfinished]` commit, **Continue the work** (or `/jules continue`)
+  finishes it. Asking for a first version and extending it with follow-up tasks works as well.
+- **Tokens.** Every request to a model repeats the conversation so far. Files the agent wrote some
+  turns ago are therefore replaced in the conversation by an outline of what they declare (they are
+  in the sandbox, and it is told to read a file again before it changes it); without that a project
+  of thirty files is sent thirty times over. Its latest reply always stays whole. Should a model
+  copy such an outline into a file instead of the file's content, the write is refused.
 - **Workflow files.** GitHub refuses files under `.github/workflows` from a GitHub App without the
   *Workflows* permission, which fails the commit. The agent does not add CI workflows unless asked.
 - **Review before you merge.** The agent's summary and any documentation it writes are the model's
   words. The platform reports what it can observe (files read, commands run, test results); it does
   not verify that a description is accurate.
 - **LLM rate limits.** Free tiers are small (Groq's free tier allows about 8,000 tokens per minute on
-  the default model). The agent sizes its context to the provider's limit. With one provider it has
-  to wait out a rate limit, and a wait that does not fit in the time budget ends the run; with a
-  second provider it carries on with that one instead. Either way, what it had changed by then is
-  kept (see [Unfinished work](#-unfinished-work)).
-- **Free models differ.** A free model on OpenRouter may be limited to a number of requests per day,
-  may not support tool calls, or may be withdrawn. Use the **Test** button in Settings before relying
-  on one; `OPENROUTER_MODEL` (or the model field in Settings) selects another.
+  the default model). The agent sizes its context to the provider's limit. With a single model it
+  has to wait out a rate limit, and a wait that does not fit in the time budget ends the run; with
+  a second model or a second provider it carries on with that one instead. Either way, what it had
+  changed by then is kept (see [Unfinished work](#-unfinished-work)).
+- **Free models differ.** A free model on OpenRouter may not support tool calls or may be
+  withdrawn, which is why the default there is the router `openrouter/free` rather than one model.
+  OpenRouter's free models share a daily allowance per account (50 requests a day at the time of
+  writing, 1,000 once the account has bought credits; failed attempts count), and one larger task
+  can use most of the small one. Use the **Test** button in Settings before relying on a model -
+  it costs one request per model; `OPENROUTER_MODEL` (or the Models field in Settings) selects others.
 - **Refused model replies.** Open models hosted by Groq sometimes answer with a call to a tool that
   does not exist (`commentary`, `json`, …), or with arguments that are not valid JSON; Groq refuses
   such a reply. Where the refused reply contains a usable tool call it is recovered and executed.
@@ -532,12 +671,15 @@ Fields of a task record that describe how far the result can be trusted:
   durable record of a task is its pull request (or first commit). Whether a pull request has been merged or closed
   since, and what its checks say, is read from GitHub when the dashboard loads, when you return to
   its tab, and for a while after a task finishes.
-- **Settings are per browser.** Provider keys, model choices and the commit identity entered in the
-  dashboard are kept in that browser's `localStorage`: another browser or device starts without
-  them, and anyone with access to the browser profile can read them. Use environment variables for
-  keys that should be shared or that tasks started from GitHub need.
-- **Change size.** A task may change up to 300 files / 4 MB (1 MB per file). Dependency and build
-  directories (`node_modules`, `.venv`, `__pycache__`, …) are never committed.
+- **Settings are per browser.** Provider keys, model choices, standing instructions and the commit
+  identity entered in the dashboard are kept in that browser's `localStorage`: another browser or
+  device starts without them, and anyone with access to the browser profile can read them. Use
+  environment variables for what should be shared or what tasks started from GitHub need.
+- **Change size.** A task may change up to 300 files / 4 MB (1 MB per file). Dependency and cache
+  directories (`node_modules`, `.venv`, `__pycache__`, `.next`, …) are never committed. If a
+  finished task left a file that is too large (a bundle, a dump), the pull request is opened
+  without it - together with any build output the run produced - and says so under *Changes*; a
+  task with nothing else to deliver fails with that reason.
 
 ---
 

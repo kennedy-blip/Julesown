@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Callable, Iterable, List
+from typing import Callable, Iterable, List, Sequence
 
 # (level, message) - how every component reports progress to the task log.
 Emit = Callable[[str, str], None]
@@ -85,6 +85,12 @@ def clip(text: str, limit: int, *, tail_share: float = 0.7) -> str:
     head = max(0, limit - tail)
     omitted = len(text) - head - tail
     return f"{text[:head]}\n[... {omitted} characters omitted ...]\n{text[-tail:] if tail else ''}"
+
+
+def listed(items: Sequence[str], limit: int = 6) -> str:
+    """The first few of ``items`` in a row, and how many more there are."""
+    more = len(items) - limit
+    return ", ".join(items[:limit]) + (f" and {more} more" if more > 0 else "")
 
 
 def first_line(text: str, limit: int = 72) -> str:

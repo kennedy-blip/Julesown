@@ -16,7 +16,12 @@ router = APIRouter(prefix="/api/v1/llm", tags=["llm"], dependencies=[Depends(req
 
 class ProviderTestRequest(BaseModel):
     provider: str = Field(..., description="groq, gemini, openrouter, openai or anthropic")
-    model: Optional[str] = Field(None, max_length=200, description="Model to try. Defaults to the configured one.")
+    # Up to four names of up to 200 characters, with what separates them.
+    model: Optional[str] = Field(
+        None,
+        max_length=900,
+        description="Model to try, or several separated by commas. Defaults to the configured ones.",
+    )
 
 
 @router.post("/test", dependencies=[Depends(require_json_body)])
@@ -26,7 +31,9 @@ async def test_provider(req: ProviderTestRequest, keys: Dict[str, str] = Depends
     The key is taken from the request's ``X-<Provider>-Key`` header if it is
     there, else from the server's environment. The answer says whether the key
     was accepted, whether the model exists and whether it called the tool -
-    the three things a task needs. This costs one request of the provider's quota.
+    the three things a task needs. With several models each one is tried and
+    listed under ``models``. This costs one request of the provider's quota
+    per model.
     """
     provider = req.provider.strip().lower()
     settings = get_settings().with_overrides(
