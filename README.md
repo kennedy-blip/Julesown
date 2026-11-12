@@ -10,9 +10,10 @@ search box. A repository that is still **empty** works too: the agent builds the
 description and pushes it as the repository's first commit, laid out so that it can be deployed on
 Vercel or another host afterwards.
 
-The agent is not tied to one model. Each provider (Groq, Google Gemini, OpenRouter, OpenAI,
-Anthropic) can be given several models, and with keys for more than one provider the agent
-**carries on with the next model** when the one in use reaches its rate limit or fails. It can
+The agent is not tied to one model. Each provider (Groq, Google Gemini, NVIDIA NIM, Z.AI,
+OpenRouter, OpenAI, Anthropic) can be given several models, and with keys for more than one
+provider the agent **carries on with the next model** when the one in use reaches its rate limit,
+has used up its day or fails. It can
 **add more work to a pull request**, **repair the checks that failed** on it (a test run on GitHub
 Actions, a deployment on Vercel) and, when a run stops before the work is done, it **delivers what
 it had** marked as unfinished - together with a note of where it stopped, so that the next run
@@ -173,23 +174,27 @@ Whatever it has built by then is **kept**: a project whose build does not pass y
 
 ## 🧠 Model providers and fallback
 
-| Provider | Key | Default models |
-| --- | --- | --- |
-| Groq | `GROQ_API_KEY` | `openai/gpt-oss-120b`, then `openai/gpt-oss-20b` |
-| Google Gemini | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | `gemini-flash-latest`, then `gemini-3.5-flash-lite` |
-| OpenRouter | `OPENROUTER_API_KEY` | `openrouter/free` |
-| OpenAI | `OPENAI_API_KEY` | `gpt-6-luna` |
-| Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` |
+| Provider | Key | Default models | Free of charge |
+| --- | --- | --- | --- |
+| Groq | `GROQ_API_KEY` | `openai/gpt-oss-120b`, then `openai/gpt-oss-20b` | few tokens per minute and per day |
+| Google Gemini | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | `gemini-flash-latest`, then `gemini-3.5-flash-lite` | requests per day |
+| NVIDIA NIM | `NVIDIA_API_KEY` (or `NVIDIA_NIM_API_KEY`) | `deepseek-ai/deepseek-v4.1-flash`, then `nvidia/nemotron-3-super-120b-a12b` | about 40 requests a minute per account, no daily limit |
+| Z.AI (GLM) | `ZAI_API_KEY` (or `GLM_API_KEY`) | `glm-4.7-flash`, then `glm-4.5-flash` | these two models, one request at a time |
+| OpenRouter | `OPENROUTER_API_KEY` | `openrouter/free` | 50 requests a day for all free models together |
+| OpenAI | `OPENAI_API_KEY` | `gpt-6-luna` | – |
+| Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` | – |
 
-One key is enough to run tasks.
+One key is enough to run tasks. The more of the free ones are set, the less a single provider's
+limit matters: where one has used up its day, the next carries on. (The limits are the providers'
+own and change; the column says what they were when this was written.)
 
 **Several models per provider.** A provider can be given up to four models, separated by commas
 (`GEMINI_MODEL=gemini-flash-latest,gemini-3.5-flash-lite`, or the **Models** field in the
 dashboard's Settings). Providers count their limits per model, so a second model is a second
 allowance: when the first is rate limited, overloaded or withdrawn, the next one carries on.
 
-**Defaults that do not go stale.** None of the default names is a version that is retired on its
-own schedule:
+**Defaults that do not go stale.** Where a provider has a name that moves with its catalogue, that
+name is the default:
 
 - `gemini-flash-latest` is Google's own alias for its current Flash model. Google moves it when a new
   version is released, so there is no need to follow which version (2.5, 3.x, …) is current or
@@ -199,22 +204,59 @@ own schedule:
   throttled whenever it is popular and may be withdrawn; the router has neither problem. The log
   and the result say which models answered. To pin one, or to list several, set `OPENROUTER_MODEL`
   (for example `qwen/qwen3-coder:free,openrouter/free`).
+- NVIDIA and Z.AI have no such name: their defaults are models. A model NVIDIA has withdrawn is
+  replaced by another one it still lists; a GLM model that is gone is passed over, and the rest of
+  the chain carries on.
+
+**NVIDIA NIM** ([build.nvidia.com](https://build.nvidia.com)) hosts open models behind one key
+(`nvapi-…`). What to know about it:
+
+- Requests are counted **per account**, not per model, and nothing says how long to stay away. So
+  when NVIDIA answers `429`, all of its models are set aside for a minute - asking the second one
+  would be refused as well, and users report that asking again while limited prolongs the limit.
+- Its catalogue changes every few weeks. When a configured model has been withdrawn, another one
+  that NVIDIA still lists and that calls tools takes its place, and the task log says so. To choose
+  yourself: `NVIDIA_MODEL=nvidia/nemotron-3-ultra-550b-a55b,deepseek-ai/deepseek-v4.1-flash` (the
+  names are those on build.nvidia.com; pick models whose page says *Function Calling: Supported*).
+- `404 … Not found for account` for **every** model means the account may list the models but not
+  call them: NVIDIA has to enable its hosted endpoints for the account. **Test** in Settings shows it.
+- The free endpoints are a trial service for development and evaluation. NVIDIA's notice for them
+  says that what is sent and what comes back is recorded and used to improve its products, and asks
+  not to send confidential information: leave NVIDIA out for code that must stay private.
+
+**Z.AI** ([z.ai](https://z.ai/model-api)) serves the GLM models. What to know about it:
+
+- Use a **standard API key**. With it `glm-4.7-flash` and `glm-4.5-flash` cost nothing; they
+  answer one request at a time, which is all a task needs. The larger models are paid for from the
+  account's balance: `ZAI_MODEL=glm-5.3,glm-4.7-flash` uses GLM-5.3 while there is a balance and
+  the free model when there is none (only the model without balance is set aside, not Z.AI).
+- A **GLM Coding Plan** key is not meant for this. Z.AI restricts that plan to the coding tools it
+  lists and may limit accounts that use it elsewhere; this project does not use the plan's endpoint.
+- GLM models think before every reply unless told otherwise, at their highest effort - more than a
+  run of a few minutes can afford. Thinking is therefore switched off (for GLM-5.3 and later, which
+  cannot switch it off, the lowest effort is asked for). `ZAI_REASONING_EFFORT` changes that.
 
 **The chain.** Every provider that has a key takes part, in the order of the table (change it with
 `JULES_LLM_ORDER`, or name the first choice with `JULES_LLM_PROVIDER`). A task tries every
-provider's first model before anybody's second one - with keys for all three free providers:
+provider's first model before anybody's second one - with keys for all five free providers:
 
 ```text
-groq openai/gpt-oss-120b → gemini gemini-flash-latest → openrouter openrouter/free
+groq openai/gpt-oss-120b → gemini gemini-flash-latest → nvidia deepseek-ai/deepseek-v4.1-flash
+  → zai glm-4.7-flash → openrouter openrouter/free
   → groq openai/gpt-oss-20b → gemini gemini-3.5-flash-lite
+  → nvidia nvidia/nemotron-3-super-120b-a12b → zai glm-4.5-flash
 ```
+
+OpenRouter comes last among them: its router answers with whichever free model it picks, and its
+daily allowance is the smallest.
 
 The agent works with the first one and switches when it has to:
 
 - **Rate limit** – the next model that is ready takes over at once and stays in use; the agent
   does not hop back. Only when *every* model is limited does it wait, for the shortest of the
   waits. If that wait is longer than the time the task has left, the run ends there (and what it
-  had changed is kept).
+  had changed is kept). Limits are counted per model - except at NVIDIA, where a limit sets all of
+  its models aside.
 - **A router whose pick is throttled** – when `openrouter/free` lands on a model that is rate
   limited upstream (and no waiting time is named), the next request gets another pick: the router
   is asked again after 3 seconds instead of being set aside like a single model (30 seconds).
@@ -222,6 +264,7 @@ The agent works with the first one and switches when it has to:
   allowance for all its free models, so there it takes out every free model at once; paid models
   on the same key stay usable.
 - **Rejected key, no credit** – every model of that provider is out for the rest of the run.
+  (At Z.AI, "no balance" is about the paid model that was asked: its free models stay in use.)
 - **Unknown model, request the provider refuses** – that model is out for the rest of the run.
 - **Outage or timeout** – the model is set aside for a short while and tried again later.
 - **A model that does not answer** – a request is not waited for longer than the model has earned:
@@ -239,8 +282,8 @@ answered). `JULES_LLM_FALLBACK=false` restricts tasks to the first model of the 
 **Where the keys live.** A key can be an environment variable of the deployment, or be entered in the
 dashboard under **Settings → AI models**. A key entered there is kept in that browser
 (`localStorage`) and sent to your own backend with each task you start, in a request header
-(`X-Groq-Key`, `X-Gemini-Key`, `X-OpenRouter-Key`, `X-OpenAI-Key`, `X-Anthropic-Key`). The backend
-uses it for that one task, in place of its own key for that provider; it is not stored and is masked
+(`X-Groq-Key`, `X-Gemini-Key`, `X-Nvidia-Key`, `X-Zai-Key`, `X-OpenRouter-Key`, `X-OpenAI-Key`,
+`X-Anthropic-Key`). The backend uses it for that one task, in place of its own key for that provider; it is not stored and is masked
 in logs and error messages. The same page sets the models per provider and the first choice, and
 its **Test** button sends one small request with a tool to **each** of the provider's models
 (`POST /api/v1/llm/test`) to show whether the key is accepted, each model exists and can call
@@ -446,7 +489,7 @@ Model provider keys can also be entered in the dashboard instead
 
 | Variable | Purpose |
 | --- | --- |
-| `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` — at least one, here or in the dashboard's Settings | The models that drive the agent. With several, a task starts with the first in that order and carries on with the next when it has to. |
+| `GROQ_API_KEY`, `GEMINI_API_KEY`, `NVIDIA_API_KEY`, `ZAI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` — at least one, here or in the dashboard's Settings | The models that drive the agent. With several, a task starts with the first in that order and carries on with the next when it has to. |
 | `E2B_API_KEY` | Sandbox in which the repository is cloned, edited and tested. |
 | `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` **or** `GITHUB_TOKEN` | Credentials used to push the branch and open the pull request. See [GitHub setup](#-github-setup). |
 
@@ -466,14 +509,18 @@ With neither set, tasks are **locked** on Vercel / `ENVIRONMENT=production` and 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GROQ_MODEL` / `GEMINI_MODEL` / `OPENROUTER_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | see [the table above](#-model-providers-and-fallback) | The model to use, or up to four separated by commas in the order they are tried. If a configured model has been retired, the backend picks an available one from the provider's model list and says so in the task log. |
-| `JULES_LLM_PROVIDER` | – | The provider tasks start with (`groq`, `gemini`, `openrouter`, `openai`, `anthropic`). |
-| `JULES_LLM_ORDER` | `groq,gemini,openrouter,openai,anthropic` | The order in which providers that have a key are used. |
+| `GROQ_MODEL` / `GEMINI_MODEL` / `NVIDIA_MODEL` / `ZAI_MODEL` / `OPENROUTER_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | see [the table above](#-model-providers-and-fallback) | The model to use, or up to four separated by commas in the order they are tried. If a configured model has been retired, the backend picks an available one from the provider's model list and says so in the task log. |
+| `JULES_LLM_PROVIDER` | – | The provider tasks start with (`groq`, `gemini`, `nvidia`, `zai`, `openrouter`, `openai`, `anthropic`). |
+| `JULES_LLM_ORDER` | `groq,gemini,nvidia,zai,openrouter,openai,anthropic` | The order in which providers that have a key are used. |
 | `JULES_LLM_FALLBACK` | `true` | `false`: a task uses only the first model of the first provider. |
 | `JULES_TASK_GUIDELINES` | – | Instructions added to every task of this deployment (see [Standing instructions](#-standing-instructions)). `\n` stands for a line break. |
 | `GROQ_REASONING_EFFORT` / `OPENROUTER_REASONING_EFFORT` / `OPENAI_REASONING_EFFORT` | `low` / `low` / `none` | Reasoning effort sent to the model (`default` omits the parameter). |
+| `NVIDIA_REASONING_EFFORT` | – | Not sent unless set: the models NVIDIA hosts differ in whether they take it. |
+| `NVIDIA_EXTRA_BODY` | – | A JSON object with more fields for every request to NVIDIA, for what the page of your model documents - for example `{"chat_template_kwargs": {"enable_thinking": false}}` to stop a Nemotron model from thinking before each reply. A field a model rejects by name is left out for the rest of the run. |
+| `ZAI_REASONING_EFFORT` | `none` | How much a GLM model thinks before it answers: `none` (off; the lowest effort for models that cannot switch it off), `low`, `medium`, `high`, `max`, or `default` to leave it to Z.AI (thinking at the highest effort). |
 | `GEMINI_THINKING_LEVEL` | `low` | How much Gemini thinks before it answers (`minimal`, `low`, `medium`, `high`; `default` leaves it to Google). |
-| `GROQ_TEMPERATURE` / `OPENROUTER_TEMPERATURE` | `0.2` | Sampling temperature, `0`–`2` (`default` leaves it to the provider). A low value makes malformed tool calls and made-up content less likely. |
+| `GROQ_TEMPERATURE` / `OPENROUTER_TEMPERATURE` / `NVIDIA_TEMPERATURE` / `ZAI_TEMPERATURE` | `0.2` | Sampling temperature, `0`–`2` (Z.AI: `0`–`1`; `default` leaves it to the provider). A low value makes malformed tool calls and made-up content less likely. |
+| `NVIDIA_BASE_URL` / `ZAI_BASE_URL` | `https://integrate.api.nvidia.com/v1` / `https://api.z.ai/api/paas/v4` | Where the two are reached, for example a NIM you host yourself, or `https://open.bigmodel.cn/api/paas/v4` for a key from Z.AI's platform in mainland China. |
 | `JULES_KEEP_UNFINISHED_WORK` | `true` | Deliver what a run that stopped early had changed, marked as unfinished (see [Unfinished work](#-unfinished-work)). |
 | `JULES_CI_AUTOFIX` / `JULES_CI_AUTOFIX_ATTEMPTS` | `true` / `2` | Fix failed checks of Jules' own pull requests unasked, and how often per pull request (see [Failed checks](#-failed-checks)). |
 | `JULES_COMMIT_AUTHORSHIP` | `bot` | `bot`, `coauthor` or `user`, with `JULES_COMMIT_AUTHOR_NAME` and `JULES_COMMIT_AUTHOR_EMAIL` (see [Who the commits are attributed to](#-who-the-commits-are-attributed-to)). |
@@ -605,7 +652,8 @@ Request body for both task endpoints (JSON, sent with `Content-Type: application
 ```
 
 `llm` and `commit` are optional and apply to that task only. Provider keys for the task go in the
-headers `X-Groq-Key`, `X-Gemini-Key`, `X-OpenRouter-Key`, `X-OpenAI-Key`, `X-Anthropic-Key`.
+headers `X-Groq-Key`, `X-Gemini-Key`, `X-Nvidia-Key`, `X-Zai-Key`, `X-OpenRouter-Key`, `X-OpenAI-Key`,
+`X-Anthropic-Key`.
 Interactive documentation is served at `/api/docs`.
 
 Fields of a task record that describe how far the result can be trusted:
