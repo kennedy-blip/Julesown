@@ -24,7 +24,7 @@ from apps.api.services.llm import (
     probe_provider,
 )
 
-from .conftest import CHECK_ADD
+from .conftest import CHECK_ADD, fix_add_script
 from .support import FakeGitHub
 from .test_api import TASK, messages, run_stream
 from .test_fallback import Clock, failure, provider, rate_limit
@@ -669,8 +669,6 @@ def test_a_task_carries_on_with_nvidia_and_zai_when_the_others_have_used_up_thei
 
 
 def test_keys_for_the_two_can_come_with_the_request(client: TestClient, app_env, install_deps, monkeypatch):
-    from .conftest import fix_add_script
-
     deps = install_deps(fix_add_script())
     run_stream(client, TASK, headers={"X-Nvidia-Key": "nvapi-browser", "X-Zai-Key": "zai-browser"})
     seen = deps.settings_seen[0]
