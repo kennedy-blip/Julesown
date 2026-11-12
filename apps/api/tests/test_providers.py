@@ -601,7 +601,7 @@ def test_every_configured_provider_joins_the_chain(monkeypatch):
     ]
     monkeypatch.delenv("OPENROUTER_MODEL")
     # The order covers every provider, with or without a key: what the dashboard is told.
-    assert get_settings().llm_preference == ["openrouter", "gemini", "groq", "openai", "anthropic"]
+    assert get_settings().llm_preference == ["openrouter", "gemini", "groq", "nvidia", "zai", "openai", "anthropic"]
 
 
 def test_google_api_key_is_accepted_as_the_gemini_key(monkeypatch):

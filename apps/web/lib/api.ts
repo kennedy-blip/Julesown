@@ -235,6 +235,8 @@ export interface ProviderModelTest {
   kind: string | null;
   message: string;
   answered_by?: string | null;
+  /** The model that was asked for, when it is gone and `model` took its place. */
+  requested?: string | null;
 }
 
 export interface GitHubIdentity {

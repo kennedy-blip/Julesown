@@ -46,7 +46,8 @@ class LLMOptions(BaseModel):
     """Which model providers this task uses. Keys travel in headers, not here."""
 
     primary: Optional[str] = Field(
-        None, description="Provider to start with (groq, gemini, openrouter, openai, anthropic). Omit for the server's order."
+        None,
+        description="Provider to start with (groq, gemini, nvidia, zai, openrouter, openai, anthropic). Omit for the server's order.",
     )
     fallback: Optional[bool] = Field(
         None, description="Carry on with the other configured providers when the one in use reaches a limit or fails."
@@ -421,9 +422,9 @@ async def stream_task(
     """Create a task, run it within this request and stream its progress.
 
     API keys for model providers can be sent along in the headers ``X-Groq-Key``,
-    ``X-Gemini-Key``, ``X-OpenRouter-Key``, ``X-OpenAI-Key`` and
-    ``X-Anthropic-Key``. They are used for this task only, take precedence over
-    the server's own keys and are never stored or logged.
+    ``X-Gemini-Key``, ``X-Nvidia-Key``, ``X-Zai-Key``, ``X-OpenRouter-Key``,
+    ``X-OpenAI-Key`` and ``X-Anthropic-Key``. They are used for this task only,
+    take precedence over the server's own keys and are never stored or logged.
     """
     runner = runner_for(runner, req, keys)
     record = task_store.create(

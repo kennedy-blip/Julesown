@@ -75,7 +75,7 @@ def test_env_health_ready_and_never_leaks_values(client: TestClient, app_env, mo
     assert body["status"] == "HEALTHY" and body["ready"] is True and body["missing"] == []
     assert body["needs"] == {"llm": None, "sandbox": None, "github": None}
     assert body["llm_preferences"] == {
-        "order": ["groq", "gemini", "openrouter", "openai", "anthropic"],
+        "order": ["groq", "gemini", "nvidia", "zai", "openrouter", "openai", "anthropic"],
         "first_choice": None,
         "fallback": True,
     }
@@ -90,8 +90,33 @@ def test_env_health_ready_and_never_leaks_values(client: TestClient, app_env, mo
         "fallback": True,
     }
     assert [(item["id"], item["configured"]) for item in body["providers"]] == [
-        ("groq", True), ("gemini", False), ("openrouter", False), ("openai", False), ("anthropic", False)
+        ("groq", True),
+        ("gemini", False),
+        ("nvidia", False),
+        ("zai", False),
+        ("openrouter", False),
+        ("openai", False),
+        ("anthropic", False),
     ]
+    assert body["providers"][2] == {
+        "id": "nvidia",
+        "label": "NVIDIA NIM",
+        "configured": False,
+        "model": "deepseek-ai/deepseek-v4.1-flash",
+        "models": ["deepseek-ai/deepseek-v4.1-flash", "nvidia/nemotron-3-super-120b-a12b"],
+        "key_variable": "NVIDIA_API_KEY",
+        "model_variable": "NVIDIA_MODEL",
+    }
+    assert body["providers"][3] == {
+        "id": "zai",
+        "label": "Z.AI (GLM)",
+        "configured": False,
+        "model": "glm-4.7-flash",
+        "models": ["glm-4.7-flash", "glm-4.5-flash"],
+        "key_variable": "ZAI_API_KEY",
+        "model_variable": "ZAI_MODEL",
+    }
+    assert body["variables"]["NVIDIA_API_KEY"] is False and body["variables"]["ZAI_API_KEY"] is False
     assert body["providers"][1] == {
         "id": "gemini",
         "label": "Google Gemini",
