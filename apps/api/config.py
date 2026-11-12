@@ -41,17 +41,42 @@ GEMINI_MODEL_PREFERENCES = ("gemini-flash-latest", "gemini-3.8-flash", "gemini-3
 # come and go; the router has neither problem. A specific model is a setting
 # away (OPENROUTER_MODEL, or the model field in the dashboard's settings).
 DEFAULT_OPENROUTER_MODEL = "openrouter/free"
+# NVIDIA's hosted catalogue (build.nvidia.com, "NIM"): open models behind one
+# key, free within a requests-per-minute limit and without a daily one. Models
+# are added and withdrawn every few weeks, so more names are known than are
+# used: when a configured one is gone, the first of these that NVIDIA still
+# lists takes its place. They are models NVIDIA offers on a free endpoint and
+# describes as made for agents, coding and tool calls; NVIDIA's own come
+# early, because those stay in its catalogue the longest.
+DEFAULT_NVIDIA_MODEL = "deepseek-ai/deepseek-v4.1-flash"
+NVIDIA_MODEL_PREFERENCES = (
+    "deepseek-ai/deepseek-v4.1-flash",
+    "nvidia/nemotron-3-super-120b-a12b",
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "minimaxai/minimax-m3.1-flash",
+    "nvidia/nemotron-3.5-super-vl-120b-a12b",
+    "moonshotai/kimi-k2.6",
+    "openai/gpt-oss-20b",
+)
+# Z.AI's GLM models. The Flash models named here cost nothing with a standard
+# API key (one request at a time); the larger ones (glm-5.3, glm-5.3-flash)
+# are paid from the account's balance and are a setting away (ZAI_MODEL).
+DEFAULT_ZAI_MODEL = "glm-4.7-flash"
 
 # A provider can be given several models (GROQ_MODEL="a,b"): the first one is
 # used, and when it is rate limited, overloaded or gone the next one takes
 # over - limits are counted per model, so a second model is a second allowance.
-# These are the lists used when nothing is configured. Nothing here is a
-# version that goes stale on its own: Gemini's first entry is Google's alias
-# for its current Flash model, followed by the lighter model that has capacity
-# when the alias is busy; OpenRouter's is its router, which is a pool already.
+# These are the lists used when nothing is configured. Where a provider has a
+# name that moves with its catalogue, that is used: Gemini's first entry is
+# Google's alias for its current Flash model, followed by the lighter model
+# that has capacity when the alias is busy; OpenRouter's is its router, which
+# is a pool already. NVIDIA and Z.AI have no such name: a model of theirs that
+# is gone is replaced (NVIDIA) or passed over (Z.AI) - see services/llm.py.
 DEFAULT_MODELS: Dict[str, Tuple[str, ...]] = {
     "groq": (DEFAULT_GROQ_MODEL, "openai/gpt-oss-20b"),
     "gemini": (DEFAULT_GEMINI_MODEL, "gemini-3.5-flash-lite"),
+    "nvidia": (DEFAULT_NVIDIA_MODEL, "nvidia/nemotron-3-super-120b-a12b"),
+    "zai": (DEFAULT_ZAI_MODEL, "glm-4.5-flash"),
     "openrouter": (DEFAULT_OPENROUTER_MODEL,),
     "openai": (DEFAULT_OPENAI_MODEL,),
     "anthropic": (DEFAULT_ANTHROPIC_MODEL,),
@@ -65,14 +90,23 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+# Z.AI's standard API. (Its "coding" endpoint belongs to the GLM Coding Plan,
+# which Z.AI restricts to the coding tools it lists; this is not one of them.)
+DEFAULT_ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
 DEFAULT_GITHUB_API_URL = "https://api.github.com"
 
 # Every provider the agent can use, in the order they are tried when nothing
-# else is said: the free tiers first, the pay-per-token ones after them.
-LLM_PROVIDERS: Tuple[str, ...] = ("groq", "gemini", "openrouter", "openai", "anthropic")
+# else is said: the free tiers first, the pay-per-token ones after them. Among
+# the free ones, those with a model of their own choosing come before
+# OpenRouter's router, which answers with whichever free model it picks and has
+# the smallest daily allowance.
+LLM_PROVIDERS: Tuple[str, ...] = ("groq", "gemini", "nvidia", "zai", "openrouter", "openai", "anthropic")
 PROVIDER_LABELS = {
     "groq": "Groq",
     "gemini": "Google Gemini",
+    "nvidia": "NVIDIA NIM",
+    "zai": "Z.AI (GLM)",
     "openrouter": "OpenRouter",
     "openai": "OpenAI",
     "anthropic": "Anthropic",
@@ -80,6 +114,8 @@ PROVIDER_LABELS = {
 PROVIDER_KEY_VARIABLES = {
     "groq": "GROQ_API_KEY",
     "gemini": "GEMINI_API_KEY",
+    "nvidia": "NVIDIA_API_KEY",
+    "zai": "ZAI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
@@ -87,6 +123,8 @@ PROVIDER_KEY_VARIABLES = {
 PROVIDER_MODEL_VARIABLES = {
     "groq": "GROQ_MODEL",
     "gemini": "GEMINI_MODEL",
+    "nvidia": "NVIDIA_MODEL",
+    "zai": "ZAI_MODEL",
     "openrouter": "OPENROUTER_MODEL",
     "openai": "OPENAI_MODEL",
     "anthropic": "ANTHROPIC_MODEL",
@@ -261,6 +299,12 @@ class Settings:
     openrouter_api_key: Optional[str] = None
     openrouter_model: str = DEFAULT_OPENROUTER_MODEL
     openrouter_base_url: str = DEFAULT_OPENROUTER_BASE_URL
+    nvidia_api_key: Optional[str] = None
+    nvidia_model: str = ",".join(DEFAULT_MODELS["nvidia"])
+    nvidia_base_url: str = DEFAULT_NVIDIA_BASE_URL
+    zai_api_key: Optional[str] = None
+    zai_model: str = ",".join(DEFAULT_MODELS["zai"])
+    zai_base_url: str = DEFAULT_ZAI_BASE_URL
     # Instructions added to every task of this installation (conventions of the
     # owner's projects: the stack, what a deployment needs, what to leave alone).
     task_guidelines: str = ""
@@ -346,7 +390,7 @@ class Settings:
     @property
     def llm_provider(self) -> Optional[str]:
         """The provider a task starts with: the explicit override, else the
-        first configured one (Groq, Gemini, OpenRouter, OpenAI, Anthropic)."""
+        first configured one in the order of ``llm_preference``."""
         chain = self.llm_chain
         return chain[0] if chain else None
 
@@ -463,10 +507,8 @@ class Settings:
             if self.llm_provider_override:
                 llm = f"an API key for the selected LLM provider (JULES_LLM_PROVIDER={self.llm_provider_override})"
             else:
-                llm = (
-                    "an LLM API key (GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY "
-                    "or ANTHROPIC_API_KEY)"
-                )
+                names = [PROVIDER_KEY_VARIABLES[name] for name in LLM_PROVIDERS]
+                llm = f"an LLM API key ({', '.join(names[:-1])} or {names[-1]})"
         return {
             "llm": llm,
             "sandbox": None
@@ -524,6 +566,13 @@ def get_settings() -> Settings:
         openrouter_base_url=(
             env_str("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL) or DEFAULT_OPENROUTER_BASE_URL
         ).rstrip("/"),
+        # Other tools know these keys under a second name; either one works here.
+        nvidia_api_key=env_str("NVIDIA_API_KEY") or env_str("NVIDIA_NIM_API_KEY"),
+        nvidia_model=env_str("NVIDIA_MODEL") or default_models("nvidia"),
+        nvidia_base_url=(env_str("NVIDIA_BASE_URL", DEFAULT_NVIDIA_BASE_URL) or DEFAULT_NVIDIA_BASE_URL).rstrip("/"),
+        zai_api_key=env_str("ZAI_API_KEY") or env_str("GLM_API_KEY"),
+        zai_model=env_str("ZAI_MODEL") or default_models("zai"),
+        zai_base_url=(env_str("ZAI_BASE_URL", DEFAULT_ZAI_BASE_URL) or DEFAULT_ZAI_BASE_URL).rstrip("/"),
         llm_fallback=env_bool("JULES_LLM_FALLBACK", True),
         llm_order=tuple(clean_provider_order(env_str("JULES_LLM_ORDER") or "")),
         commit_authorship=_commit_authorship(env_str("JULES_COMMIT_AUTHORSHIP")),

@@ -31,7 +31,7 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 import httpx
 
@@ -40,6 +40,7 @@ from ..config import (
     GEMINI_MODEL_PREFERENCES,
     GROQ_MODEL_PREFERENCES,
     LLM_PROVIDERS,
+    NVIDIA_MODEL_PREFERENCES,
     OPENAI_MODEL_PREFERENCES,
     PROVIDER_KEY_VARIABLES,
     PROVIDER_LABELS,
@@ -72,6 +73,12 @@ _TOOL_FORMAT_RE = re.compile(
     re.IGNORECASE,
 )
 _REJECTED_TOOL_RE = re.compile(r"attempted to call tool '([^']{1,80})'", re.IGNORECASE)
+# Ways a reply can end that mean there is none: finish_reason -> (kind, why).
+_FAILED_FINISH = {
+    "sensitive": ("blocked", "its content filter stopped it"),
+    "network_error": ("server", "the provider lost its connection to the model"),
+    "model_context_window_exceeded": ("too_large", "the conversation is longer than the model can take in"),
+}
 _REPEATED_PREFIX_RE = re.compile(r"^(?P<prefix>[^:]{4,60}):\s*(?P=prefix):\s*", re.IGNORECASE)
 
 # Sampling temperature for tool calling. Providers default to 1.0, which makes
@@ -96,9 +103,11 @@ class LLMError(Exception):
 
     ``quota`` means the account cannot be used until something changes (no
     credits left); ``daily`` marks a rate limit that does not lift within a
-    run. ``provider`` names who failed. When several providers are configured
-    and another one has taken over, ``switched_to`` names it: the request can
-    be repeated at once.
+    run. ``model_only`` says that a ``quota`` failure is about the model that
+    was asked - a paid one on an account without a balance - and not about the
+    provider's other models. ``provider`` names who failed. When several
+    providers are configured and another one has taken over, ``switched_to``
+    names it: the request can be repeated at once.
     """
 
     def __init__(
@@ -112,6 +121,7 @@ class LLMError(Exception):
         failed_generation: Optional[str] = None,
         daily: bool = False,
         provider: Optional[str] = None,
+        model_only: bool = False,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -122,6 +132,7 @@ class LLMError(Exception):
         self.failed_generation = failed_generation
         self.daily = daily
         self.provider = provider
+        self.model_only = model_only
         self.switched_to: Optional[str] = None
         # After waiting ``retry_after`` the request goes to this provider.
         self.next_provider: Optional[str] = None
@@ -315,6 +326,28 @@ def _reset_delay(headers: httpx.Headers, metadata: Dict[str, Any]) -> Optional[f
     return None
 
 
+def _problem_text(body: Any) -> str:
+    """What an error body says when it is not OpenAI's ``{"error": {...}}``.
+
+    NVIDIA's gateway answers with problem details (``{"status": 429, "title":
+    "Too Many Requests"}``, sometimes with a ``detail``), model servers behind
+    it with ``{"object": "error", "message": ...}``, and request validation
+    with a list of what was wrong under ``detail``.
+    """
+    if not isinstance(body, dict):
+        return ""
+    detail = body.get("detail")
+    if isinstance(detail, list):
+        items = [str(item.get("msg") or "") for item in detail if isinstance(item, dict)]
+        detail = "; ".join(item for item in items if item)
+    parts: List[str] = []
+    for value in (body.get("title"), detail, body.get("message")):
+        text = value.strip() if isinstance(value, str) else ""
+        if text and text not in parts:
+            parts.append(text)
+    return clip_text(": ".join(parts), 300)
+
+
 def _choose_model(available: Sequence[str], preferences: Sequence[str], current: str) -> Optional[str]:
     present = set(available)
     for candidate in preferences:
@@ -407,6 +440,10 @@ class OpenAICompatibleClient(_HttpProvider):
         extra_headers: Optional[Dict[str, str]] = None,
         assumed_tokens_per_minute: Optional[int] = None,
         list_models: bool = True,
+        error_codes: Optional[Mapping[str, str]] = None,
+        error_hints: Sequence[Tuple[str, str]] = (),
+        limits_per_account: bool = False,
+        rate_limit_cooldown: Optional[float] = None,
         transport: Optional[httpx.BaseTransport] = None,
         on_notice: Optional[Notice] = None,
     ) -> None:
@@ -425,6 +462,16 @@ class OpenAICompatibleClient(_HttpProvider):
         self.model_env_var = model_env_var
         self._preferences = tuple(model_preferences)
         self._output_tokens_param = output_tokens_param
+        # What the provider's own error codes mean, where its HTTP status does
+        # not say (see ZAI_ERROR_CODES), and what to add to a message that
+        # needs explaining: (pattern, sentence).
+        self._error_codes = dict(error_codes or {})
+        self._error_hints = [(re.compile(pattern, re.IGNORECASE), hint) for pattern, hint in error_hints]
+        # The provider counts requests per account, not per model: when one of
+        # its models is rate limited the others are too (see FailoverClient).
+        self.limits_per_account = limits_per_account
+        # How long to stay away after a rate limit that names no waiting time.
+        self.rate_limit_cooldown = rate_limit_cooldown
         # For providers that do not report a tokens-per-minute limit: what the
         # agent may assume when it sizes its context.
         self.assumed_tokens_per_minute = assumed_tokens_per_minute
@@ -550,6 +597,10 @@ class OpenAICompatibleClient(_HttpProvider):
             except ValueError:
                 body = {}
         detail = body.get("error") if isinstance(body, dict) else None
+        if detail is None and isinstance(body, dict) and body.get("message") and "code" in body:
+            # The body is the error itself: Z.AI's documented schema, and the
+            # model servers behind NVIDIA's gateway.
+            detail = body
         failed_generation: Optional[str] = None
         metadata: Dict[str, Any] = {}
         if isinstance(detail, dict):
@@ -564,12 +615,16 @@ class OpenAICompatibleClient(_HttpProvider):
                 raw = metadata.get("raw")
                 if isinstance(raw, str) and raw.strip() and raw.strip() not in message:
                     message = f"{message} ({clip_text(raw.strip(), 300)})" if message else raw.strip()
-            if status == 200 and code.isdigit():
+            if status == 200 and code.isdigit() and 400 <= int(code) <= 599:
                 status = int(code)  # an error reported inside a 200 response
         else:
-            message = str(detail or (response.text or "")[:300])
+            message = str(detail or _problem_text(body) or (response.text or "")[:300])
             code = ""
         text = f"{self.provider} returned HTTP {status}: {message or 'no details'}"
+        for pattern, hint in self._error_hints:
+            if pattern.search(message):
+                text += f" {hint}"
+                break
         lowered = message.lower()
         refused_reply = code == "tool_use_failed" or (
             status in (400, 422)
@@ -620,13 +675,24 @@ class OpenAICompatibleClient(_HttpProvider):
             kind = "server"
         else:
             kind = "bad_request"
+        daily = kind == "rate_limit" and _PER_DAY_RE.search(message) is not None
+        # The provider's own code says more than the status it arrived with.
+        meaning = self._error_codes.get(code)
+        model_only = False
+        if meaning == "no_balance":
+            kind, daily, model_only = "quota", False, True
+        elif meaning == "limit_reached":
+            kind, daily = "rate_limit", True
+        elif meaning:
+            kind, daily = meaning, False
         return LLMError(
             text,
             kind=kind,
             status_code=status,
             retry_after=retry_after,
-            daily=kind == "rate_limit" and _PER_DAY_RE.search(message) is not None,
+            daily=daily,
             provider=self.provider,
+            model_only=model_only,
         )
 
     def _parse(self, response: httpx.Response, tools: Sequence[Dict[str, Any]] = ()) -> LLMResponse:
@@ -673,6 +739,17 @@ class OpenAICompatibleClient(_HttpProvider):
                 }
             )
 
+        finish_reason = str(choice.get("finish_reason") or "")
+        if finish_reason in _FAILED_FINISH and not content.strip() and not calls:
+            # Z.AI reports what stopped a reply this way, inside a 200 answer.
+            kind, why = _FAILED_FINISH[finish_reason]
+            raise LLMError(
+                f"{self.provider} returned no reply: {why} (finish_reason {finish_reason}).",
+                kind=kind,
+                status_code=response.status_code,
+                provider=self.provider,
+            )
+
         # Only fields every OpenAI-compatible API accepts back are kept; provider
         # extras such as `reasoning` are dropped from the history.
         assistant: Dict[str, Any] = {"role": "assistant", "content": content}
@@ -682,7 +759,7 @@ class OpenAICompatibleClient(_HttpProvider):
         return LLMResponse(
             content=content,
             tool_calls=calls,
-            finish_reason=str(choice.get("finish_reason") or ""),
+            finish_reason=finish_reason,
             model=str(body.get("model") or self.model),
             assistant_message=assistant,
             tokens_per_minute_limit=_int_header(response.headers, "x-ratelimit-limit-tokens"),
@@ -1481,14 +1558,26 @@ class FailoverClient:
                 # The model the router picked is throttled, not the account.
                 slot.ready_at = now + COOLDOWN_ROUTER_PICK
             else:
-                slot.ready_at = now + max(1.0, exc.retry_after or COOLDOWN_UNKNOWN_RATE_LIMIT)
+                wait = max(
+                    1.0,
+                    exc.retry_after
+                    or getattr(slot.client, "rate_limit_cooldown", None)
+                    or COOLDOWN_UNKNOWN_RATE_LIMIT,
+                )
+                slot.ready_at = now + wait
+                if getattr(slot.client, "limits_per_account", False):
+                    # One allowance for the whole account (NVIDIA): its other
+                    # models are limited too, and asking them prolongs it.
+                    for other in self._slots:
+                        if other.out is None and other.client.provider == slot.client.provider:
+                            other.ready_at = max(other.ready_at, now + wait)
         elif kind in _OUT_FOR_THE_RUN:
             slot.out = {
                 "auth": "its API key was rejected",
-                "quota": "its account has no credit left",
+                "quota": "its account has no credit for this model" if exc.model_only else "its account has no credit left",
                 "model_unavailable": "its model is not available",
             }.get(kind, "it refused the request")
-            if kind in _OUT_FOR_THE_PROVIDER:
+            if kind in _OUT_FOR_THE_PROVIDER and not exc.model_only:
                 # The key or the account: no other model of this provider will work either.
                 for other in self._slots:
                     if other.out is None and other.client.provider == slot.client.provider:
@@ -1527,7 +1616,10 @@ class FailoverClient:
         if not waiting:
             return
         exc.all_limited = len(self._slots) > 1
-        soonest = min(waiting, key=lambda index: self._slots[index].ready_at)
+        # The one that is free first; of several that are free at the same
+        # moment (the models of an account-wide limit) not the one that has
+        # just refused, in case it is that model which is short of capacity.
+        soonest = min(waiting, key=lambda index: (self._slots[index].ready_at, index == current))
         if soonest != current:
             self._active = soonest
             self.switches += 1
@@ -1572,6 +1664,90 @@ def _temperature_setting(raw: Optional[str], default: Optional[float]) -> Option
     if value != value:  # NaN
         return default
     return max(0.0, min(2.0, value))
+
+
+# What Z.AI's own error codes mean (https://docs.z.ai/api-reference/api-code).
+# Its HTTP status does not say: "no balance", "plan expired" and "limit of the
+# week reached" all arrive as 429, an unknown model as 400.
+ZAI_ERROR_CODES: Dict[str, str] = {
+    # Paid for from the account's balance, and there is none. Only this model:
+    # the free Flash models need no balance.
+    "1113": "no_balance",
+    "1211": "model_unavailable",  # unknown model
+    "1212": "model_unavailable",  # the model does not take this kind of call
+    "1220": "model_unavailable",  # no permission to use it
+    "1311": "model_unavailable",  # the subscription does not include it
+    "1261": "too_large",  # prompt too long
+    "1301": "blocked",  # its content filter
+    "1302": "rate_limit",
+    "1305": "server",  # overloaded: try again later
+    # An allowance that is used up until a time hours or days away.
+    **{code: "limit_reached" for code in ("1308", "1310", "1316", "1317", "1318", "1319", "1320", "1321")},
+    # The subscription has expired or is restricted, or the key belongs to another product.
+    **{code: "quota" for code in ("1309", "1313", "1314", "1315")},
+}
+ZAI_ERROR_HINTS = (
+    (
+        r"insufficient balance|no resource package",
+        "That model is paid for from the account's balance; Z.AI's free Flash models do not need one.",
+    ),
+)
+NVIDIA_ERROR_HINTS = (
+    (
+        r"not found for account",
+        "NVIDIA answers this for a model it has withdrawn - and for every model when the account "
+        "has not been given access to its hosted endpoints.",
+    ),
+)
+# NVIDIA counts requests per account and per minute; no waiting time is named.
+NVIDIA_RATE_LIMIT_COOLDOWN = 60.0
+_GLM_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?", re.IGNORECASE)
+
+
+def _zai_thinking(model: str, raw: Optional[str]) -> Dict[str, Any]:
+    """What a request to Z.AI says about thinking (``ZAI_REASONING_EFFORT``).
+
+    Left alone, a GLM model thinks before every reply, at its highest effort:
+    more than a run of a few minutes with one request per step can afford. Our
+    default, ``none``, switches thinking off - or, for the models that cannot
+    switch it off (GLM-5.3 and later), asks for the lowest effort. ``low``,
+    ``medium``, ``high`` and ``max`` ask for thinking at that effort;
+    ``default`` leaves everything to Z.AI.
+    """
+    effort = (raw or "none").strip().lower()
+    if effort == "default":
+        return {}
+    match = _GLM_VERSION_RE.match(model)
+    always_thinks = bool(match) and (int(match.group(1)), int(match.group(2) or 0)) >= (5, 3)
+    if effort in ("none", "off", "disabled", "minimal"):
+        return {"reasoning_effort": "low"} if always_thinks else {"thinking": {"type": "disabled"}}
+    if effort not in ("low", "medium", "high", "xhigh", "max"):
+        effort = "low"
+    if always_thinks:
+        # These models know three levels.
+        effort = {"medium": "high", "xhigh": "max"}.get(effort, effort)
+    return {"thinking": {"type": "enabled"}, "reasoning_effort": effort}
+
+
+# What a request is made of: not for a setting to replace.
+_OWN_FIELDS = ("model", "messages", "tools", "tool_choice", "stream", "max_tokens", "max_completion_tokens", "n")
+
+
+def _extra_body(raw: Optional[str]) -> Dict[str, Any]:
+    """More fields for every request to a provider, from a setting that holds
+    a JSON object (``NVIDIA_EXTRA_BODY``): what one model's page documents and
+    another model does not know, such as
+    ``{"chat_template_kwargs": {"enable_thinking": false}}``. Anything that is
+    not an object is ignored, as are the fields a request is made of."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(name): value for name, value in parsed.items() if name not in _OWN_FIELDS}
 
 
 def _thinking_level(raw: Optional[str]) -> Optional[str]:
@@ -1662,6 +1838,61 @@ def build_provider_client(
             assumed_tokens_per_minute=200_000,
             # Its catalogue has hundreds of models: there is no sensible automatic pick.
             list_models=False,
+            transport=transport,
+            on_notice=on_notice,
+        )
+    if provider == "nvidia":
+        optional = {}
+        temperature = _temperature_setting(env_str("NVIDIA_TEMPERATURE"), DEFAULT_GROQ_TEMPERATURE)
+        if temperature is not None:
+            optional["temperature"] = temperature
+        # The models differ in whether and how they reason, and in what they
+        # accept: nothing is asked for unless it is set.
+        effort = (env_str("NVIDIA_REASONING_EFFORT") or "default").lower()
+        if effort != "default":
+            optional["reasoning_effort"] = effort
+        optional.update(_extra_body(env_str("NVIDIA_EXTRA_BODY")))
+        # When this model is withdrawn, one that NVIDIA still lists takes its
+        # place - not one that another entry of the chain is using already.
+        elsewhere = [name for name in settings.models_for("nvidia") if name != model]
+        return OpenAICompatibleClient(
+            provider="nvidia",
+            base_url=settings.nvidia_base_url,
+            api_key=settings.nvidia_api_key or "",
+            model=model,
+            model_env_var="NVIDIA_MODEL",
+            model_preferences=[name for name in NVIDIA_MODEL_PREFERENCES if name not in elsewhere],
+            optional_params=optional,
+            output_tokens_param="max_tokens",
+            # No tokens-per-minute limit: requests are counted, and the context windows are large.
+            assumed_tokens_per_minute=200_000,
+            error_hints=NVIDIA_ERROR_HINTS,
+            limits_per_account=True,
+            rate_limit_cooldown=NVIDIA_RATE_LIMIT_COOLDOWN,
+            transport=transport,
+            on_notice=on_notice,
+        )
+    if provider == "zai":
+        optional = {}
+        temperature = _temperature_setting(env_str("ZAI_TEMPERATURE"), DEFAULT_GROQ_TEMPERATURE)
+        if temperature is not None:
+            optional["temperature"] = min(1.0, temperature)  # Z.AI takes 0 to 1
+        optional.update(_zai_thinking(model, env_str("ZAI_REASONING_EFFORT")))
+        return OpenAICompatibleClient(
+            provider="zai",
+            base_url=settings.zai_base_url,
+            api_key=settings.zai_api_key or "",
+            model=model,
+            model_env_var="ZAI_MODEL",
+            optional_params=optional,
+            output_tokens_param="max_tokens",
+            # Error messages in English.
+            extra_headers={"Accept-Language": "en-US,en"},
+            assumed_tokens_per_minute=200_000,
+            # A model that is gone is left to the next entry of the chain.
+            list_models=False,
+            error_codes=ZAI_ERROR_CODES,
+            error_hints=ZAI_ERROR_HINTS,
             transport=transport,
             on_notice=on_notice,
         )
@@ -1764,10 +1995,15 @@ def probe_provider(
         result.update(kind="no_key", message=f"No API key for {label} was sent or is set on the server.")
         return result
     tried: List[Dict[str, Any]] = []
+    whole_provider = False
     for model in settings.models_for(provider):
-        if tried and tried[0]["kind"] in _OUT_FOR_THE_PROVIDER:
+        if whole_provider:
             break  # the key or the account: the other models would say the same
-        tried.append(_probe_model(settings, provider, model, label, transport, timeout))
+        outcome = _probe_model(settings, provider, model, label, transport, timeout)
+        # (Not so when only that model is paid for: a free one may still answer.)
+        whole_provider = outcome["kind"] in _OUT_FOR_THE_PROVIDER and not outcome.pop("model_only", False)
+        outcome.pop("model_only", None)
+        tried.append(outcome)
     result.update(tried[0])
     if len(settings.models_for(provider)) > 1:
         result["models"] = tried
@@ -1790,10 +2026,15 @@ def _probe_model(
     try:
         response = client.complete(_PROBE_MESSAGES, [_PROBE_TOOL], max_output_tokens=1024, timeout=timeout)
     except LLMError as exc:
-        outcome.update(kind=exc.kind, message=exc.message, model=client.model)
+        outcome.update(kind=exc.kind, message=exc.message, model=client.model, model_only=exc.model_only)
+        if client.model != model:
+            outcome["requested"] = model
         return outcome
     finally:
         client.close()
+    if client.model != model:
+        # The model that was asked for is gone; the client found another (see the notices).
+        outcome["requested"] = model
     called = any(call.name == "confirm" for call in response.tool_calls)
     # A router or an alias answers with the model it chose.
     chosen = response.model if response.model and response.model != client.model else ""

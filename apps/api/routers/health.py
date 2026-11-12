@@ -23,6 +23,8 @@ router = APIRouter(prefix="/api/v1/health", tags=["health"])
 REPORTED_VARIABLES = (
     "GROQ_API_KEY",
     "GEMINI_API_KEY",
+    "NVIDIA_API_KEY",
+    "ZAI_API_KEY",
     "OPENROUTER_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -60,7 +62,10 @@ async def health_env_check():
     """
     settings = get_settings()
     variables = {name: bool(env_str(name)) for name in REPORTED_VARIABLES}
-    variables["GEMINI_API_KEY"] = bool(settings.gemini_api_key)  # GOOGLE_API_KEY counts too
+    # A key counts under whichever of its names it was set (GOOGLE_API_KEY,
+    # NVIDIA_NIM_API_KEY, GLM_API_KEY).
+    for name in LLM_PROVIDERS:
+        variables[PROVIDER_KEY_VARIABLES[name]] = bool(settings.api_key_for(name))
     missing = settings.missing_requirements()
     provider = settings.llm_provider
     identity = settings.commit_identity

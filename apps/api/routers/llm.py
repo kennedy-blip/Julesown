@@ -15,7 +15,7 @@ router = APIRouter(prefix="/api/v1/llm", tags=["llm"], dependencies=[Depends(req
 
 
 class ProviderTestRequest(BaseModel):
-    provider: str = Field(..., description="groq, gemini, openrouter, openai or anthropic")
+    provider: str = Field(..., description="groq, gemini, nvidia, zai, openrouter, openai or anthropic")
     # Up to four names of up to 200 characters, with what separates them.
     model: Optional[str] = Field(
         None,
