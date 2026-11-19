@@ -44,15 +44,20 @@ from ..config import (
     OPENAI_MODEL_PREFERENCES,
     PROVIDER_KEY_VARIABLES,
     PROVIDER_LABELS,
+    SAMBANOVA_MODEL_PREFERENCES,
     Settings,
     env_str,
 )
 
 Notice = Callable[[str], None]
+# Looks at an answer that arrived with HTTP 200 - the body, the text of the
+# reply, whether it calls tools - and returns the failure it really is, if any.
+ReplyCheck = Callable[[Any, str, bool], Optional["LLMError"]]
 
 _MODEL_GONE_CODES = {"model_not_found", "model_decommissioned", "model_deprecated", "model_not_active"}
+# ("Model Not Exist" is all DeepSeek says about a name it does not know.)
 _MODEL_GONE_RE = re.compile(
-    r"decommission|deprecat|does not exist|do not have access|not found|no longer (?:available|supported)",
+    r"decommission|deprecat|not exist|do not have access|not found|no longer (?:available|supported)",
     re.IGNORECASE,
 )
 _NON_CHAT_RE = re.compile(
@@ -80,6 +85,10 @@ _FAILED_FINISH = {
     "model_context_window_exceeded": ("too_large", "the conversation is longer than the model can take in"),
 }
 _REPEATED_PREFIX_RE = re.compile(r"^(?P<prefix>[^:]{4,60}):\s*(?P=prefix):\s*", re.IGNORECASE)
+# "This model requires the paid balance": no credit for the model that was
+# asked, which says nothing about the provider's other models.
+_PAID_MODEL_RE = re.compile(r"this model (?:requires|needs)", re.IGNORECASE)
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(<?[^)>]*>?\)")
 
 # Sampling temperature for tool calling. Providers default to 1.0, which makes
 # malformed tool calls and invented content more likely; Groq's tool-use guide
@@ -307,6 +316,13 @@ def clip_text(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _followed_by(text: str, sentence: str) -> str:
+    """``text`` with a sentence of ours after it. What a provider wrote often
+    ends without a full stop ("Insufficient Balance"), and would run into it."""
+    text = text.rstrip()
+    return f"{text}{'' if text.endswith(('.', '!', '?', '…')) else '.'} {sentence}"
+
+
 def _reset_delay(headers: httpx.Headers, metadata: Dict[str, Any]) -> Optional[float]:
     """Seconds until a rate limit resets, from ``X-RateLimit-Reset`` (a Unix
     time in seconds or milliseconds), sent as a header or inside the error."""
@@ -444,6 +460,10 @@ class OpenAICompatibleClient(_HttpProvider):
         error_hints: Sequence[Tuple[str, str]] = (),
         limits_per_account: bool = False,
         rate_limit_cooldown: Optional[float] = None,
+        daily_limit_per_account: bool = False,
+        tokens_counted_per_day: bool = False,
+        empty_content_with_tool_calls: bool = False,
+        reply_check: Optional[ReplyCheck] = None,
         transport: Optional[httpx.BaseTransport] = None,
         on_notice: Optional[Notice] = None,
     ) -> None:
@@ -472,6 +492,20 @@ class OpenAICompatibleClient(_HttpProvider):
         self.limits_per_account = limits_per_account
         # How long to stay away after a rate limit that names no waiting time.
         self.rate_limit_cooldown = rate_limit_cooldown
+        # The provider's daily allowance is one for the whole account: when it
+        # is used up, it is used up for every one of its models.
+        self.daily_limit_per_account = daily_limit_per_account
+        # The provider limits requests by the minute and by the day and says
+        # in headers how many of each are left - and it limits tokens by the
+        # day, of which it says nothing (SambaNova). A refusal that arrives
+        # while requests are left can then only be about the day's tokens.
+        self._tokens_counted_per_day = tokens_counted_per_day
+        # The provider refuses an assistant message whose content is null,
+        # which is how OpenAI writes one that only calls tools.
+        self._empty_content_with_tool_calls = empty_content_with_tool_calls
+        # A look at every answer for what the provider reports inside one
+        # instead of failing the request (see _pollinations_notice).
+        self._reply_check = reply_check
         # For providers that do not report a tokens-per-minute limit: what the
         # agent may assume when it sizes its context.
         self.assumed_tokens_per_minute = assumed_tokens_per_minute
@@ -484,10 +518,18 @@ class OpenAICompatibleClient(_HttpProvider):
         # one raises the sampling temperature of the next request a little, so a
         # retry is not a re-run of the request that just failed.
         self._refused_replies = 0
+        # Tools are sent with ``tool_choice: "auto"``, which is what sending
+        # tools means anyway. A model server that does not know the field has
+        # it left out from then on.
+        self._send_tool_choice = True
 
-    @staticmethod
-    def _wire_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [{k: v for k, v in message.items() if not k.startswith("_")} for message in messages]
+    def _wire_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        wire = [{k: v for k, v in message.items() if not k.startswith("_")} for message in messages]
+        if self._empty_content_with_tool_calls:
+            for message in wire:
+                if message.get("role") == "assistant" and message.get("tool_calls") and message.get("content") is None:
+                    message["content"] = ""
+        return wire
 
     def complete(
         self,
@@ -515,7 +557,8 @@ class OpenAICompatibleClient(_HttpProvider):
                 )
             if tools:
                 payload["tools"] = tools
-                payload["tool_choice"] = "auto"
+                if self._send_tool_choice:
+                    payload["tool_choice"] = "auto"
             response = self._post("/chat/completions", payload, timeout)
             if response.status_code == 200:
                 parsed = self._parse(response, tools)
@@ -536,6 +579,9 @@ class OpenAICompatibleClient(_HttpProvider):
                 if rejected:
                     for name in rejected:
                         self._optional.pop(name, None)
+                    continue
+                if "tool_choice" in payload and "tool_choice" in error.message:
+                    self._send_tool_choice = False
                     continue
             if error.kind == "model_unavailable" and not self._fallback_attempted and self._list_models:
                 self._fallback_attempted = True
@@ -601,12 +647,26 @@ class OpenAICompatibleClient(_HttpProvider):
             # The body is the error itself: Z.AI's documented schema, and the
             # model servers behind NVIDIA's gateway.
             detail = body
+        if detail is None and isinstance(body, dict) and isinstance(body.get("errors"), list):
+            # Cloudflare's API: {"success": false, "errors": [{"code": 5007, "message": "..."}]}.
+            detail = next((item for item in body["errors"] if isinstance(item, dict)), None)
         failed_generation: Optional[str] = None
         metadata: Dict[str, Any] = {}
         if isinstance(detail, dict):
             message = str(detail.get("message") or "")
             code = str(detail.get("code") or "")
-            generated = detail.get("failed_generation")
+            # What exactly was wrong, where Cloudflare says it one level down.
+            chain = detail.get("error_chain")
+            if isinstance(chain, list):
+                causes = [str(item.get("message") or "") for item in chain if isinstance(item, dict)]
+                causes = [cause for cause in causes if cause and cause not in message]
+                if causes:
+                    message = f"{message} ({'; '.join(causes)})" if message else "; ".join(causes)
+            # The model's reply as it was written, when the provider could not
+            # use it: Groq's name for it, and SambaNova's two.
+            generated = (
+                detail.get("failed_generation") or detail.get("error_model_output") or detail.get("model_output")
+            )
             if generated:
                 failed_generation = generated if isinstance(generated, str) else json.dumps(generated)
             if isinstance(detail.get("metadata"), dict):
@@ -623,12 +683,15 @@ class OpenAICompatibleClient(_HttpProvider):
         text = f"{self.provider} returned HTTP {status}: {message or 'no details'}"
         for pattern, hint in self._error_hints:
             if pattern.search(message):
-                text += f" {hint}"
+                text = _followed_by(text, hint)
                 break
         lowered = message.lower()
-        refused_reply = code == "tool_use_failed" or (
-            status in (400, 422)
-            and (failed_generation is not None or _TOOL_FORMAT_RE.search(message) is not None)
+        refused_reply = (
+            code == "tool_use_failed"
+            # Whatever the status: a provider that hands the model's own words
+            # back is saying that those were the problem.
+            or failed_generation is not None
+            or (status in (400, 422) and _TOOL_FORMAT_RE.search(message) is not None)
         )
         # The key works but this model cannot be used with it: retired, never
         # existed, blocked for the project, or its terms were not accepted
@@ -643,7 +706,7 @@ class OpenAICompatibleClient(_HttpProvider):
         retry_after = _retry_after(response.headers, message)
         if status == 401 or (status == 403 and not model_problem):
             kind = "auth"
-            text += f" Check the {self.provider.upper()} API key."
+            text = _followed_by(text, f"Check the {self.provider.upper()} API key.")
         elif status == 402:
             # No credits (OpenRouter answers this for free models too when the
             # balance is negative). A short Retry-After means "settling", not "empty".
@@ -669,13 +732,29 @@ class OpenAICompatibleClient(_HttpProvider):
                 rejected_tool=rejected_tool,
                 failed_generation=failed_generation,
             )
-        elif status == 404 or model_problem:
+        elif status in (404, 410) or model_problem:
             kind = "model_unavailable"
         elif status >= 500 or status == 408:
             kind = "server"
         else:
             kind = "bad_request"
-        daily = kind == "rate_limit" and _PER_DAY_RE.search(message) is not None
+        # SambaNova counts requests per minute and per day. Its refusal reads
+        # the same for both ("Rate limit exceeded"): a header says which ran out.
+        day_left = _int_header(response.headers, "x-ratelimit-remaining-requests-day")
+        day_is_spent = kind == "rate_limit" and day_left == 0
+        # ... and when neither did, it is the tokens, which it counts by the day.
+        tokens_are_spent = (
+            kind == "rate_limit"
+            and self._tokens_counted_per_day
+            and (day_left or 0) > 0
+            and (_int_header(response.headers, "x-ratelimit-remaining-requests") or 0) > 0
+        )
+        daily = kind == "rate_limit" and (_PER_DAY_RE.search(message) is not None or day_is_spent or tokens_are_spent)
+        if day_is_spent and _PER_DAY_RE.search(message) is None:
+            a_day = _int_header(response.headers, "x-ratelimit-limit-requests-day")
+            text = _followed_by(text, "This model's requests for today are used up" + (f" ({a_day} a day)." if a_day else "."))
+        elif tokens_are_spent and _PER_DAY_RE.search(message) is None:
+            text = _followed_by(text, "Requests are left, so this is taken to be the model's limit of tokens per day.")
         # The provider's own code says more than the status it arrived with.
         meaning = self._error_codes.get(code)
         model_only = False
@@ -685,6 +764,8 @@ class OpenAICompatibleClient(_HttpProvider):
             kind, daily = "rate_limit", True
         elif meaning:
             kind, daily = meaning, False
+        if kind == "quota" and _PAID_MODEL_RE.search(message):
+            model_only = True
         return LLMError(
             text,
             kind=kind,
@@ -718,7 +799,10 @@ class OpenAICompatibleClient(_HttpProvider):
         calls: List[ToolCall] = []
         wire_calls: List[Dict[str, Any]] = []
         for position, raw in enumerate(message.get("tool_calls") or []):
-            function = (raw or {}).get("function") or {}
+            raw = raw if isinstance(raw, dict) else {}
+            # OpenAI puts a call's name and arguments under "function"; the
+            # models Cloudflare hosts also know a form with both on the call itself.
+            function = raw.get("function") if isinstance(raw.get("function"), dict) else raw
             name = str(function.get("name") or "")
             # "functions/write_file" means write_file; an unknown name stays as it is.
             name = canonical_tool_name(name, known) or name
@@ -749,6 +833,10 @@ class OpenAICompatibleClient(_HttpProvider):
                 status_code=response.status_code,
                 provider=self.provider,
             )
+        if self._reply_check is not None:
+            problem = self._reply_check(body, content, bool(calls))
+            if problem is not None:
+                raise problem
 
         # Only fields every OpenAI-compatible API accepts back are kept; provider
         # extras such as `reasoning` are dropped from the history.
@@ -904,7 +992,7 @@ class AnthropicClient(_HttpProvider):
 
         if status in (401, 403) or error_type in ("authentication_error", "permission_error"):
             kind = "auth"
-            text += " Check ANTHROPIC_API_KEY."
+            text = _followed_by(text, "Check ANTHROPIC_API_KEY.")
         elif status == 429 or error_type == "rate_limit_error":
             kind = "rate_limit"
         elif status == 413 or error_type == "request_too_large" or "prompt is too long" in lowered:
@@ -1244,7 +1332,7 @@ class GeminiClient(_HttpProvider):
 
         if status in (401, 403) or bad_key:
             kind = "auth"
-            text += " Check the Gemini API key (GEMINI_API_KEY) and that its project may use the Gemini API."
+            text = _followed_by(text, "Check the Gemini API key (GEMINI_API_KEY) and that its project may use the Gemini API.")
         elif status == 402:
             kind = "quota"
         elif status == 429:
@@ -1398,6 +1486,17 @@ def _counts_as_free(client: Any) -> bool:
     return getattr(client, "provider", "") == "openrouter" and (model == "openrouter/free" or model.endswith(":free"))
 
 
+def _shares_daily_allowance(one: Any, other: Any) -> bool:
+    """Whether two entries of the pool draw on the same daily allowance:
+    OpenRouter's free models do, and so does every model of a provider that
+    counts per account (Cloudflare's neurons)."""
+    if _counts_as_free(one) and _counts_as_free(other):
+        return True
+    return bool(getattr(one, "daily_limit_per_account", False)) and getattr(one, "provider", "") == getattr(
+        other, "provider", None
+    )
+
+
 @dataclass
 class _Slot:
     client: ChatClient
@@ -1549,11 +1648,11 @@ class FailoverClient:
         if kind == "rate_limit":
             if exc.daily:
                 slot.out = "its daily limit is used up"
-                if _counts_as_free(slot.client):
-                    # Counted per account, not per model: the other free models are out too.
-                    for other in self._slots:
-                        if other.out is None and _counts_as_free(other.client):
-                            other.out = slot.out
+                # Where that is counted per account, not per model, the
+                # provider's other models are out too.
+                for other in self._slots:
+                    if other.out is None and _shares_daily_allowance(slot.client, other.client):
+                        other.out = slot.out
             elif exc.retry_after is None and is_router(slot.client.model) and "upstream" in exc.message.lower():
                 # The model the router picked is throttled, not the account.
                 slot.ready_at = now + COOLDOWN_ROUTER_PICK
@@ -1729,6 +1828,121 @@ def _zai_thinking(model: str, raw: Optional[str]) -> Dict[str, Any]:
     return {"thinking": {"type": "enabled"}, "reasoning_effort": effort}
 
 
+# What Cloudflare's error codes mean
+# (https://developers.cloudflare.com/workers-ai/platform/errors/). They arrive
+# as {"errors": [{"code": ..., "message": ...}]}, and the status beside them
+# does not always say enough: an unknown model is a 400, a wrong account ID a 404.
+CLOUDFLARE_ERROR_CODES: Dict[str, str] = {
+    # The day's free allowance is used up. 3036 is the code Cloudflare
+    # documents for it, 4006 the one it sends.
+    "3036": "limit_reached",
+    "4006": "limit_reached",
+    "3040": "rate_limit",  # no capacity for this model at the moment
+    "5007": "model_unavailable",  # no such model
+    "3042": "model_unavailable",  # not a model name
+    "5028": "model_unavailable",  # withdrawn
+    "5016": "model_unavailable",  # the model's terms have not been agreed to
+    "5018": "model_unavailable",  # somebody else's private model
+    "3041": "model_unavailable",
+    # Only on Cloudflare's paid plan - this model; the others are free to use.
+    "5035": "no_balance",
+    # The address names an account Cloudflare does not know: the account ID.
+    "7003": "auth",
+    "7000": "auth",
+    # The token is not in the form of one.
+    "6003": "auth",
+    "6111": "auth",
+}
+CLOUDFLARE_ERROR_HINTS = (
+    (r"daily free allocation", "The allowance is for all of the account's models together and starts again at 00:00 UTC."),
+    (
+        r"requires a workers paid plan",
+        "Cloudflare offers that model on its paid plan only; the daily allowance covers the others.",
+    ),
+    (
+        r"could not route|no route for that uri",
+        "That is what Cloudflare answers when the account ID is not one it knows: check CLOUDFLARE_ACCOUNT_ID.",
+    ),
+    (
+        r"authentication error|invalid access token|invalid format for authorization",
+        "The token has to be one with the Workers AI permission, made for the account whose ID is used.",
+    ),
+)
+DEEPSEEK_ERROR_HINTS = (
+    (
+        r"insufficient balance",
+        "DeepSeek's API is paid for from the account's balance: it has to be topped up at platform.deepseek.com.",
+    ),
+)
+# The models whose requests have a switch for thinking, by their place in
+# Cloudflare's catalogue (the others would be sent a field they do not know).
+_CLOUDFLARE_THINKING_SWITCH_RE = re.compile(
+    r"/(?:glm-|gemma-4|qwen3\.\d|kimi-|deepseek-v|nemotron-|inkling-|phonellm-)", re.IGNORECASE
+)
+_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+# How every notice of Pollinations ends (see _pollinations_notice).
+_POLLINATIONS_NOTICE_MARK = "this isn't your pollinations account"
+
+
+def _cloudflare_thinking(model: str, raw: Optional[str]) -> Dict[str, Any]:
+    """What a request to Cloudflare says about thinking (``CLOUDFLARE_REASONING_EFFORT``).
+
+    Several of its models think before every reply unless told not to, which
+    costs time a run of a few minutes does not have - and neurons, of which
+    there are 10,000 a day. Our default, ``none``, switches thinking off for
+    the models that have a switch. ``low`` to ``max`` ask for that effort
+    instead (a model that does not take the parameter has it left out);
+    ``default`` leaves everything to the model.
+    """
+    effort = (raw or "none").strip().lower()
+    if effort == "default":
+        return {}
+    if effort in _REASONING_EFFORTS:
+        return {"reasoning_effort": effort}
+    if _CLOUDFLARE_THINKING_SWITCH_RE.search(model):
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {}
+
+
+def _pollinations_notice(body: Any, content: str, calls_tools: bool) -> Optional[LLMError]:
+    """The failure behind a reply that is Pollinations speaking, not a model.
+
+    When Pollinations will not serve a request - the account is out of credit,
+    the key has spent its budget or may not use the model - it does not fail
+    it. It answers HTTP 200 with a chat reply that says so, written for a
+    person at a chat window: "The account behind this API key doesn't have
+    enough credits. Please top up ...". An agent would take that for the
+    model's answer and end its task with it. Such a reply is recognised by the
+    sentence every one of them ends with and by having cost no tokens.
+    """
+    if calls_tools or not content:
+        return None
+    text = content.replace("\u2019", "'")
+    lowered = text.lower()
+    if _POLLINATIONS_NOTICE_MARK not in lowered:
+        return None
+    usage = body.get("usage") if isinstance(body, dict) else None
+    if isinstance(usage, dict) and _count(usage, "total_tokens", "completion_tokens") > 0:
+        return None  # a model wrote this, whatever it says
+    said = _MARKDOWN_LINK_RE.sub(r"\1", text.split("\n\n", 1)[0])
+    said = clip_text(" ".join(said.split()), 300)
+    if "isn't allowed to use" in lowered:
+        # The key is restricted to other models: this one is not for it.
+        kind, status, model_only = "model_unavailable", 403, False
+    else:
+        # No credit - for this model alone when it is one that only the paid
+        # balance pays for, and credit earned there is all the account has.
+        kind, status, model_only = "quota", 402, "needs the paid balance" in lowered
+    return LLMError(
+        f"pollinations did not answer the request: {said} "
+        "(The balance and the key's budget are shown at https://enter.pollinations.ai.)",
+        kind=kind,
+        status_code=status,
+        provider="pollinations",
+        model_only=model_only,
+    )
+
+
 # What a request is made of: not for a setting to replace.
 _OWN_FIELDS = ("model", "messages", "tools", "tool_choice", "stream", "max_tokens", "max_completion_tokens", "n")
 
@@ -1896,6 +2110,126 @@ def build_provider_client(
             transport=transport,
             on_notice=on_notice,
         )
+    if provider == "cloudflare":
+        base_url = settings.base_url_for("cloudflare")
+        if not base_url:
+            raise LLMError(
+                "Cloudflare needs the account ID (CLOUDFLARE_ACCOUNT_ID) as well as the API token: "
+                "it is part of the address its models are called at.",
+                kind="auth",
+                provider="cloudflare",
+            )
+        optional = {}
+        temperature = _temperature_setting(env_str("CLOUDFLARE_TEMPERATURE"), DEFAULT_GROQ_TEMPERATURE)
+        if temperature is not None:
+            optional["temperature"] = temperature
+        optional.update(_cloudflare_thinking(model, env_str("CLOUDFLARE_REASONING_EFFORT")))
+        # Asks Cloudflare to refuse a request at once (429, code 3040) rather
+        # than queue it for capacity: there are others in the chain to take
+        # it. Documented for this endpoint; where it is not applied the field
+        # is ignored and the request waits its turn.
+        # https://developers.cloudflare.com/workers-ai/features/reject-if-busy/
+        optional["options"] = {"rejectIfBusy": True}
+        return OpenAICompatibleClient(
+            provider="cloudflare",
+            base_url=base_url,
+            api_key=settings.cloudflare_api_key or "",
+            model=model,
+            model_env_var="CLOUDFLARE_MODEL",
+            optional_params=optional,
+            output_tokens_param="max_tokens",
+            # Requests are not what is counted: neurons are, per day.
+            assumed_tokens_per_minute=200_000,
+            # It has no list of models at this address; one that is gone is
+            # left to the next entry of the chain.
+            list_models=False,
+            error_codes=CLOUDFLARE_ERROR_CODES,
+            error_hints=CLOUDFLARE_ERROR_HINTS,
+            daily_limit_per_account=True,
+            empty_content_with_tool_calls=True,
+            transport=transport,
+            on_notice=on_notice,
+        )
+    if provider == "sambanova":
+        optional = {}
+        temperature = _temperature_setting(env_str("SAMBANOVA_TEMPERATURE"), DEFAULT_GROQ_TEMPERATURE)
+        if temperature is not None:
+            optional["temperature"] = temperature
+        # Some of its models reason and some do not: an effort (low, medium,
+        # high) is asked for only when it is set.
+        effort = (env_str("SAMBANOVA_REASONING_EFFORT") or "default").lower()
+        if effort != "default":
+            optional["reasoning_effort"] = effort
+        # A model that was withdrawn is replaced by one SambaNova still lists -
+        # not by one that another entry of the chain is using already.
+        elsewhere = [name for name in settings.models_for("sambanova") if name != model]
+        return OpenAICompatibleClient(
+            provider="sambanova",
+            base_url=settings.sambanova_base_url,
+            api_key=settings.sambanova_api_key or "",
+            model=model,
+            model_env_var="SAMBANOVA_MODEL",
+            model_preferences=[name for name in SAMBANOVA_MODEL_PREFERENCES if name not in elsewhere],
+            optional_params=optional,
+            output_tokens_param="max_tokens",
+            # Requests are counted, per model: by the minute and by the day.
+            assumed_tokens_per_minute=200_000,
+            # So are tokens on its free tier, by the day.
+            tokens_counted_per_day=True,
+            transport=transport,
+            on_notice=on_notice,
+        )
+    if provider == "pollinations":
+        optional = {}
+        temperature = _temperature_setting(env_str("POLLINATIONS_TEMPERATURE"), DEFAULT_GROQ_TEMPERATURE)
+        if temperature is not None:
+            optional["temperature"] = temperature
+        # The models behind it are of many makers and differ in what they
+        # take: nothing about reasoning is asked for unless it is set.
+        effort = (env_str("POLLINATIONS_REASONING_EFFORT") or "default").lower()
+        if effort != "default":
+            optional["reasoning_effort"] = effort
+        return OpenAICompatibleClient(
+            provider="pollinations",
+            base_url=settings.pollinations_base_url,
+            api_key=settings.pollinations_api_key or "",
+            model=model,
+            model_env_var="POLLINATIONS_MODEL",
+            optional_params=optional,
+            output_tokens_param="max_tokens",
+            assumed_tokens_per_minute=200_000,
+            # More than a hundred models: there is no sensible automatic pick.
+            list_models=False,
+            reply_check=_pollinations_notice,
+            transport=transport,
+            on_notice=on_notice,
+        )
+    if provider == "deepseek":
+        # Left alone, DeepSeek thinks before every reply - and once tools are
+        # in play it wants the reasoning of every earlier reply sent back with
+        # each request, refusing the request otherwise. A conversation that
+        # moves between providers has replies that came with none. So thinking
+        # is switched off, which is also what a short run can afford.
+        optional = {"thinking": {"type": "disabled"}}
+        temperature = _temperature_setting(env_str("DEEPSEEK_TEMPERATURE"), DEFAULT_GROQ_TEMPERATURE)
+        if temperature is not None:
+            optional["temperature"] = temperature
+        return OpenAICompatibleClient(
+            provider="deepseek",
+            base_url=settings.deepseek_base_url,
+            api_key=settings.deepseek_api_key or "",
+            model=model,
+            model_env_var="DEEPSEEK_MODEL",
+            optional_params=optional,
+            output_tokens_param="max_tokens",
+            assumed_tokens_per_minute=200_000,
+            # Its other model costs several times as much: it is not switched
+            # to behind the owner's back.
+            list_models=False,
+            error_hints=DEEPSEEK_ERROR_HINTS,
+            transport=transport,
+            on_notice=on_notice,
+        )
     if provider == "gemini":
         return GeminiClient(
             base_url=settings.gemini_base_url,
@@ -1991,19 +2325,23 @@ def probe_provider(
     if provider not in LLM_PROVIDERS:
         result.update(kind="unknown_provider", message=f"'{provider}' is not a provider this server knows.")
         return result
+    gap = settings.missing_for(provider)
+    if gap:
+        result.update(
+            kind="no_account",
+            message=f"{label} needs its account ID as well as the API token: enter it next to the token, "
+            f"or set {gap} on the server.",
+        )
+        return result
     if not settings.api_key_for(provider):
         result.update(kind="no_key", message=f"No API key for {label} was sent or is set on the server.")
         return result
     tried: List[Dict[str, Any]] = []
-    whole_provider = False
     for model in settings.models_for(provider):
+        outcome, whole_provider = _probe_model(settings, provider, model, label, transport, timeout)
+        tried.append(outcome)
         if whole_provider:
             break  # the key or the account: the other models would say the same
-        outcome = _probe_model(settings, provider, model, label, transport, timeout)
-        # (Not so when only that model is paid for: a free one may still answer.)
-        whole_provider = outcome["kind"] in _OUT_FOR_THE_PROVIDER and not outcome.pop("model_only", False)
-        outcome.pop("model_only", None)
-        tried.append(outcome)
     result.update(tried[0])
     if len(settings.models_for(provider)) > 1:
         result["models"] = tried
@@ -2017,8 +2355,9 @@ def _probe_model(
     label: str,
     transport: Optional[httpx.BaseTransport],
     timeout: float,
-) -> Dict[str, Any]:
-    """One test request to one model of a provider."""
+) -> Tuple[Dict[str, Any], bool]:
+    """One test request to one model of a provider: what came of it, and
+    whether that goes for the provider's other models as well."""
     outcome: Dict[str, Any] = {"model": model, "ok": False, "tool_call": False, "latency_ms": None, "kind": None, "message": ""}
     notices: List[str] = []
     client = build_provider_client(settings, provider, model=model, transport=transport, on_notice=notices.append)
@@ -2026,10 +2365,16 @@ def _probe_model(
     try:
         response = client.complete(_PROBE_MESSAGES, [_PROBE_TOOL], max_output_tokens=1024, timeout=timeout)
     except LLMError as exc:
-        outcome.update(kind=exc.kind, message=exc.message, model=client.model, model_only=exc.model_only)
+        outcome.update(kind=exc.kind, message=exc.message, model=client.model)
         if client.model != model:
             outcome["requested"] = model
-        return outcome
+        # The key or the account - but not when only that model is paid for (a
+        # free one may still answer) - or a day's allowance that is one for
+        # all of the provider's models.
+        whole_provider = (exc.kind in _OUT_FOR_THE_PROVIDER and not exc.model_only) or (
+            exc.kind == "rate_limit" and exc.daily and bool(getattr(client, "daily_limit_per_account", False))
+        )
+        return outcome, whole_provider
     finally:
         client.close()
     if client.model != model:
@@ -2054,4 +2399,4 @@ def _probe_model(
     )
     if chosen:
         outcome["answered_by"] = chosen
-    return outcome
+    return outcome, False

@@ -4,7 +4,7 @@
  * All URLs are relative: on Vercel the API is served from the same origin, and
  * in local development Next.js proxies /api/* to the backend (next.config.mjs).
  */
-import { getSettings, providerKeyHeaders, taskOptions } from './settings';
+import { getSettings, keyHeaderValue, providerKeyHeaders, taskOptions } from './settings';
 import type { ProviderId } from './settings';
 
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed';
@@ -175,6 +175,14 @@ export interface ProviderInfo {
   models?: string[];
   key_variable: string;
   model_variable: string;
+  /**
+   * Only for a provider that needs an account ID beside its key (Cloudflare):
+   * the variable that holds it, and which of the two the server has. Such a
+   * provider is `configured` when the server has both.
+   */
+  account_variable?: string;
+  key_set?: boolean;
+  account_set?: boolean;
 }
 
 export interface HealthEnv {
@@ -502,16 +510,17 @@ export function fetchAutomation(): Promise<AutomationStatus> {
 
 /**
  * Try a provider out with one small request. The key typed into the dashboard
- * is sent along (only that provider's); without one the server's own is tried.
+ * is sent along (only that provider's, with its account ID where it has one);
+ * without one the server's own is tried.
  */
-export async function testProvider(provider: ProviderId, key: string, model: string): Promise<ProviderTest> {
+export async function testProvider(provider: ProviderId, key: string, model: string, account = ''): Promise<ProviderTest> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'application/json',
     ...authHeaders(),
   };
-  const trimmed = key.trim();
-  if (trimmed && /^[\x21-\x7e]+$/.test(trimmed)) headers[`X-${provider}-Key`] = trimmed;
+  const sent = keyHeaderValue(provider, key, account);
+  if (sent) headers[`X-${provider}-Key`] = sent;
   const body: Record<string, string> = { provider };
   if (model.trim()) body.model = model.trim();
   const res = await fetch('/api/v1/llm/test', {

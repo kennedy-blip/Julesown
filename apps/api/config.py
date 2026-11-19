@@ -62,6 +62,33 @@ NVIDIA_MODEL_PREFERENCES = (
 # API key (one request at a time); the larger ones (glm-5.3, glm-5.3-flash)
 # are paid from the account's balance and are a setting away (ZAI_MODEL).
 DEFAULT_ZAI_MODEL = "glm-4.7-flash"
+# Cloudflare Workers AI: open models on Cloudflare's own network. Every account
+# gets 10,000 "neurons" a day at no charge, for all of its models together.
+# What a request costs depends on the model, so the ones named here are cheap
+# ones that call tools and that a free account may use (Cloudflare points
+# people who leave its older models to both). Model names start with "@cf/".
+DEFAULT_CLOUDFLARE_MODEL = "@cf/zai-org/glm-4.7-flash"
+# SambaNova Cloud: very fast inference of open models. Without a payment
+# method an account may make 20 requests a day to each model (and 200,000
+# tokens): a stand-in for a few steps, not for whole tasks. Its catalogue is
+# small and changes; a model that is gone is replaced by the first of these
+# that it still lists and that calls tools.
+DEFAULT_SAMBANOVA_MODEL = "DeepSeek-V3.1"
+SAMBANOVA_MODEL_PREFERENCES = (
+    "DeepSeek-V3.1",
+    "gpt-oss-120b",
+    "Meta-Llama-3.3-70B-Instruct",
+    "MiniMax-M3.1-Flash",
+    "DeepSeek-V3.2",
+)
+# Pollinations: one key for models of many makers, paid for from a prepaid
+# balance (credit can be earned there without paying). "openai" is its name
+# for the OpenAI model it currently offers as its default: like Gemini's alias
+# it moves with the catalogue.
+DEFAULT_POLLINATIONS_MODEL = "openai"
+# DeepSeek's own API. Not free: every request is paid for from the account's
+# balance, so there is one model and no stand-in that costs four times as much.
+DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
 
 # A provider can be given several models (GROQ_MODEL="a,b"): the first one is
 # used, and when it is rate limited, overloaded or gone the next one takes
@@ -71,13 +98,20 @@ DEFAULT_ZAI_MODEL = "glm-4.7-flash"
 # Google's alias for its current Flash model, followed by the lighter model
 # that has capacity when the alias is busy; OpenRouter's is its router, which
 # is a pool already. NVIDIA and Z.AI have no such name: a model of theirs that
-# is gone is replaced (NVIDIA) or passed over (Z.AI) - see services/llm.py.
+# is gone is replaced (NVIDIA, SambaNova) or passed over (the others) - see
+# services/llm.py.
 DEFAULT_MODELS: Dict[str, Tuple[str, ...]] = {
     "groq": (DEFAULT_GROQ_MODEL, "openai/gpt-oss-20b"),
     "gemini": (DEFAULT_GEMINI_MODEL, "gemini-3.5-flash-lite"),
     "nvidia": (DEFAULT_NVIDIA_MODEL, "nvidia/nemotron-3-super-120b-a12b"),
     "zai": (DEFAULT_ZAI_MODEL, "glm-4.5-flash"),
+    "cloudflare": (DEFAULT_CLOUDFLARE_MODEL, "@cf/google/gemma-4-26b-a4b-it"),
+    "sambanova": (DEFAULT_SAMBANOVA_MODEL, "gpt-oss-120b"),
     "openrouter": (DEFAULT_OPENROUTER_MODEL,),
+    # The second one is served by another company than the first: a stand-in
+    # for when that route is down. Both are paid for from the same balance.
+    "pollinations": (DEFAULT_POLLINATIONS_MODEL, "openai/gpt-oss-20b"),
+    "deepseek": (DEFAULT_DEEPSEEK_MODEL,),
     "openai": (DEFAULT_OPENAI_MODEL,),
     "anthropic": (DEFAULT_ANTHROPIC_MODEL,),
 }
@@ -94,20 +128,44 @@ DEFAULT_NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 # Z.AI's standard API. (Its "coding" endpoint belongs to the GLM Coding Plan,
 # which Z.AI restricts to the coding tools it lists; this is not one of them.)
 DEFAULT_ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"
+# Cloudflare's address has the account in it: "{account_id}" stands for the
+# account ID (CLOUDFLARE_ACCOUNT_ID), which is needed as well as the token.
+DEFAULT_CLOUDFLARE_BASE_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+DEFAULT_SAMBANOVA_BASE_URL = "https://api.sambanova.ai/v1"
+DEFAULT_POLLINATIONS_BASE_URL = "https://gen.pollinations.ai/v1"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_GITHUB_API_URL = "https://api.github.com"
 
 # Every provider the agent can use, in the order they are tried when nothing
-# else is said: the free tiers first, the pay-per-token ones after them. Among
-# the free ones, those with a model of their own choosing come before
-# OpenRouter's router, which answers with whichever free model it picks and has
-# the smallest daily allowance.
-LLM_PROVIDERS: Tuple[str, ...] = ("groq", "gemini", "nvidia", "zai", "openrouter", "openai", "anthropic")
+# else is said. First the ones with an allowance that comes back by itself
+# (per minute or per day), the larger allowances before the smaller ones and a
+# model of our choosing before OpenRouter's router, which answers with
+# whichever free model it picks. Then the ones that spend a balance:
+# Pollinations (credit that can be earned as well as bought) and the
+# pay-per-token ones, the cheapest first.
+LLM_PROVIDERS: Tuple[str, ...] = (
+    "groq",
+    "gemini",
+    "nvidia",
+    "zai",
+    "cloudflare",
+    "sambanova",
+    "openrouter",
+    "pollinations",
+    "deepseek",
+    "openai",
+    "anthropic",
+)
 PROVIDER_LABELS = {
     "groq": "Groq",
     "gemini": "Google Gemini",
     "nvidia": "NVIDIA NIM",
     "zai": "Z.AI (GLM)",
+    "cloudflare": "Cloudflare Workers AI",
+    "sambanova": "SambaNova",
     "openrouter": "OpenRouter",
+    "pollinations": "Pollinations",
+    "deepseek": "DeepSeek",
     "openai": "OpenAI",
     "anthropic": "Anthropic",
 }
@@ -116,7 +174,12 @@ PROVIDER_KEY_VARIABLES = {
     "gemini": "GEMINI_API_KEY",
     "nvidia": "NVIDIA_API_KEY",
     "zai": "ZAI_API_KEY",
+    # Cloudflare calls its keys API tokens, and its own tools read this name.
+    "cloudflare": "CLOUDFLARE_API_TOKEN",
+    "sambanova": "SAMBANOVA_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
+    "pollinations": "POLLINATIONS_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
 }
@@ -125,10 +188,18 @@ PROVIDER_MODEL_VARIABLES = {
     "gemini": "GEMINI_MODEL",
     "nvidia": "NVIDIA_MODEL",
     "zai": "ZAI_MODEL",
+    "cloudflare": "CLOUDFLARE_MODEL",
+    "sambanova": "SAMBANOVA_MODEL",
     "openrouter": "OPENROUTER_MODEL",
+    "pollinations": "POLLINATIONS_MODEL",
+    "deepseek": "DEEPSEEK_MODEL",
     "openai": "OPENAI_MODEL",
     "anthropic": "ANTHROPIC_MODEL",
 }
+# Providers whose address names the account: a key alone is not enough for
+# them. The value is the setting that holds the account's ID.
+PROVIDER_ACCOUNT_VARIABLES = {"cloudflare": "CLOUDFLARE_ACCOUNT_ID"}
+ACCOUNT_PLACEHOLDER = "{account_id}"
 
 # Who a commit made by the agent is attributed to.
 #   bot      - the GitHub App (or the owner of GITHUB_TOKEN): GitHub's default
@@ -136,7 +207,10 @@ PROVIDER_MODEL_VARIABLES = {
 #   user     - a person is the author; the App is only the committer
 COMMIT_AUTHORSHIP_MODES: Tuple[str, ...] = ("bot", "coauthor", "user")
 _EMAIL_RE = re.compile(r"^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$")
-_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$")
+# (Cloudflare's model names start with "@": @cf/zai-org/glm-4.7-flash.)
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9@][A-Za-z0-9._:/@+-]{0,199}$")
+# A Cloudflare account ID: 32 hexadecimal characters.
+_ACCOUNT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 SERVICE_NAME = "jules-clone-api"
 SERVICE_VERSION = "2.0.0"
@@ -222,6 +296,31 @@ def clean_model_name(value: Any) -> Optional[str]:
     return cleaned if _MODEL_NAME_RE.match(cleaned) else None
 
 
+def clean_account_id(value: Any) -> Optional[str]:
+    """An account ID as it goes into a provider's address, or None when the
+    value cannot be one (it becomes part of a URL: nothing else is let in)."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip().lower()
+    return cleaned if _ACCOUNT_ID_RE.match(cleaned) else None
+
+
+def split_account_key(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    """``(account ID, key)`` from a key that may have its account in front.
+
+    Cloudflare needs two values. Where there is room for one - a request
+    header, a single variable - they travel as ``<account ID>:<token>``;
+    ``<account ID>:`` brings the account alone, a plain token the token alone.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None, None
+    text = value.strip()
+    if ":" not in text:
+        return None, text
+    account, _, key = text.partition(":")
+    return clean_account_id(account), (key.strip() or None)
+
+
 def split_models(value: Any) -> List[str]:
     """The model names in a setting such as ``"a, b"`` (or a list): valid ones
     only, without repeats, in the order given, at most MAX_MODELS_PER_PROVIDER."""
@@ -305,6 +404,19 @@ class Settings:
     zai_api_key: Optional[str] = None
     zai_model: str = ",".join(DEFAULT_MODELS["zai"])
     zai_base_url: str = DEFAULT_ZAI_BASE_URL
+    cloudflare_api_key: Optional[str] = None
+    cloudflare_account_id: Optional[str] = None
+    cloudflare_model: str = ",".join(DEFAULT_MODELS["cloudflare"])
+    cloudflare_base_url: str = DEFAULT_CLOUDFLARE_BASE_URL
+    sambanova_api_key: Optional[str] = None
+    sambanova_model: str = ",".join(DEFAULT_MODELS["sambanova"])
+    sambanova_base_url: str = DEFAULT_SAMBANOVA_BASE_URL
+    pollinations_api_key: Optional[str] = None
+    pollinations_model: str = ",".join(DEFAULT_MODELS["pollinations"])
+    pollinations_base_url: str = DEFAULT_POLLINATIONS_BASE_URL
+    deepseek_api_key: Optional[str] = None
+    deepseek_model: str = ",".join(DEFAULT_MODELS["deepseek"])
+    deepseek_base_url: str = DEFAULT_DEEPSEEK_BASE_URL
     # Instructions added to every task of this installation (conventions of the
     # owner's projects: the stack, what a deployment needs, what to leave alone).
     task_guidelines: str = ""
@@ -328,8 +440,45 @@ class Settings:
     # ------------------------------------------------------------------ #
     # Derived state
     # ------------------------------------------------------------------ #
-    def api_key_for(self, provider: str) -> Optional[str]:
+    def stored_key_for(self, provider: str) -> Optional[str]:
+        """The key that is set for a provider, usable as things stand or not."""
         return getattr(self, f"{provider}_api_key", None) if provider in LLM_PROVIDERS else None
+
+    def account_for(self, provider: str) -> Optional[str]:
+        """The account ID of a provider whose address names the account."""
+        return getattr(self, f"{provider}_account_id", None) if provider in PROVIDER_ACCOUNT_VARIABLES else None
+
+    def needs_account(self, provider: str) -> bool:
+        """Whether a provider is called at an address with the account in it.
+        (An address of one's own without ``{account_id}`` - a gateway, say -
+        is used as it stands: there the key is all that is needed.)"""
+        return provider in PROVIDER_ACCOUNT_VARIABLES and ACCOUNT_PLACEHOLDER in str(
+            getattr(self, f"{provider}_base_url", "") or ""
+        )
+
+    def base_url_for(self, provider: str) -> Optional[str]:
+        """Where a provider is called - with the account ID filled in where the
+        address has one, and None while that ID is not known."""
+        if provider not in LLM_PROVIDERS:
+            return None
+        url = str(getattr(self, f"{provider}_base_url", "") or "")
+        if ACCOUNT_PLACEHOLDER not in url:
+            return url or None
+        account = self.account_for(provider)
+        return url.replace(ACCOUNT_PLACEHOLDER, account) if account else None
+
+    def missing_for(self, provider: str) -> Optional[str]:
+        """What a provider that has its key still lacks: the name of the
+        setting (CLOUDFLARE_ACCOUNT_ID), or None when nothing is missing."""
+        if self.stored_key_for(provider) and not self.base_url_for(provider):
+            return PROVIDER_ACCOUNT_VARIABLES.get(provider)
+        return None
+
+    def api_key_for(self, provider: str) -> Optional[str]:
+        """The key of a provider that can be used with it. (A Cloudflare token
+        without the account it belongs to cannot: there is no address to call.)"""
+        key = self.stored_key_for(provider)
+        return key if key and self.base_url_for(provider) else None
 
     def models_for(self, provider: str) -> List[str]:
         """The models configured for a provider, in the order they are tried."""
@@ -407,7 +556,10 @@ class Settings:
 
     def secret_values(self) -> List[str]:
         """Every secret this configuration holds, for redacting logs."""
-        values = [self.api_key_for(name) for name in LLM_PROVIDERS]
+        values = [self.stored_key_for(name) for name in LLM_PROVIDERS]
+        # An account ID is no password, but it is nobody else's business
+        # either, and it is part of every address that shows up in an error.
+        values += [self.account_for(name) for name in PROVIDER_ACCOUNT_VARIABLES]
         values += [self.github_token, self.e2b_api_key, self.access_key, self.github_webhook_secret]
         return [value for value in values if value]
 
@@ -430,9 +582,20 @@ class Settings:
         changes: Dict[str, Any] = {}
         brings_key = False
         for provider, key in (api_keys or {}).items():
-            if provider in LLM_PROVIDERS and isinstance(key, str) and key.strip():
-                changes[f"{provider}_api_key"] = key.strip()
+            if provider not in LLM_PROVIDERS or not isinstance(key, str) or not key.strip():
+                continue
+            value: Optional[str] = key.strip()
+            if provider in PROVIDER_ACCOUNT_VARIABLES:
+                # "<account ID>:<token>": either part, or both (see split_account_key).
+                account, value = split_account_key(value)
+                if account:
+                    changes[f"{provider}_account_id"] = account
+                    brings_key = True
+            if value:
+                changes[f"{provider}_api_key"] = value
                 brings_key = True
+        # What this request brought decides whether its first choice can be one.
+        keyed = replace(self, **changes) if changes else self
         for provider, model in (models or {}).items():
             # One model or several ("a, b"): this request's list replaces the server's.
             cleaned = split_models(model)
@@ -446,7 +609,7 @@ class Settings:
             if choice in LLM_PROVIDERS:
                 # A preference, not a requirement: without a key for that
                 # provider the order stays as it was.
-                if changes.get(f"{choice}_api_key") or self.api_key_for(choice):
+                if keyed.api_key_for(choice):
                     changes["llm_provider_override"] = choice
             elif choice in ("", "auto"):
                 changes["llm_provider_override"] = None
@@ -509,6 +672,11 @@ class Settings:
             else:
                 names = [PROVIDER_KEY_VARIABLES[name] for name in LLM_PROVIDERS]
                 llm = f"an LLM API key ({', '.join(names[:-1])} or {names[-1]})"
+            # A key that is there but cannot be used yet is said, not passed over.
+            for name in LLM_PROVIDERS:
+                gap = self.missing_for(name)
+                if gap:
+                    llm += f"; {PROVIDER_KEY_VARIABLES[name]} is set, but {PROVIDER_LABELS[name]} needs {gap} as well"
         return {
             "llm": llm,
             "sandbox": None
@@ -529,6 +697,11 @@ def get_settings() -> Settings:
     environment = (
         env_str("ENVIRONMENT") or env_str("VERCEL_ENV") or "development"
     ).lower()
+    # Cloudflare's own tools and examples use both names for the token. The
+    # account ID has a variable of its own, or stands in front of the token.
+    cloudflare_account, cloudflare_token = split_account_key(
+        env_str("CLOUDFLARE_API_TOKEN") or env_str("CLOUDFLARE_API_KEY")
+    )
     return Settings(
         environment=environment,
         on_vercel=on_vercel,
@@ -573,6 +746,27 @@ def get_settings() -> Settings:
         zai_api_key=env_str("ZAI_API_KEY") or env_str("GLM_API_KEY"),
         zai_model=env_str("ZAI_MODEL") or default_models("zai"),
         zai_base_url=(env_str("ZAI_BASE_URL", DEFAULT_ZAI_BASE_URL) or DEFAULT_ZAI_BASE_URL).rstrip("/"),
+        cloudflare_api_key=cloudflare_token,
+        cloudflare_account_id=clean_account_id(env_str("CLOUDFLARE_ACCOUNT_ID")) or cloudflare_account,
+        cloudflare_model=env_str("CLOUDFLARE_MODEL") or default_models("cloudflare"),
+        cloudflare_base_url=(
+            env_str("CLOUDFLARE_BASE_URL", DEFAULT_CLOUDFLARE_BASE_URL) or DEFAULT_CLOUDFLARE_BASE_URL
+        ).rstrip("/"),
+        sambanova_api_key=env_str("SAMBANOVA_API_KEY"),
+        sambanova_model=env_str("SAMBANOVA_MODEL") or default_models("sambanova"),
+        sambanova_base_url=(
+            env_str("SAMBANOVA_BASE_URL", DEFAULT_SAMBANOVA_BASE_URL) or DEFAULT_SAMBANOVA_BASE_URL
+        ).rstrip("/"),
+        pollinations_api_key=env_str("POLLINATIONS_API_KEY"),
+        pollinations_model=env_str("POLLINATIONS_MODEL") or default_models("pollinations"),
+        pollinations_base_url=(
+            env_str("POLLINATIONS_BASE_URL", DEFAULT_POLLINATIONS_BASE_URL) or DEFAULT_POLLINATIONS_BASE_URL
+        ).rstrip("/"),
+        deepseek_api_key=env_str("DEEPSEEK_API_KEY"),
+        deepseek_model=env_str("DEEPSEEK_MODEL") or default_models("deepseek"),
+        deepseek_base_url=(
+            env_str("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL) or DEFAULT_DEEPSEEK_BASE_URL
+        ).rstrip("/"),
         llm_fallback=env_bool("JULES_LLM_FALLBACK", True),
         llm_order=tuple(clean_provider_order(env_str("JULES_LLM_ORDER") or "")),
         commit_authorship=_commit_authorship(env_str("JULES_COMMIT_AUTHORSHIP")),

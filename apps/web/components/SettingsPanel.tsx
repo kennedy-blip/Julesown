@@ -28,8 +28,17 @@ import {
 } from 'lucide-react';
 import { ApiError, describeError, fetchAutomation, fetchIdentity, testProvider } from '@/lib/api';
 import type { AppInstallation, AutomationStatus, HealthEnv, ProviderInfo, ProviderModelTest, ProviderTest } from '@/lib/api';
-import { effectiveChain, providersIn, providersOf, serverModels } from '@/lib/providers';
-import { identityComplete, MAX_GUIDELINES, MAX_MODELS, SETTINGS_TABS, splitModels, updateSettings, useSettings } from '@/lib/settings';
+import { effectiveChain, heldHere, needsAccount, onServer, providersIn, providersOf, serverModels, usableHere } from '@/lib/providers';
+import {
+  cleanAccountId,
+  identityComplete,
+  MAX_GUIDELINES,
+  MAX_MODELS,
+  SETTINGS_TABS,
+  splitModels,
+  updateSettings,
+  useSettings,
+} from '@/lib/settings';
 import type { CommitMode, ProviderId, Settings, SettingsTab } from '@/lib/settings';
 import { AccessKeyField } from './AccessKeyField';
 import { Badge, Button, buttonClass, Callout, CARD, Hint, INPUT, INSET, LABEL, TEXTAREA, Toggle } from './ui';
@@ -58,8 +67,14 @@ const TAB_META: Record<SettingsTab, { label: string; description: string; icon: 
   about: { label: 'About', description: 'What the server is configured with', icon: <Info className="w-4 h-4" /> },
 };
 
-/** Where a key for each provider is created, and what it looks like. */
-const PROVIDER_HELP: Record<ProviderId, { keysUrl: string; keysLabel: string; placeholder: string; blurb: string }> = {
+/**
+ * Where a key for each provider is created, and what it looks like.
+ * `keyLabel` is the provider's own word for its key, where that is not "API key".
+ */
+const PROVIDER_HELP: Record<
+  ProviderId,
+  { keysUrl: string; keysLabel: string; placeholder: string; blurb: string; keyLabel?: string }
+> = {
   groq: {
     keysUrl: 'https://console.groq.com/keys',
     keysLabel: 'console.groq.com',
@@ -87,12 +102,41 @@ const PROVIDER_HELP: Record<ProviderId, { keysUrl: string; keysLabel: string; pl
     blurb:
       'GLM models. The Flash models used here are free with a standard API key, one request at a time; glm-5.3 and the other large ones are paid for from the account\u2019s balance. A GLM Coding Plan key is not meant for this: Z.AI limits that plan to the coding tools it lists.',
   },
+  cloudflare: {
+    keysUrl: 'https://dash.cloudflare.com/?to=/:account/ai/workers-ai',
+    keysLabel: 'dash.cloudflare.com',
+    placeholder: 'API token',
+    keyLabel: 'API token',
+    blurb:
+      'Open models on Cloudflare\u2019s own network. Free up to 10,000 \u201cneurons\u201d a day for all of the account\u2019s models together - with the models used here a few tasks, not more; the count starts again at 00:00 UTC. It needs two values: an API token with the Workers AI permission and the account ID. Both are on the Workers AI page under \u201cUse REST API\u201d.',
+  },
+  sambanova: {
+    keysUrl: 'https://cloud.sambanova.ai/apis',
+    keysLabel: 'cloud.sambanova.ai',
+    placeholder: 'API key',
+    blurb:
+      'Very fast open models. Without a payment method each model answers 20 requests a day (and 200,000 tokens): enough to carry a task over some steps while the others are limited, not to run whole tasks. With a payment method linked the limits are in the thousands.',
+  },
   openrouter: {
     keysUrl: 'https://openrouter.ai/keys',
     keysLabel: 'openrouter.ai',
     placeholder: 'sk-or-…',
     blurb:
       'One key for many models, including free ones. With openrouter/free OpenRouter picks, for every request, a free model that is available - no single model to be throttled or retired. Free models are limited by requests per day.',
+  },
+  pollinations: {
+    keysUrl: 'https://enter.pollinations.ai/keys',
+    keysLabel: 'enter.pollinations.ai',
+    placeholder: 'sk_…',
+    blurb:
+      'One key for models of many makers, paid for from a prepaid balance - which can be earned there with \u201cquests\u201d as well as bought. \u201copenai\u201d is its name for the OpenAI model it offers by default. When the balance is used up, tasks carry on with the next provider.',
+  },
+  deepseek: {
+    keysUrl: 'https://platform.deepseek.com/api_keys',
+    keysLabel: 'platform.deepseek.com',
+    placeholder: 'sk-…',
+    blurb:
+      'DeepSeek\u2019s own API. Not free: every request is paid for from the account\u2019s balance, at a low price per token. Without a balance it answers \u201cInsufficient Balance\u201d, and tasks carry on with the next provider.',
   },
   openai: {
     keysUrl: 'https://platform.openai.com/api-keys',
@@ -225,7 +269,16 @@ function ProviderCard({
   const model = settings.models[info.id] || '';
   const [shown, setShown] = useState(false);
   const [test, setTest] = useState<TestState>({ phase: 'idle' });
-  const hasKey = key.trim() !== '';
+  // Cloudflare's address names the account: it needs an account ID beside the token.
+  const wantsAccount = needsAccount(info);
+  const account = settings.accounts[info.id] || '';
+  const accountTyped = account.trim() !== '';
+  const here = heldHere(info, settings);
+  const server = onServer(info);
+  const hasKey = here.key;
+  // A task can use the provider: key and account ID each come from here or from the server.
+  const usable = usableHere(info, settings);
+  const keyWord = help.keyLabel || 'API key';
   // What is typed into the model field: the names that can be model names, and the rest.
   const typed = model
     .split(/[,;\n]+/)
@@ -240,9 +293,20 @@ function ProviderCard({
       const keys = { ...current.keys };
       if (value.trim()) keys[info.id] = value.trim();
       else delete keys[info.id];
-      // A provider without any key cannot stay the first choice.
-      const primary = !value.trim() && !info.configured && current.primary === info.id ? 'auto' : current.primary;
+      // A provider that cannot be used any more cannot stay the first choice.
+      const primary = current.primary === info.id && !usableHere(info, { ...current, keys }) ? 'auto' : current.primary;
       return { keys, primary };
+    });
+    setTest({ phase: 'idle' });
+  };
+  const setAccount = (value: string) => {
+    updateSettings((current) => {
+      const accounts = { ...current.accounts };
+      // Kept as typed, so that what is wrong with it can be said; sent only when it is an ID.
+      if (value.trim()) accounts[info.id] = value.trim().slice(0, 80);
+      else delete accounts[info.id];
+      const primary = current.primary === info.id && !usableHere(info, { ...current, accounts }) ? 'auto' : current.primary;
+      return { accounts, primary };
     });
     setTest({ phase: 'idle' });
   };
@@ -260,7 +324,7 @@ function ProviderCard({
   const runTest = async () => {
     setTest({ phase: 'testing' });
     try {
-      setTest({ phase: 'done', result: await testProvider(info.id, key, mine.join(',')) });
+      setTest({ phase: 'done', result: await testProvider(info.id, key, mine.join(','), account) });
     } catch (error) {
       setTest({
         phase: 'error',
@@ -285,18 +349,49 @@ function ProviderCard({
         </div>
         <div className="flex flex-wrap items-center gap-1.5" data-testid="provider-key-state">
           {hasKey && <Badge tone="good">Key in this browser</Badge>}
-          {info.configured && <Badge tone={hasKey ? 'muted' : 'good'}>Key on the server</Badge>}
-          {!hasKey && !info.configured && <Badge tone="muted">No key</Badge>}
+          {server.key && <Badge tone={hasKey ? 'muted' : 'good'}>Key on the server</Badge>}
+          {!hasKey && !server.key && <Badge tone="muted">No key</Badge>}
+          {wantsAccount && (hasKey || server.key) && !here.account && !server.account && (
+            <Badge tone="warn" data-testid="provider-account-missing">
+              Account ID missing
+            </Badge>
+          )}
         </div>
       </div>
       <Hint className="mb-3">
-        {help.blurb} Get a key at <ExternalAnchor href={help.keysUrl}>{help.keysLabel}</ExternalAnchor>.
+        {help.blurb} Get {wantsAccount ? 'both' : 'a key'} at <ExternalAnchor href={help.keysUrl}>{help.keysLabel}</ExternalAnchor>.
       </Hint>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        {wantsAccount && (
+          <div>
+            <label htmlFor={`account-${info.id}`} className={LABEL}>
+              Account ID
+            </label>
+            <input
+              id={`account-${info.id}`}
+              type="text"
+              value={account}
+              onChange={(event) => setAccount(event.target.value)}
+              placeholder={server.account ? 'Using the server\u2019s account ID' : '32 letters and digits'}
+              autoComplete="off"
+              spellCheck={false}
+              data-testid="provider-account"
+              aria-describedby={`account-hint-${info.id}`}
+              className={`${INPUT} font-mono`}
+            />
+            <div id={`account-hint-${info.id}`}>
+              {accountTyped && !cleanAccountId(account) && (
+                <p className="text-xs text-amber-400 mt-1.5" data-testid="provider-account-problem">
+                  An account ID is 32 characters: digits and the letters a to f. This is not sent.
+                </p>
+              )}
+            </div>
+          </div>
+        )}
         <div>
           <label htmlFor={`key-${info.id}`} className={LABEL}>
-            API key
+            {keyWord}
           </label>
           <div className="flex gap-2">
             <input
@@ -304,7 +399,7 @@ function ProviderCard({
               type={shown ? 'text' : 'password'}
               value={key}
               onChange={(event) => setKey(event.target.value)}
-              placeholder={info.configured ? 'Using the server\u2019s key' : help.placeholder}
+              placeholder={server.key ? `Using the server\u2019s ${help.keyLabel ? 'token' : 'key'}` : help.placeholder}
               autoComplete="off"
               spellCheck={false}
               data-testid="provider-key"
@@ -320,7 +415,7 @@ function ProviderCard({
             )}
           </div>
         </div>
-        <div>
+        <div className={wantsAccount ? 'md:col-span-2' : undefined}>
           <label htmlFor={`model-${info.id}`} className={LABEL}>
             Models
           </label>
@@ -362,11 +457,13 @@ function ProviderCard({
       <div className="flex flex-wrap items-center gap-3 mt-3">
         <Button
           onClick={() => void runTest()}
-          disabled={!canCallApi || test.phase === 'testing' || (!hasKey && !info.configured)}
+          disabled={!canCallApi || test.phase === 'testing' || !usable}
           data-testid="provider-test"
           title={
-            !hasKey && !info.configured
-              ? 'Enter a key first'
+            !usable
+              ? wantsAccount
+                ? 'Enter the API token and the account ID first'
+                : 'Enter a key first'
               : 'Sends one small request with a tool to each model - the kind of request the agent makes'
           }
         >
@@ -420,6 +517,21 @@ function ProviderCard({
   );
 }
 
+/** Providers that answer within an allowance that renews itself, at no charge. */
+const FREE_PROVIDERS: ProviderId[] = ['groq', 'gemini', 'nvidia', 'zai', 'cloudflare', 'sambanova', 'openrouter'];
+/** Providers that spend a balance which can be small - or, at Pollinations, earned. */
+const PREPAID_PROVIDERS: ProviderId[] = ['pollinations', 'deepseek'];
+
+/** What the provider cards below it have in common. */
+function ProviderGroup({ title, testId, children }: { title: string; testId: string; children: React.ReactNode }) {
+  return (
+    <div className="pt-2 first:pt-0" data-testid={testId}>
+      <h4 className="text-[13px] font-semibold text-slate-200">{title}</h4>
+      <Hint className="mt-0.5 max-w-2xl">{children}</Hint>
+    </div>
+  );
+}
+
 function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
   const settings = useSettings();
   const providers = providersOf(health);
@@ -427,11 +539,23 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
   // The providers behind the chain, each once, in the order they are first used.
   const chainProviders = providersIn(chain);
   const [showMore, setShowMore] = useState(false);
-  const usable = providers.filter((item) => item.configured || !!(settings.keys[item.id] || '').trim());
-  // The providers with a free tier are shown at once; the pay-per-token ones on request.
-  const main = providers.filter((item) => ['groq', 'gemini', 'nvidia', 'zai', 'openrouter'].indexOf(item.id) >= 0);
+  const usable = providers.filter((item) => usableHere(item, settings));
+  // Shown at once: the providers that answer within a free allowance, and the
+  // ones whose balance can be small or earned. The rest on request.
+  const free = providers.filter((item) => FREE_PROVIDERS.indexOf(item.id) >= 0);
+  const prepaid = providers.filter((item) => PREPAID_PROVIDERS.indexOf(item.id) >= 0);
+  const main = free.concat(prepaid);
   const more = providers.filter((item) => main.indexOf(item) < 0);
   const moreInUse = more.some((item) => usable.indexOf(item) >= 0);
+  const card = (item: ProviderInfo) => (
+    <ProviderCard
+      key={item.id}
+      info={item}
+      settings={settings}
+      position={chainProviders.findIndex((entry) => entry.id === item.id) + 1}
+      canCallApi={canCallApi}
+    />
+  );
   const serverFallbackOff =
     !!health &&
     ((!!health.llm_preferences && health.llm_preferences.fallback === false) || (!!health.llm && health.llm.fallback === false));
@@ -513,25 +637,17 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
       </div>
 
       <div className="space-y-4">
-        {main.map((item) => (
-          <ProviderCard
-            key={item.id}
-            info={item}
-            settings={settings}
-            position={chainProviders.findIndex((entry) => entry.id === item.id) + 1}
-            canCallApi={canCallApi}
-          />
-        ))}
-        {(showMore || moreInUse) &&
-          more.map((item) => (
-            <ProviderCard
-              key={item.id}
-              info={item}
-              settings={settings}
-              position={chainProviders.findIndex((entry) => entry.id === item.id) + 1}
-              canCallApi={canCallApi}
-            />
-          ))}
+        <ProviderGroup title="Free within limits" testId="providers-free">
+          Each of these answers a number of requests - per minute or per day - at no charge. The more of them have
+          a key, the further a task gets before it has to wait.
+        </ProviderGroup>
+        {free.map(card)}
+        <ProviderGroup title="Paid from a balance" testId="providers-prepaid">
+          These spend credit that the account holds. They are tried after the free ones, and passed over once the
+          balance is used up.
+        </ProviderGroup>
+        {prepaid.map(card)}
+        {(showMore || moreInUse) && more.map(card)}
         {!moreInUse && (
           <button type="button" onClick={() => setShowMore(!showMore)} className="text-xs text-blue-400 hover:text-blue-300 underline underline-offset-2" data-testid="more-providers">
             {showMore ? 'Hide OpenAI and Anthropic' : 'More providers: OpenAI, Anthropic'}
@@ -544,7 +660,8 @@ function ModelsTab({ health, canCallApi }: SettingsPanelProps) {
         sent to your own backend with each task you start from it; the backend uses it for that task and does not
         store it. Tasks that GitHub starts (a <code className="font-mono">/jules</code> comment, a failed check) do
         not pass through a browser: for those, set the key as an environment variable of the deployment (
-        {main.map((item) => item.key_variable).join(', ')}).
+        {main.map((item) => (item.account_variable ? `${item.key_variable} with ${item.account_variable}` : item.key_variable)).join(', ')}
+        ).
       </Callout>
     </div>
   );

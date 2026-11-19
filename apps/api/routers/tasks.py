@@ -47,7 +47,10 @@ class LLMOptions(BaseModel):
 
     primary: Optional[str] = Field(
         None,
-        description="Provider to start with (groq, gemini, nvidia, zai, openrouter, openai, anthropic). Omit for the server's order.",
+        description=(
+            "Provider to start with (groq, gemini, nvidia, zai, cloudflare, sambanova, openrouter, pollinations, "
+            "deepseek, openai, anthropic). Omit for the server's order."
+        ),
     )
     fallback: Optional[bool] = Field(
         None, description="Carry on with the other configured providers when the one in use reaches a limit or fails."
@@ -422,9 +425,12 @@ async def stream_task(
     """Create a task, run it within this request and stream its progress.
 
     API keys for model providers can be sent along in the headers ``X-Groq-Key``,
-    ``X-Gemini-Key``, ``X-Nvidia-Key``, ``X-Zai-Key``, ``X-OpenRouter-Key``,
-    ``X-OpenAI-Key`` and ``X-Anthropic-Key``. They are used for this task only,
-    take precedence over the server's own keys and are never stored or logged.
+    ``X-Gemini-Key``, ``X-Nvidia-Key``, ``X-Zai-Key``, ``X-Cloudflare-Key``,
+    ``X-SambaNova-Key``, ``X-OpenRouter-Key``, ``X-Pollinations-Key``,
+    ``X-DeepSeek-Key``, ``X-OpenAI-Key`` and ``X-Anthropic-Key``. They are used
+    for this task only, take precedence over the server's own keys and are
+    never stored or logged. Cloudflare's carries the account ID in front of
+    the token: ``<account ID>:<token>``.
     """
     runner = runner_for(runner, req, keys)
     record = task_store.create(

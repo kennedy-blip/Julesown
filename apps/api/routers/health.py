@@ -9,6 +9,7 @@ from fastapi import APIRouter
 
 from ..config import (
     LLM_PROVIDERS,
+    PROVIDER_ACCOUNT_VARIABLES,
     PROVIDER_KEY_VARIABLES,
     PROVIDER_LABELS,
     PROVIDER_MODEL_VARIABLES,
@@ -25,7 +26,12 @@ REPORTED_VARIABLES = (
     "GEMINI_API_KEY",
     "NVIDIA_API_KEY",
     "ZAI_API_KEY",
+    "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_ACCOUNT_ID",
+    "SAMBANOVA_API_KEY",
     "OPENROUTER_API_KEY",
+    "POLLINATIONS_API_KEY",
+    "DEEPSEEK_API_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "E2B_API_KEY",
@@ -63,9 +69,12 @@ async def health_env_check():
     settings = get_settings()
     variables = {name: bool(env_str(name)) for name in REPORTED_VARIABLES}
     # A key counts under whichever of its names it was set (GOOGLE_API_KEY,
-    # NVIDIA_NIM_API_KEY, GLM_API_KEY).
+    # NVIDIA_NIM_API_KEY, GLM_API_KEY, CLOUDFLARE_API_KEY) - and an account ID
+    # wherever it was given: in its own variable or in front of the token.
     for name in LLM_PROVIDERS:
-        variables[PROVIDER_KEY_VARIABLES[name]] = bool(settings.api_key_for(name))
+        variables[PROVIDER_KEY_VARIABLES[name]] = bool(settings.stored_key_for(name))
+    for name, variable in PROVIDER_ACCOUNT_VARIABLES.items():
+        variables[variable] = bool(settings.account_for(name))
     missing = settings.missing_requirements()
     provider = settings.llm_provider
     identity = settings.commit_identity
@@ -109,6 +118,20 @@ async def health_env_check():
                 "models": settings.models_for(name),
                 "key_variable": PROVIDER_KEY_VARIABLES[name],
                 "model_variable": PROVIDER_MODEL_VARIABLES[name],
+                # A provider that needs its account ID beside the key
+                # (Cloudflare) is configured when the server has both; which
+                # of the two it has is said here, so that the dashboard can
+                # ask for the other one alone. (Not so when it is called at an
+                # address that has no account in it: then it is like the rest.)
+                **(
+                    {
+                        "account_variable": PROVIDER_ACCOUNT_VARIABLES[name],
+                        "key_set": bool(settings.stored_key_for(name)),
+                        "account_set": bool(settings.account_for(name)),
+                    }
+                    if settings.needs_account(name)
+                    else {}
+                ),
             }
             for name in LLM_PROVIDERS
         ],

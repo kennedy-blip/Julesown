@@ -75,7 +75,19 @@ def test_env_health_ready_and_never_leaks_values(client: TestClient, app_env, mo
     assert body["status"] == "HEALTHY" and body["ready"] is True and body["missing"] == []
     assert body["needs"] == {"llm": None, "sandbox": None, "github": None}
     assert body["llm_preferences"] == {
-        "order": ["groq", "gemini", "nvidia", "zai", "openrouter", "openai", "anthropic"],
+        "order": [
+            "groq",
+            "gemini",
+            "nvidia",
+            "zai",
+            "cloudflare",
+            "sambanova",
+            "openrouter",
+            "pollinations",
+            "deepseek",
+            "openai",
+            "anthropic",
+        ],
         "first_choice": None,
         "fallback": True,
     }
@@ -94,7 +106,11 @@ def test_env_health_ready_and_never_leaks_values(client: TestClient, app_env, mo
         ("gemini", False),
         ("nvidia", False),
         ("zai", False),
+        ("cloudflare", False),
+        ("sambanova", False),
         ("openrouter", False),
+        ("pollinations", False),
+        ("deepseek", False),
         ("openai", False),
         ("anthropic", False),
     ]

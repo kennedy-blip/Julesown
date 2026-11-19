@@ -19,7 +19,9 @@ from .config import LLM_PROVIDERS, get_settings
 
 # Headers in which a caller can send its own model-provider keys along with a
 # request ("bring your own key"). The dashboard keeps such keys in the browser
-# and sends them only with the requests that need them.
+# and sends them only with the requests that need them. Cloudflare needs an
+# account ID beside its token: both travel in its one header, as
+# "<account ID>:<token>" (see config.split_account_key).
 PROVIDER_KEY_HEADERS = {name: f"x-{name}-key" for name in LLM_PROVIDERS}
 MAX_KEY_LENGTH = 512
 

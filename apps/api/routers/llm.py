@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
-from ..config import LLM_PROVIDERS, get_settings
+from ..config import LLM_PROVIDERS, PROVIDER_ACCOUNT_VARIABLES, get_settings, split_account_key
 from ..security import provider_keys, require_access, require_json_body
 from ..services.llm import probe_provider
 
@@ -15,7 +15,13 @@ router = APIRouter(prefix="/api/v1/llm", tags=["llm"], dependencies=[Depends(req
 
 
 class ProviderTestRequest(BaseModel):
-    provider: str = Field(..., description="groq, gemini, nvidia, zai, openrouter, openai or anthropic")
+    provider: str = Field(
+        ...,
+        description=(
+            "groq, gemini, nvidia, zai, cloudflare, sambanova, openrouter, pollinations, deepseek, "
+            "openai or anthropic"
+        ),
+    )
     # Up to four names of up to 200 characters, with what separates them.
     model: Optional[str] = Field(
         None,
@@ -34,6 +40,10 @@ async def test_provider(req: ProviderTestRequest, keys: Dict[str, str] = Depends
     the three things a task needs. With several models each one is tried and
     listed under ``models``. This costs one request of the provider's quota
     per model.
+
+    Cloudflare needs its account ID as well as the token: the header carries
+    both as ``<account ID>:<token>`` (or either one alone - ``<account ID>:``
+    for the account - with the other taken from the server).
     """
     provider = req.provider.strip().lower()
     settings = get_settings().with_overrides(
@@ -41,7 +51,8 @@ async def test_provider(req: ProviderTestRequest, keys: Dict[str, str] = Depends
         models={provider: req.model} if req.model else None,
     )
     result = await run_in_threadpool(probe_provider, settings, provider)
-    result["key_source"] = (
-        "request" if provider in keys else "server" if settings.api_key_for(provider) else None
-    )
+    brought = keys.get(provider)
+    if brought and provider in PROVIDER_ACCOUNT_VARIABLES:
+        brought = split_account_key(brought)[1]  # the account ID alone is no key
+    result["key_source"] = "request" if brought else "server" if settings.stored_key_for(provider) else None
     return result

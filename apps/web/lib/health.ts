@@ -3,7 +3,8 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { describeError, fetchHealth } from './api';
 import type { HealthEnv } from './api';
-import { hasProviderKey, useSettings } from './settings';
+import { effectiveChain } from './providers';
+import { useSettings } from './settings';
 
 /**
  * Backend readiness, shared by the header badge and the dashboard so both show
@@ -91,5 +92,6 @@ export function readinessOf(state: HealthState, browserHasModelKey = false): Rea
 export function useReadiness(): Readiness {
   const health = useHealth();
   const settings = useSettings();
-  return readinessOf(health, hasProviderKey(settings));
+  // A key counts when a task can use a model with it (Cloudflare needs its account ID too).
+  return readinessOf(health, effectiveChain(health.phase === 'ok' ? health.data : null, settings).length > 0);
 }
