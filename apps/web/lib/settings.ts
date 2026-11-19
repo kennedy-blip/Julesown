@@ -11,16 +11,48 @@ import { useEffect, useSyncExternalStore } from 'react';
  * travel to the dashboard's own backend in headers, are used for that request
  * and are not stored there.
  */
-export type ProviderId = 'groq' | 'gemini' | 'nvidia' | 'zai' | 'openrouter' | 'openai' | 'anthropic';
+export type ProviderId =
+  | 'groq'
+  | 'gemini'
+  | 'nvidia'
+  | 'zai'
+  | 'cloudflare'
+  | 'sambanova'
+  | 'openrouter'
+  | 'pollinations'
+  | 'deepseek'
+  | 'openai'
+  | 'anthropic';
 /** In the order the server tries them when nothing else is said (`LLM_PROVIDERS` in apps/api/config.py). */
-export const PROVIDER_IDS: ProviderId[] = ['groq', 'gemini', 'nvidia', 'zai', 'openrouter', 'openai', 'anthropic'];
+export const PROVIDER_IDS: ProviderId[] = [
+  'groq',
+  'gemini',
+  'nvidia',
+  'zai',
+  'cloudflare',
+  'sambanova',
+  'openrouter',
+  'pollinations',
+  'deepseek',
+  'openai',
+  'anthropic',
+];
+/**
+ * Providers whose address names the account: they need an account ID beside
+ * the key (`PROVIDER_ACCOUNT_VARIABLES` in apps/api/config.py).
+ */
+export const ACCOUNT_PROVIDERS: ProviderId[] = ['cloudflare'];
 
 const PROVIDER_NAMES: Record<string, string> = {
   groq: 'Groq',
   gemini: 'Gemini',
   nvidia: 'NVIDIA',
   zai: 'Z.AI',
+  cloudflare: 'Cloudflare',
+  sambanova: 'SambaNova',
   openrouter: 'OpenRouter',
+  pollinations: 'Pollinations',
+  deepseek: 'DeepSeek',
   openai: 'OpenAI',
   anthropic: 'Anthropic',
 };
@@ -66,6 +98,8 @@ export const EMPTY_DRAFT: Draft = {
 
 export interface Settings {
   keys: Partial<Record<ProviderId, string>>;
+  /** Account IDs, for the providers that need one beside the key (Cloudflare). Kept as typed. */
+  accounts: Partial<Record<ProviderId, string>>;
   models: Partial<Record<ProviderId, string>>;
   /** Provider a task starts with; 'auto' leaves the order to the server. */
   primary: ProviderId | 'auto';
@@ -90,6 +124,7 @@ const STORAGE_KEY = 'jules_settings_v1';
 
 export const DEFAULT_SETTINGS: Settings = {
   keys: {},
+  accounts: {},
   models: {},
   primary: 'auto',
   fallback: true,
@@ -107,9 +142,20 @@ export function splitModels(value: string | null | undefined): string[] {
   const models: string[] = [];
   (value || '').split(/[,;\n]+/).forEach((item) => {
     const name = item.trim();
-    if (name && /^[A-Za-z0-9][A-Za-z0-9._:\/@+-]{0,199}$/.test(name) && models.indexOf(name) < 0) models.push(name);
+    // (Cloudflare's names start with "@": @cf/zai-org/glm-4.7-flash.)
+    if (name && /^[A-Za-z0-9@][A-Za-z0-9._:\/@+-]{0,199}$/.test(name) && models.indexOf(name) < 0) models.push(name);
   });
   return models.slice(0, MAX_MODELS);
+}
+
+/**
+ * An account ID as it is sent: Cloudflare's are 32 hexadecimal characters.
+ * '' when the text is not one - it becomes part of an address on the server,
+ * which lets nothing else in either (`clean_account_id`).
+ */
+export function cleanAccountId(value: string | null | undefined): string {
+  const text = (value || '').trim().toLowerCase();
+  return /^[0-9a-f]{32}$/.test(text) ? text : '';
 }
 
 function text(value: unknown, limit = 600): string {
@@ -136,6 +182,7 @@ export function reviveSettings(value: unknown): Settings {
   const modes: CommitMode[] = ['bot', 'coauthor', 'user'];
   return {
     keys: providerMap(raw.keys),
+    accounts: providerMap(raw.accounts),
     models: providerMap(raw.models),
     primary: PROVIDER_IDS.indexOf(raw.primary as ProviderId) >= 0 ? (raw.primary as ProviderId) : 'auto',
     fallback: raw.fallback !== false,
@@ -216,11 +263,6 @@ export function useSettings(): Settings {
   return settings;
 }
 
-/** Whether this browser holds a key for at least one model provider. */
-export function hasProviderKey(settings: Settings): boolean {
-  return PROVIDER_IDS.some((id) => (settings.keys[id] || '').trim() !== '');
-}
-
 const EMAIL = /^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/;
 
 /** Whether a name and address are there to attribute a commit to a person. */
@@ -228,13 +270,40 @@ export function identityComplete(identity: CommitIdentity): boolean {
   return identity.name.trim().length > 0 && EMAIL.test(identity.email.trim());
 }
 
+/**
+ * A key that may have its account ID in front ("<account ID>:<key>", the form
+ * in which the two travel together) taken apart. A plain key is the key.
+ */
+export function splitAccountKey(value: string | null | undefined): { account: string; key: string } {
+  const text = (value || '').trim();
+  const colon = text.indexOf(':');
+  if (colon < 0) return { account: '', key: text };
+  return { account: cleanAccountId(text.slice(0, colon)), key: text.slice(colon + 1).trim() };
+}
+
+/**
+ * What a provider's key header carries: the key. For a provider that needs an
+ * account ID as well, both travel in it as "<account ID>:<key>" - or either
+ * one alone ("<account ID>:" for the account), when the server holds the other.
+ * '' when there is nothing to send.
+ */
+export function keyHeaderValue(id: ProviderId, key: string | null | undefined, account?: string | null): string {
+  const trimmed = (key || '').trim();
+  // Header values must be plain ASCII without spaces; anything else is not a key.
+  const usable = trimmed && /^[\x21-\x7e]+$/.test(trimmed) ? trimmed : '';
+  if (ACCOUNT_PROVIDERS.indexOf(id) < 0) return usable;
+  // (A key pasted with its account ID in front is taken apart: the field for the ID counts first.)
+  const pasted = splitAccountKey(usable);
+  const accountId = cleanAccountId(account) || pasted.account;
+  return accountId ? `${accountId}:${pasted.key}` : pasted.key;
+}
+
 /** Headers that carry this browser's provider keys to the backend. */
 export function providerKeyHeaders(settings: Settings = current): Record<string, string> {
   const headers: Record<string, string> = {};
   PROVIDER_IDS.forEach((id) => {
-    const key = (settings.keys[id] || '').trim();
-    // Header values must be plain ASCII without spaces; anything else is not a key.
-    if (key && /^[\x21-\x7e]+$/.test(key)) headers[`X-${id}-Key`] = key;
+    const value = keyHeaderValue(id, settings.keys[id], settings.accounts[id]);
+    if (value) headers[`X-${id}-Key`] = value;
   });
   return headers;
 }

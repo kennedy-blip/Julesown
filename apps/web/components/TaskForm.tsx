@@ -20,6 +20,7 @@ import type { Readiness } from '@/lib/health';
 import { providersIn } from '@/lib/providers';
 import type { ChainEntry } from '@/lib/providers';
 import { routeHref } from '@/lib/route';
+import { providerName } from '@/lib/settings';
 import type { Draft } from '@/lib/settings';
 import { Linkified } from './Linkified';
 import { buttonClass, INPUT, LABEL, Panel, TEXTAREA } from './ui';
@@ -119,6 +120,10 @@ export function TaskForm({
   const first = chain[0];
   // The providers behind the chain, each once: what the label names.
   const providers = providersIn(chain);
+  // The label has room for the first one with its model and the next two by
+  // name; the rest are counted (its title lists them all).
+  const named = providers.slice(1, 3);
+  const unnamed = providers.length - 1 - named.length;
   const via = repoCheck.phase === 'ok' ? (repoCheck.authMode === 'app' ? ' · via GitHub App' : repoCheck.authMode === 'token' ? ' · via token' : '') : '';
   const visibility = repoCheck.phase === 'ok' ? (repoCheck.isPrivate === null ? '' : repoCheck.isPrivate ? ' (private)' : ' (public)') : '';
 
@@ -163,12 +168,17 @@ export function TaskForm({
                   +{chain.length - 1}
                 </span>
               )}
-              {providers.slice(1).map((item) => (
+              {named.map((item) => (
                 <span key={item.id} className="hidden sm:inline-flex items-center gap-1.5 flex-shrink-0 text-slate-400">
                   <ArrowRight className="w-3 h-3 text-slate-600" />
-                  {item.label}
+                  {providerName(item.id)}
                 </span>
               ))}
+              {unnamed > 0 && (
+                <span className="hidden sm:inline flex-shrink-0 text-slate-500" data-testid="providers-more">
+                  +{unnamed}
+                </span>
+              )}
             </a>
           </>
         ) : undefined

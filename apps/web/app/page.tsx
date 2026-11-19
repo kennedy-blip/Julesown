@@ -40,7 +40,7 @@ import {
   saveSessions,
 } from '@/lib/sessions';
 import type { Session } from '@/lib/sessions';
-import { getSettings, hasProviderKey, loadSettings, updateSettings, useSettings } from '@/lib/settings';
+import { getSettings, loadSettings, updateSettings, useSettings } from '@/lib/settings';
 import type { Draft, SettingsTab } from '@/lib/settings';
 
 const MAX_SESSIONS = 30;
@@ -175,13 +175,15 @@ export default function Dashboard() {
   const settings = useSettings();
   const route = useRoute();
   const form = settings.draft;
-  const browserHasModelKey = hasProviderKey(settings);
-  const readiness = readinessOf(health, browserHasModelKey);
   const healthData = health.phase === 'ok' ? health.data : null;
   const accessMode = healthData && healthData.access ? healthData.access.mode : 'open';
   const githubAuthMode = healthData && healthData.github ? healthData.github.auth_mode : 'none';
   // The model providers a task started here will use, first choice first.
   const chain = useMemo(() => effectiveChain(healthData, settings), [healthData, settings]);
+  // Where the server has no model key of its own, one kept here will do - when a
+  // provider can be used with it (Cloudflare needs its account ID too).
+  const browserHasModelKey = chain.length > 0;
+  const readiness = readinessOf(health, browserHasModelKey);
 
   const [sessions, setSessions] = useState<Session[]>([]);
   const [storageLoaded, setStorageLoaded] = useState(false);

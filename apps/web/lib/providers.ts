@@ -1,5 +1,5 @@
 import type { HealthEnv, ProviderInfo } from './api';
-import { PROVIDER_IDS, splitModels } from './settings';
+import { PROVIDER_IDS, cleanAccountId, providerKeyHeaders, splitAccountKey, splitModels } from './settings';
 import type { ProviderId, Settings } from './settings';
 
 /** What is known about the providers before the backend has answered. */
@@ -41,6 +41,27 @@ const KNOWN_PROVIDERS: ProviderInfo[] = [
     model_variable: 'ZAI_MODEL',
   },
   {
+    id: 'cloudflare',
+    label: 'Cloudflare Workers AI',
+    configured: false,
+    model: '@cf/zai-org/glm-4.7-flash',
+    models: ['@cf/zai-org/glm-4.7-flash', '@cf/google/gemma-4-26b-a4b-it'],
+    key_variable: 'CLOUDFLARE_API_TOKEN',
+    model_variable: 'CLOUDFLARE_MODEL',
+    account_variable: 'CLOUDFLARE_ACCOUNT_ID',
+    key_set: false,
+    account_set: false,
+  },
+  {
+    id: 'sambanova',
+    label: 'SambaNova',
+    configured: false,
+    model: 'DeepSeek-V3.1',
+    models: ['DeepSeek-V3.1', 'gpt-oss-120b'],
+    key_variable: 'SAMBANOVA_API_KEY',
+    model_variable: 'SAMBANOVA_MODEL',
+  },
+  {
     id: 'openrouter',
     label: 'OpenRouter',
     configured: false,
@@ -48,6 +69,24 @@ const KNOWN_PROVIDERS: ProviderInfo[] = [
     models: ['openrouter/free'],
     key_variable: 'OPENROUTER_API_KEY',
     model_variable: 'OPENROUTER_MODEL',
+  },
+  {
+    id: 'pollinations',
+    label: 'Pollinations',
+    configured: false,
+    model: 'openai',
+    models: ['openai', 'openai/gpt-oss-20b'],
+    key_variable: 'POLLINATIONS_API_KEY',
+    model_variable: 'POLLINATIONS_MODEL',
+  },
+  {
+    id: 'deepseek',
+    label: 'DeepSeek',
+    configured: false,
+    model: 'deepseek-flash',
+    models: ['deepseek-flash'],
+    key_variable: 'DEEPSEEK_API_KEY',
+    model_variable: 'DEEPSEEK_MODEL',
   },
   { id: 'openai', label: 'OpenAI', configured: false, model: '', models: [], key_variable: 'OPENAI_API_KEY', model_variable: 'OPENAI_MODEL' },
   { id: 'anthropic', label: 'Anthropic', configured: false, model: '', models: [], key_variable: 'ANTHROPIC_API_KEY', model_variable: 'ANTHROPIC_MODEL' },
@@ -57,6 +96,42 @@ const KNOWN_PROVIDERS: ProviderInfo[] = [
 export function providersOf(health: HealthEnv | null): ProviderInfo[] {
   const reported = health && Array.isArray(health.providers) ? health.providers : [];
   return KNOWN_PROVIDERS.map((known) => reported.find((item) => item.id === known.id) || known);
+}
+
+/** The provider needs an account ID beside its key (Cloudflare: it is part of the address). */
+export function needsAccount(info: ProviderInfo): boolean {
+  return !!info.account_variable;
+}
+
+/** What the server holds for a provider: its key and - where one is needed - its account ID. */
+export function onServer(info: ProviderInfo): { key: boolean; account: boolean } {
+  if (!needsAccount(info)) return { key: info.configured, account: true };
+  return {
+    key: typeof info.key_set === 'boolean' ? info.key_set : info.configured,
+    account: typeof info.account_set === 'boolean' ? info.account_set : info.configured,
+  };
+}
+
+/** What this browser holds for a provider. */
+export function heldHere(info: ProviderInfo, settings: Settings): { key: boolean; account: boolean } {
+  const typed = (settings.keys[info.id] || '').trim();
+  if (!needsAccount(info)) return { key: typed !== '', account: false };
+  // (The account ID can also stand in front of the key: "<account ID>:<key>".)
+  const pasted = splitAccountKey(typed);
+  return {
+    key: pasted.key !== '',
+    account: cleanAccountId(settings.accounts[info.id]) !== '' || pasted.account !== '',
+  };
+}
+
+/**
+ * Whether a task started from this browser can use a provider: its key - and
+ * its account ID, where it needs one - each come from here or from the server.
+ */
+export function usableHere(info: ProviderInfo, settings: Settings): boolean {
+  const here = heldHere(info, settings);
+  const server = onServer(info);
+  return (here.key || server.key) && (here.account || server.account);
 }
 
 /** The models the server gives a provider, in the order they are tried. */
@@ -87,27 +162,29 @@ export interface ChainEntry {
  * This repeats what the server does with a request (`Settings.with_overrides`
  * in apps/api/config.py): every provider that has a key - the server's or one
  * kept here - in the server's order of preference, with the first choice in
- * front. The first choice made here counts only if there is a key for it; the
- * server's own (JULES_LLM_PROVIDER) is set aside when it has no key but this
- * browser brings one for another provider.
+ * front. (A provider that needs an account ID has to have that too, from
+ * either side.) The first choice made here counts only if there is a key for
+ * it; the server's own (JULES_LLM_PROVIDER) is set aside when it has no key
+ * but this browser brings one for another provider.
  */
 export function providerOrder(health: HealthEnv | null, settings: Settings): ProviderId[] {
   const providers = providersOf(health);
   const preferences = health && health.llm_preferences ? health.llm_preferences : null;
-  const hasKeyHere = (id: ProviderId) => (settings.keys[id] || '').trim() !== '';
 
   const order: ProviderId[] = [];
   ((preferences && preferences.order) || []).concat(PROVIDER_IDS).forEach((id) => {
     if (PROVIDER_IDS.indexOf(id as ProviderId) >= 0 && order.indexOf(id as ProviderId) < 0) order.push(id as ProviderId);
   });
-  const usable = order.filter((id) => hasKeyHere(id) || providers.some((item) => item.id === id && item.configured));
+  const usable = order.filter((id) => providers.some((item) => item.id === id && usableHere(item, settings)));
 
   const chosenHere = settings.primary !== 'auto' && usable.indexOf(settings.primary) >= 0 ? settings.primary : null;
   const choice = chosenHere || ((preferences && preferences.first_choice) as ProviderId | null) || null;
   let chain: ProviderId[];
   if (!choice) chain = usable;
   else if (usable.indexOf(choice) >= 0) chain = [choice].concat(usable.filter((id) => id !== choice));
-  else chain = PROVIDER_IDS.some(hasKeyHere) ? usable : [];
+  // (The server's first choice has no key. It keeps to it - and runs nothing -
+  // unless the request brings something of its own.)
+  else chain = Object.keys(providerKeyHeaders(settings)).length > 0 ? usable : [];
 
   const fallback = settings.fallback && !(preferences && preferences.fallback === false);
   return fallback ? chain : chain.slice(0, 1);
