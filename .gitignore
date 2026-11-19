@@ -1,6 +1,8 @@
 # Node & Build Outputs
 node_modules/
 .next/
+# Written by Next.js on every build and dev run
+next-env.d.ts
 out/
 build/
 dist/
@@ -20,6 +22,11 @@ ENV/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Browser tests (Playwright)
+test-results/
+playwright-report/
+blob-report/
 
 # Logs & Environment
 logs/

@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, ArrowLeft, CheckCircle2, KeyRound, Loader2, RefreshCw, X } from 'lucide-react';
 import { AccessKeyField } from '@/components/AccessKeyField';
 import { LiveTerminal } from '@/components/LiveTerminal';

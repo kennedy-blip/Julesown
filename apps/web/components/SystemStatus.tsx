@@ -1,6 +1,5 @@
 'use client';
 
-import React from 'react';
 import { useReadiness } from '@/lib/health';
 import type { Readiness } from '@/lib/health';
 

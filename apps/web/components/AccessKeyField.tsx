@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import { useState } from 'react';
 import { AlertTriangle, CheckCircle2, Eye, EyeOff, Loader2, Trash2 } from 'lucide-react';
 import { Button, INPUT, LABEL } from './ui';
 

@@ -1,6 +1,5 @@
 'use client';
 
-import React from 'react';
 import { History, Plus, Trash2 } from 'lucide-react';
 import { sessionBadge } from '@/lib/sessions';
 import type { Session, SessionBadge } from '@/lib/sessions';
