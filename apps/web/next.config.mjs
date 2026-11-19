@@ -4,6 +4,9 @@
 const apiBase = (process.env.API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
 
 const nextConfig = {
+  // Explicitly set distDir so @vercel/next can locate the static output
+  // in this monorepo setup (apps/web/.next/).
+  distDir: '.next',
   reactStrictMode: true,
   async rewrites() {
     // On Vercel, vercel.json sends /api/* straight to the Python function
