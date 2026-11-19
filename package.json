@@ -10,9 +10,12 @@
     "build": "npm run build --workspace=apps/web",
     "dev:web": "npm run dev --workspace=apps/web",
     "dev:api": "uvicorn apps.api.main:app --reload --reload-dir apps/api --port 8000",
+    "dev:standin": "python3 -m apps.api.tests.standin_server",
     "build:web": "npm run build --workspace=apps/web",
     "lint": "npm run lint --workspace=apps/web",
-    "test:api": "pytest apps/api"
+    "test:api": "pytest apps/api",
+    "test:web": "npm run test:unit --workspace=apps/web",
+    "test:e2e": "npm run test:e2e --workspace=apps/web"
   },
   "devDependencies": {
     "concurrently": "^8.2.2"

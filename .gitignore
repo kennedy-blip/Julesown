@@ -21,6 +21,11 @@ ENV/
 .coverage
 htmlcov/
 
+# Browser tests (Playwright)
+test-results/
+playwright-report/
+blob-report/
+
 # Logs & Environment
 logs/
 *.log
