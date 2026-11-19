@@ -14,18 +14,6 @@
     {
       "src": "/api/(.*)",
       "dest": "apps/api/main.py"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "apps/web/$1"
-    },
-    {
-      "handle": "error"
-    },
-    {
-      "src": "/(?!api/).*",
-      "status": 404,
-      "dest": "/apps/web/404"
     }
   ]
 }
