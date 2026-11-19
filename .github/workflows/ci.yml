@@ -1,0 +1,53 @@
+name: CI
+
+# Runs on every pull request, and on the default branch after a merge - a
+# merge there is what Vercel deploys to production.
+on:
+  pull_request:
+  push:
+    branches:
+      - jules-clone-bootstrap-4141909950121385715
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  api:
+    name: Backend (tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: apps/api/requirements*.txt
+      - name: Install
+        run: pip install -r apps/api/requirements.txt pyflakes
+      - name: Lint
+        run: python -m pyflakes apps/api
+      - name: Tests
+        run: python -m pytest apps/api -q
+
+  web:
+    name: Dashboard (types, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install
+        run: npm ci --no-audit --no-fund
+      - name: Types
+        run: npx tsc --noEmit -p apps/web
+      - name: Build
+        run: npm run build
