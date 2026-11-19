@@ -204,3 +204,29 @@ def test_sandbox_that_dies_during_startup_is_cleaned_up(fake_sdk, monkeypatch):
     with pytest.raises(SandboxError):
         E2BWorkspace.create(api_key="k")
     assert killed == [True]
+
+
+def test_create_passes_allowed_hosts_to_network(fake_sdk):
+    E2BWorkspace.create(
+        api_key="k",
+        allowed_hosts=["registry.npmjs.org", "github.com"],
+    )
+    kwargs = fake_sdk.created[-1]
+    assert kwargs["network"] == {
+        "allow_out": ["registry.npmjs.org", "github.com"],
+        "deny_out": ["0.0.0.0/0"],
+    }
+
+
+def test_create_without_allowed_hosts_has_no_network(fake_sdk):
+    E2BWorkspace.create(api_key="k")
+    kwargs = fake_sdk.created[-1]
+    assert "network" not in kwargs
+
+
+def test_workspace_network_limited_flag(fake_sdk):
+    workspace = E2BWorkspace.create(api_key="k", allowed_hosts=["registry.npmjs.org"])
+    assert workspace.network_limited is True
+
+    workspace2 = E2BWorkspace.create(api_key="k")
+    assert workspace2.network_limited is False

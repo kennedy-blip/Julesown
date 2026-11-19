@@ -83,6 +83,10 @@ shows you what it looked at:
 
 - **Facts up front.** The repository's root manifests and the beginning of its README are part of
   the task message, so the model does not have to guess what the project is built with.
+- **The repository's own instructions.** If the repository has an `AGENTS.md`, it is shown above
+  the manifests, with its own size budget (16 KB by default). The agent is told to follow it where
+  it applies to the task, but the task and the standing instructions come first where they
+  conflict. A guide is shown up front - it is not counted as something the agent has read.
 - **Look before you write.** The first `write_file` of a run is held back once if the model has not
   read, searched or run anything yet, and an existing file is not overwritten before it has been read.
   The model is told why and may repeat the call – this is a nudge, not a lock. If a held-back write is
@@ -615,6 +619,8 @@ With neither set, tasks are **locked** on Vercel / `ENVIRONMENT=production` and 
 | `JULES_COMMAND_TIMEOUT_SECONDS` | `120` | Time limit for one command in the sandbox. |
 | `JULES_MAX_OUTPUT_TOKENS` | `8192` | Upper bound for one model reply. |
 | `E2B_TEMPLATE` | E2B default | Sandbox template, e.g. one with your toolchain preinstalled. |
+| `JULES_SANDBOX_NETWORK` | `auto` | Where the sandbox may connect: `auto` (limits when an issue comes from outside the project), `open` (anywhere), `restricted` (the registries and GitHub only). |
+| `JULES_SANDBOX_ALLOWED_HOSTS` | – | Extra hosts a limited sandbox can reach, comma-separated (names, `*.` prefixes or CIDR blocks). |
 | `GITHUB_WEBHOOK_SECRET` | – | Enables what GitHub starts: `/jules` commands and fixing failed checks unasked (see below). |
 | `JULES_CORS_ORIGINS` | – | Comma-separated origins allowed to call the API from a browser. Not needed for the dashboard, which is served from the same origin. |
 
@@ -681,6 +687,14 @@ To have failed checks of Jules' own pull requests fixed **unasked**, also subscr
 Vercel reports a deployment). *Workflow run* is understood as well.
 
 Deliveries with an invalid signature are rejected, and nothing is started when no secret is configured.
+
+**Issues from outside the project.** Anyone can open an issue and write `/jules` in it - they do not
+need to be a collaborator. When the person who opened the issue is not an owner, member or
+collaborator of the repository, the issue's text is given to the agent as a quotation: every line
+is prefixed with `>`, and what Markdown hides from a reader (HTML comments, link definitions) is
+stripped out first. The task is marked with `untrusted_author`, and the agent's sandbox is limited
+to GitHub and the package registries only - it cannot reach any other host. Trusted collaborators'
+issues are treated as normal instructions and are not quoted.
 
 ---
 
@@ -802,6 +816,12 @@ Fields of a task record that describe how far the result can be trusted:
 - **Sandbox contents.** The default E2B template has git, Python and Node.js but not your project's
   dependencies; the agent installs what the tests need, which costs time. Use `E2B_TEMPLATE` for a
   prepared image.
+- **Sandbox network.** The sandbox can reach GitHub (to clone and push) and the package registries
+  (npm, PyPI, crates.io, Maven Central, …). `JULES_SANDBOX_NETWORK` controls this: `auto` (the
+  default) limits the sandbox when an issue comes from someone outside the project, `open` allows
+  any connection, `restricted` always limits it. `JULES_SANDBOX_ALLOWED_HOSTS` adds more hosts a
+  limited sandbox may reach (comma-separated names, `*.` prefixes or CIDR blocks). The health
+  endpoint (`GET /api/v1/health/env`) reports the current `sandbox.network` mode.
 - **Task history** is kept in the server's memory and in your browser. It is not a database; the
   durable record of a task is its pull request (or first commit). Whether a pull request has been merged or closed
   since, and what its checks say, is read from GitHub when the dashboard loads, when you return to
