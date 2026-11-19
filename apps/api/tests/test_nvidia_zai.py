@@ -145,7 +145,7 @@ def test_a_parameter_a_model_does_not_take_is_left_out(monkeypatch):
             401,
             {"status": 401, "title": "Unauthorized", "detail": "Authentication failed"},
             "auth",
-            "nvidia returned HTTP 401: Unauthorized: Authentication failed Check the NVIDIA API key.",
+            "nvidia returned HTTP 401: Unauthorized: Authentication failed. Check the NVIDIA API key.",
         ),
         (403, {"status": 403, "title": "Forbidden", "detail": "Authorization failed"}, "auth", None),
         (
@@ -251,7 +251,7 @@ def test_nvidia_account_without_access_to_the_hosted_endpoints_is_explained(monk
     assert error.kind == "model_unavailable" and error.status_code == 404
     assert error.message == (
         "nvidia returned HTTP 404: Not Found: Function '0f1e2d3c-aaaa-4bbb-8ccc-0123456789ab': Not found for account "
-        "'acct-123' NVIDIA answers this for a model it has withdrawn - and for every model when the account has not "
+        "'acct-123'. NVIDIA answers this for a model it has withdrawn - and for every model when the account has not "
         "been given access to its hosted endpoints."
     )
     # One replacement is tried, not the whole catalogue.
@@ -544,7 +544,8 @@ def test_trying_a_key_out_goes_on_to_the_free_model(monkeypatch):
 # Their place among the others
 # --------------------------------------------------------------------------- #
 def test_where_the_two_stand_in_the_chain(monkeypatch):
-    assert LLM_PROVIDERS == ("groq", "gemini", "nvidia", "zai", "openrouter", "openai", "anthropic")
+    assert LLM_PROVIDERS[:4] == ("groq", "gemini", "nvidia", "zai") and LLM_PROVIDERS[-2:] == ("openai", "anthropic")
+    assert LLM_PROVIDERS.index("zai") < LLM_PROVIDERS.index("openrouter") < LLM_PROVIDERS.index("openai")
     for name, key in (("GROQ", "gsk"), ("GEMINI", "AQ.key"), ("OPENROUTER", "sk-or"), ("NVIDIA", "nvapi-key"), ("ZAI", "zai-key")):
         monkeypatch.setenv(f"{name}_API_KEY", key)
     # Every provider's first model, then the ones that stand in for them. The two
@@ -582,8 +583,9 @@ def test_keys_under_their_other_names(monkeypatch, client: TestClient):
 def test_without_any_key_every_way_in_is_named(client: TestClient):
     needed = get_settings().needs()["llm"]
     assert needed == (
-        "an LLM API key (GROQ_API_KEY, GEMINI_API_KEY, NVIDIA_API_KEY, ZAI_API_KEY, OPENROUTER_API_KEY, "
-        "OPENAI_API_KEY or ANTHROPIC_API_KEY)"
+        "an LLM API key (GROQ_API_KEY, GEMINI_API_KEY, NVIDIA_API_KEY, ZAI_API_KEY, CLOUDFLARE_API_TOKEN, "
+        "SAMBANOVA_API_KEY, OPENROUTER_API_KEY, POLLINATIONS_API_KEY, DEEPSEEK_API_KEY, OPENAI_API_KEY "
+        "or ANTHROPIC_API_KEY)"
     )
     with pytest.raises(LLMError) as caught:
         create_llm_client(get_settings())
