@@ -9,7 +9,8 @@
       "src": "apps/web/package.json",
       "use": "@vercel/next",
       "config": {
-        "distDir": ".next"
+        "distDir": ".next",
+        "rootDirectory": "apps/web"
       }
     }
   ],
