@@ -17,6 +17,10 @@
     {
       "src": "/api/(.*)",
       "dest": "apps/api/main.py"
+    },
+    {
+      "src": "/_next/static/immutable/(.*)",
+      "dest": "/_next/static/$1"
     }
   ]
 }
