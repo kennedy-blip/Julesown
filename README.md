@@ -11,7 +11,8 @@ description and pushes it as the repository's first commit, laid out so that it 
 Vercel or another host afterwards.
 
 The agent is not tied to one model. Each provider (Groq, Google Gemini, NVIDIA NIM, Z.AI,
-OpenRouter, OpenAI, Anthropic) can be given several models, and with keys for more than one
+Cloudflare Workers AI, SambaNova, OpenRouter, Pollinations, DeepSeek, OpenAI, Anthropic) can be
+given several models, and with keys for more than one
 provider the agent **carries on with the next model** when the one in use reaches its rate limit,
 has used up its day or fails. It can
 **add more work to a pull request**, **repair the checks that failed** on it (a test run on GitHub
@@ -180,13 +181,22 @@ Whatever it has built by then is **kept**: a project whose build does not pass y
 | Google Gemini | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | `gemini-flash-latest`, then `gemini-3.5-flash-lite` | requests per day |
 | NVIDIA NIM | `NVIDIA_API_KEY` (or `NVIDIA_NIM_API_KEY`) | `deepseek-ai/deepseek-v4.1-flash`, then `nvidia/nemotron-3-super-120b-a12b` | about 40 requests a minute per account, no daily limit |
 | Z.AI (GLM) | `ZAI_API_KEY` (or `GLM_API_KEY`) | `glm-4.7-flash`, then `glm-4.5-flash` | these two models, one request at a time |
+| Cloudflare Workers AI | `CLOUDFLARE_API_TOKEN` (or `CLOUDFLARE_API_KEY`) **and** `CLOUDFLARE_ACCOUNT_ID` | `@cf/zai-org/glm-4.7-flash`, then `@cf/google/gemma-4-26b-a4b-it` | 10,000 neurons a day for the whole account |
+| SambaNova | `SAMBANOVA_API_KEY` | `DeepSeek-V3.1`, then `gpt-oss-120b` | 20 requests and 200,000 tokens a day per model |
 | OpenRouter | `OPENROUTER_API_KEY` | `openrouter/free` | 50 requests a day for all free models together |
+| Pollinations | `POLLINATIONS_API_KEY` | `openai`, then `openai/gpt-oss-20b` | only the credit earned with its quests; otherwise a prepaid balance |
+| DeepSeek | `DEEPSEEK_API_KEY` | `deepseek-flash` | – (a prepaid balance, at a low price per token) |
 | OpenAI | `OPENAI_API_KEY` | `gpt-6-luna` | – |
 | Anthropic | `ANTHROPIC_API_KEY` | `claude-sonnet-5-5` | – |
 
 One key is enough to run tasks. The more of the free ones are set, the less a single provider's
 limit matters: where one has used up its day, the next carries on. (The limits are the providers'
 own and change; the column says what they were when this was written.)
+
+What "free" means differs a great deal. NVIDIA and Z.AI can carry whole tasks all day; Cloudflare's
+daily allowance is good for a few tasks; SambaNova's twenty requests a day per model carry a task
+over some steps while the others are limited, no further. Pollinations and DeepSeek spend a
+balance: they are tried after the free ones and are passed over once it is used up.
 
 **Several models per provider.** A provider can be given up to four models, separated by commas
 (`GEMINI_MODEL=gemini-flash-latest,gemini-3.5-flash-lite`, or the **Models** field in the
@@ -204,9 +214,11 @@ name is the default:
   throttled whenever it is popular and may be withdrawn; the router has neither problem. The log
   and the result say which models answered. To pin one, or to list several, set `OPENROUTER_MODEL`
   (for example `qwen/qwen3-coder:free,openrouter/free`).
-- NVIDIA and Z.AI have no such name: their defaults are models. A model NVIDIA has withdrawn is
-  replaced by another one it still lists; a GLM model that is gone is passed over, and the rest of
-  the chain carries on.
+- `openai` is Pollinations' own name for the OpenAI model it offers by default (GPT-5.4 Nano when
+  this was written). It moves with their catalogue; the log says which model answered.
+- The others have no such name: their defaults are models. A model that NVIDIA or SambaNova has
+  withdrawn is replaced by another one it still lists; elsewhere a model that is gone is passed
+  over, and the rest of the chain carries on.
 
 **NVIDIA NIM** ([build.nvidia.com](https://build.nvidia.com)) hosts open models behind one key
 (`nvapi-…`). What to know about it:
@@ -236,9 +248,73 @@ name is the default:
   run of a few minutes can afford. Thinking is therefore switched off (for GLM-5.3 and later, which
   cannot switch it off, the lowest effort is asked for). `ZAI_REASONING_EFFORT` changes that.
 
+**Cloudflare Workers AI** ([developers.cloudflare.com/workers-ai](https://developers.cloudflare.com/workers-ai/))
+runs open models on Cloudflare's own network. What to know about it:
+
+- It needs **two values**: an API token with the *Workers AI* permission and the **account ID**,
+  which is part of the address its models are called at. Both are on the dashboard's Workers AI
+  page under *Use REST API* (*Create a Workers AI API Token*, and *Account ID* beside it). On the
+  server they are `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`; the card in Settings has a
+  field for each. A token without its account ID is not used, and Settings says that it is missing.
+- An account gets **10,000 neurons a day** at no charge, for all of its models together; the count
+  starts again at 00:00 UTC. What a request costs depends on the model, which is why the defaults
+  are two inexpensive ones that call tools: GLM-4.7-Flash and Gemma 4. When the day is used up, every
+  Cloudflare model is set aside for the rest of the run - its second model would be refused as well.
+- Model names start with `@cf/` and are those of its
+  [model catalogue](https://developers.cloudflare.com/workers-ai/models/); pick ones marked
+  *Function calling*. Models marked as needing the Workers Paid plan are refused on a free account -
+  only that model is set aside then, the others stay in use.
+- Several of its models think before every reply unless told not to. Thinking is switched off for
+  the models that have a switch (`CLOUDFLARE_REASONING_EFFORT` changes that). Every request also
+  asks Cloudflare to refuse it at once rather than queue it when there is no capacity
+  (`options.rejectIfBusy`), so that the next model can take it; where Cloudflare does not apply
+  that option, the request waits its turn like any other.
+
+**SambaNova** ([cloud.sambanova.ai](https://cloud.sambanova.ai)) serves a handful of open models
+very fast. What to know about it:
+
+- Without a payment method each model answers **20 requests a day** (and 200,000 tokens), and 20 a
+  minute. A task takes up to thirty requests: SambaNova alone does not run one. In the chain it is
+  what carries a task over some steps while the others wait for their limits. With a payment method
+  linked to the account the limits are in the thousands, and usage is paid for.
+- The limits are per model, so its second model has an allowance of its own. Headers of the
+  refusal say whether the minute's requests ran out or the day's. When neither did, the refusal
+  is taken to be about the day's tokens, which no header counts and which a long conversation can
+  reach before its twentieth request. A model whose day is used up is set aside for the rest of
+  the run.
+- Its catalogue is small and changes. A model that was withdrawn is replaced by another one it
+  still lists and that calls tools (`SAMBANOVA_MODEL` to choose yourself; the names are those of
+  its [models page](https://docs.sambanova.ai/docs/en/models/sambacloud-models), in its spelling).
+
+**Pollinations** ([enter.pollinations.ai](https://enter.pollinations.ai)) gives one key (`sk_…`)
+for models of many makers. What to know about it:
+
+- It is **prepaid**: requests are paid for from the account's balance - the *Quest balance* first
+  (credit earned there without paying), then the *paid balance* (bought credit). Its catalogue says
+  for each model which of the two pay for it. A model that only the paid balance pays for is set
+  aside alone when there is none; Pollinations' other models stay in use. (The catalogue also
+  marks a few models as free to use. When this was written none of them could drive the agent: one
+  was a moderation model that calls no tools, the other an experimental one that was down.)
+- When the balance (or the budget a key was given) is used up, Pollinations does not fail the
+  request: it answers with a chat message that asks to top up. The agent recognises that message
+  for what it is - a task does not end with it as its answer - and carries on with the next provider.
+- `POLLINATIONS_MODEL` takes the names of its [catalogue](https://enter.pollinations.ai/models)
+  (`deepseek/deepseek-v4.1-flash`, `z-ai/glm-5.3-flash`, …); use ones that are marked for tool
+  calling. A key can be restricted to some models: **Test** in Settings shows which are refused.
+
+**DeepSeek** ([platform.deepseek.com](https://platform.deepseek.com)) is DeepSeek's own API. What to
+know about it:
+
+- It is **not free**: requests are paid for from the account's balance, at a low price per token.
+  Without a balance it answers `402 Insufficient Balance`; DeepSeek is then out for the rest of the
+  run and the chain carries on. There is one default model and no second one that costs more.
+- DeepSeek's models think before every reply unless a request says otherwise, and once tools are
+  used they refuse a conversation whose earlier replies come without their reasoning. A
+  conversation that moves between providers has such replies, so thinking is switched off.
+
 **The chain.** Every provider that has a key takes part, in the order of the table (change it with
 `JULES_LLM_ORDER`, or name the first choice with `JULES_LLM_PROVIDER`). A task tries every
-provider's first model before anybody's second one - with keys for all five free providers:
+provider's first model before anybody's second one - with keys for the first four and OpenRouter:
 
 ```text
 groq openai/gpt-oss-120b → gemini gemini-flash-latest → nvidia deepseek-ai/deepseek-v4.1-flash
@@ -247,8 +323,10 @@ groq openai/gpt-oss-120b → gemini gemini-flash-latest → nvidia deepseek-ai/d
   → nvidia nvidia/nemotron-3-super-120b-a12b → zai glm-4.5-flash
 ```
 
-OpenRouter comes last among them: its router answers with whichever free model it picks, and its
-daily allowance is the smallest.
+The order is: what renews itself first, the larger allowances before the smaller ones - Cloudflare
+and SambaNova take their places between Z.AI and OpenRouter. OpenRouter comes last among the free
+ones, because its router answers with whichever free model it picks. Pollinations and DeepSeek
+follow, then OpenAI and Anthropic: what spends a balance is used when nothing free is left.
 
 The agent works with the first one and switches when it has to:
 
@@ -262,9 +340,11 @@ The agent works with the first one and switches when it has to:
   is asked again after 3 seconds instead of being set aside like a single model (30 seconds).
 - **Daily limit** – that model is out for the rest of the run. OpenRouter counts one daily
   allowance for all its free models, so there it takes out every free model at once; paid models
-  on the same key stay usable.
+  on the same key stay usable. Cloudflare's neurons are one allowance for the whole account: there
+  it takes out every model.
 - **Rejected key, no credit** – every model of that provider is out for the rest of the run.
-  (At Z.AI, "no balance" is about the paid model that was asked: its free models stay in use.)
+  (Where "no credit" is about the model that was asked - a paid GLM model at Z.AI, a paid-only one
+  at Pollinations, one of Cloudflare's paid plan - the provider's other models stay in use.)
 - **Unknown model, request the provider refuses** – that model is out for the rest of the run.
 - **Outage or timeout** – the model is set aside for a short while and tried again later.
 - **A model that does not answer** – a request is not waited for longer than the model has earned:
@@ -282,9 +362,11 @@ answered). `JULES_LLM_FALLBACK=false` restricts tasks to the first model of the 
 **Where the keys live.** A key can be an environment variable of the deployment, or be entered in the
 dashboard under **Settings → AI models**. A key entered there is kept in that browser
 (`localStorage`) and sent to your own backend with each task you start, in a request header
-(`X-Groq-Key`, `X-Gemini-Key`, `X-Nvidia-Key`, `X-Zai-Key`, `X-OpenRouter-Key`, `X-OpenAI-Key`,
-`X-Anthropic-Key`). The backend uses it for that one task, in place of its own key for that provider; it is not stored and is masked
-in logs and error messages. The same page sets the models per provider and the first choice, and
+(`X-Groq-Key`, `X-Gemini-Key`, `X-Nvidia-Key`, `X-Zai-Key`, `X-Cloudflare-Key`, `X-SambaNova-Key`,
+`X-OpenRouter-Key`, `X-Pollinations-Key`, `X-DeepSeek-Key`, `X-OpenAI-Key`, `X-Anthropic-Key`). The
+backend uses it for that one task, in place of its own key for that provider; it is not stored and
+is masked in logs and error messages. (Cloudflare's header carries the account ID in front of the
+token, `<account ID>:<token>`; either half can be left to the server.) The same page sets the models per provider and the first choice, and
 its **Test** button sends one small request with a tool to **each** of the provider's models
 (`POST /api/v1/llm/test`) to show whether the key is accepted, each model exists and can call
 tools - and, for a router or an alias, which model answered.
@@ -489,7 +571,7 @@ Model provider keys can also be entered in the dashboard instead
 
 | Variable | Purpose |
 | --- | --- |
-| `GROQ_API_KEY`, `GEMINI_API_KEY`, `NVIDIA_API_KEY`, `ZAI_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` — at least one, here or in the dashboard's Settings | The models that drive the agent. With several, a task starts with the first in that order and carries on with the next when it has to. |
+| `GROQ_API_KEY`, `GEMINI_API_KEY`, `NVIDIA_API_KEY`, `ZAI_API_KEY`, `CLOUDFLARE_API_TOKEN` (with `CLOUDFLARE_ACCOUNT_ID`), `SAMBANOVA_API_KEY`, `OPENROUTER_API_KEY`, `POLLINATIONS_API_KEY`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` — at least one, here or in the dashboard's Settings | The models that drive the agent. With several, a task starts with the first in that order and carries on with the next when it has to. |
 | `E2B_API_KEY` | Sandbox in which the repository is cloned, edited and tested. |
 | `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` **or** `GITHUB_TOKEN` | Credentials used to push the branch and open the pull request. See [GitHub setup](#-github-setup). |
 
@@ -509,18 +591,22 @@ With neither set, tasks are **locked** on Vercel / `ENVIRONMENT=production` and 
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GROQ_MODEL` / `GEMINI_MODEL` / `NVIDIA_MODEL` / `ZAI_MODEL` / `OPENROUTER_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | see [the table above](#-model-providers-and-fallback) | The model to use, or up to four separated by commas in the order they are tried. If a configured model has been retired, the backend picks an available one from the provider's model list and says so in the task log. |
-| `JULES_LLM_PROVIDER` | – | The provider tasks start with (`groq`, `gemini`, `nvidia`, `zai`, `openrouter`, `openai`, `anthropic`). |
-| `JULES_LLM_ORDER` | `groq,gemini,nvidia,zai,openrouter,openai,anthropic` | The order in which providers that have a key are used. |
+| `GROQ_MODEL` / `GEMINI_MODEL` / `NVIDIA_MODEL` / `ZAI_MODEL` / `CLOUDFLARE_MODEL` / `SAMBANOVA_MODEL` / `OPENROUTER_MODEL` / `POLLINATIONS_MODEL` / `DEEPSEEK_MODEL` / `OPENAI_MODEL` / `ANTHROPIC_MODEL` | see [the table above](#-model-providers-and-fallback) | The model to use, or up to four separated by commas in the order they are tried. If a configured model has been retired, the backend picks an available one from the provider's model list and says so in the task log. |
+| `CLOUDFLARE_ACCOUNT_ID` | – | The ID of the Cloudflare account the token belongs to (32 characters). Cloudflare is used only when both are set. |
+| `JULES_LLM_PROVIDER` | – | The provider tasks start with (`groq`, `gemini`, `nvidia`, `zai`, `cloudflare`, `sambanova`, `openrouter`, `pollinations`, `deepseek`, `openai`, `anthropic`). |
+| `JULES_LLM_ORDER` | `groq,gemini,nvidia,zai,cloudflare,sambanova,openrouter,pollinations,deepseek,openai,anthropic` | The order in which providers that have a key are used. |
 | `JULES_LLM_FALLBACK` | `true` | `false`: a task uses only the first model of the first provider. |
 | `JULES_TASK_GUIDELINES` | – | Instructions added to every task of this deployment (see [Standing instructions](#-standing-instructions)). `\n` stands for a line break. |
 | `GROQ_REASONING_EFFORT` / `OPENROUTER_REASONING_EFFORT` / `OPENAI_REASONING_EFFORT` | `low` / `low` / `none` | Reasoning effort sent to the model (`default` omits the parameter). |
-| `NVIDIA_REASONING_EFFORT` | – | Not sent unless set: the models NVIDIA hosts differ in whether they take it. |
+| `NVIDIA_REASONING_EFFORT` / `SAMBANOVA_REASONING_EFFORT` / `POLLINATIONS_REASONING_EFFORT` | – | Not sent unless set: the models these three offer differ in whether they take it. |
+| `CLOUDFLARE_REASONING_EFFORT` | `none` | `none` switches thinking off for the Cloudflare models that have a switch for it. An effort (`low`, `medium`, `high`, `max`; also `minimal`, `xhigh`) is passed on instead - which of them a model takes is on its page in Cloudflare's catalogue. `default` leaves it all to the model. |
 | `NVIDIA_EXTRA_BODY` | – | A JSON object with more fields for every request to NVIDIA, for what the page of your model documents - for example `{"chat_template_kwargs": {"enable_thinking": false}}` to stop a Nemotron model from thinking before each reply. A field a model rejects by name is left out for the rest of the run. |
 | `ZAI_REASONING_EFFORT` | `none` | How much a GLM model thinks before it answers: `none` (off; the lowest effort for models that cannot switch it off), `low`, `medium`, `high`, `max`, or `default` to leave it to Z.AI (thinking at the highest effort). |
 | `GEMINI_THINKING_LEVEL` | `low` | How much Gemini thinks before it answers (`minimal`, `low`, `medium`, `high`; `default` leaves it to Google). |
-| `GROQ_TEMPERATURE` / `OPENROUTER_TEMPERATURE` / `NVIDIA_TEMPERATURE` / `ZAI_TEMPERATURE` | `0.2` | Sampling temperature, `0`–`2` (Z.AI: `0`–`1`; `default` leaves it to the provider). A low value makes malformed tool calls and made-up content less likely. |
+| `GROQ_TEMPERATURE` / `OPENROUTER_TEMPERATURE` / `NVIDIA_TEMPERATURE` / `ZAI_TEMPERATURE` / `CLOUDFLARE_TEMPERATURE` / `SAMBANOVA_TEMPERATURE` / `POLLINATIONS_TEMPERATURE` / `DEEPSEEK_TEMPERATURE` | `0.2` | Sampling temperature, `0`–`2` (Z.AI: `0`–`1`; `default` leaves it to the provider). A low value makes malformed tool calls and made-up content less likely. |
 | `NVIDIA_BASE_URL` / `ZAI_BASE_URL` | `https://integrate.api.nvidia.com/v1` / `https://api.z.ai/api/paas/v4` | Where the two are reached, for example a NIM you host yourself, or `https://open.bigmodel.cn/api/paas/v4` for a key from Z.AI's platform in mainland China. |
+| `CLOUDFLARE_BASE_URL` | `https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1` | Where Cloudflare's models are reached; `{account_id}` stands for the account ID. An address without it is used as it is and needs no account ID - for example the Workers AI address of an AI Gateway. |
+| `SAMBANOVA_BASE_URL` / `POLLINATIONS_BASE_URL` / `DEEPSEEK_BASE_URL` | `https://api.sambanova.ai/v1` / `https://gen.pollinations.ai/v1` / `https://api.deepseek.com` | Where these three are reached. |
 | `JULES_KEEP_UNFINISHED_WORK` | `true` | Deliver what a run that stopped early had changed, marked as unfinished (see [Unfinished work](#-unfinished-work)). |
 | `JULES_CI_AUTOFIX` / `JULES_CI_AUTOFIX_ATTEMPTS` | `true` / `2` | Fix failed checks of Jules' own pull requests unasked, and how often per pull request (see [Failed checks](#-failed-checks)). |
 | `JULES_COMMIT_AUTHORSHIP` | `bot` | `bot`, `coauthor` or `user`, with `JULES_COMMIT_AUTHOR_NAME` and `JULES_COMMIT_AUTHOR_EMAIL` (see [Who the commits are attributed to](#-who-the-commits-are-attributed-to)). |
@@ -652,8 +738,9 @@ Request body for both task endpoints (JSON, sent with `Content-Type: application
 ```
 
 `llm` and `commit` are optional and apply to that task only. Provider keys for the task go in the
-headers `X-Groq-Key`, `X-Gemini-Key`, `X-Nvidia-Key`, `X-Zai-Key`, `X-OpenRouter-Key`, `X-OpenAI-Key`,
-`X-Anthropic-Key`.
+headers `X-Groq-Key`, `X-Gemini-Key`, `X-Nvidia-Key`, `X-Zai-Key`, `X-Cloudflare-Key`
+(`<account ID>:<token>`), `X-SambaNova-Key`, `X-OpenRouter-Key`, `X-Pollinations-Key`,
+`X-DeepSeek-Key`, `X-OpenAI-Key`, `X-Anthropic-Key`.
 Interactive documentation is served at `/api/docs`.
 
 Fields of a task record that describe how far the result can be trusted:
