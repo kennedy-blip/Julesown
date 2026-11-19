@@ -148,7 +148,12 @@ async def health_env_check():
             "task_guidelines": bool(settings.task_guidelines),
         },
         "github": {"auth_mode": settings.github_auth_mode},
-        "sandbox": {"configured": bool(settings.e2b_api_key), "provider": "e2b"},
+        "sandbox": {
+            "configured": bool(settings.e2b_api_key),
+            "provider": "e2b",
+            # Where it may connect: auto | open | restricted (JULES_SANDBOX_NETWORK).
+            "network": settings.sandbox_network,
+        },
         "webhooks": {"secret_configured": bool(settings.github_webhook_secret)},
         "access": {"mode": settings.access_mode},
         "limits": {

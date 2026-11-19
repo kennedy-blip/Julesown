@@ -199,6 +199,62 @@ PROVIDER_MODEL_VARIABLES = {
 # Providers whose address names the account: a key alone is not enough for
 # them. The value is the setting that holds the account's ID.
 PROVIDER_ACCOUNT_VARIABLES = {"cloudflare": "CLOUDFLARE_ACCOUNT_ID"}
+
+# Where the sandbox may connect (JULES_SANDBOX_NETWORK):
+#   auto        anywhere - except for a task that quotes text written by
+#               somebody outside the project (an issue), which gets the limit
+#   open        anywhere, always
+#   restricted  the hosts below only, always
+SANDBOX_NETWORK_MODES = ("auto", "open", "restricted")
+# What a limited sandbox can still reach: GitHub (the clone, dependencies kept
+# in git) and the registries that installs and builds fetch from. Everything
+# else is refused. Names with "*." stand for every host below that name.
+SANDBOX_HOSTS: Tuple[str, ...] = (
+    "github.com",
+    "*.github.com",
+    "*.githubusercontent.com",
+    # JavaScript
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "nodejs.org",
+    # Python
+    "pypi.org",
+    "files.pythonhosted.org",
+    # Go, Rust, Ruby, PHP
+    "proxy.golang.org",
+    "sum.golang.org",
+    "crates.io",
+    "*.crates.io",
+    "rubygems.org",
+    "*.rubygems.org",
+    "repo.packagist.org",
+    # Java
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "plugins.gradle.org",
+    "services.gradle.org",
+    # System packages of the sandbox image
+    "deb.debian.org",
+    "security.debian.org",
+    "archive.ubuntu.com",
+    "security.ubuntu.com",
+)
+_HOST_RE = re.compile(
+    r"^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"  # a name, or every host below one
+    r"|^\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?$"  # an address or a block of addresses
+)
+
+
+def clean_hosts(raw: Optional[str]) -> Tuple[str, ...]:
+    """The hosts in a setting such as "a.example, *.b.example, 10.0.0.0/8":
+    names, names with "*." in front, addresses and address blocks. Anything
+    else is left out - and so is "everything" (a bare "*" or 0.0.0.0/0), which
+    is what JULES_SANDBOX_NETWORK=open is for."""
+    hosts: List[str] = []
+    for item in re.split(r"[\s,;]+", (raw or "").strip().lower()):
+        if item and _HOST_RE.match(item) and not item.startswith("0.0.0.0") and item not in hosts:
+            hosts.append(item)
+    return tuple(hosts)
 ACCOUNT_PLACEHOLDER = "{account_id}"
 
 # Who a commit made by the agent is attributed to.
@@ -437,9 +493,26 @@ class Settings:
     # deliver what it has - marked as unfinished - instead of discarding it.
     keep_unfinished_work: bool = True
 
+    # Where the sandbox may connect (see SANDBOX_NETWORK_MODES), and hosts of
+    # the owner's own that a limited sandbox may reach beside SANDBOX_HOSTS.
+    sandbox_network: str = "auto"
+    sandbox_extra_hosts: Tuple[str, ...] = ()
+    # Set by the runner for the task at hand: this sandbox gets the limit.
+    sandbox_limited: bool = False
+
     # ------------------------------------------------------------------ #
     # Derived state
     # ------------------------------------------------------------------ #
+    @property
+    def sandbox_hosts(self) -> Tuple[str, ...]:
+        """Every host a limited sandbox can reach."""
+        return SANDBOX_HOSTS + tuple(host for host in self.sandbox_extra_hosts if host not in SANDBOX_HOSTS)
+
+    def limits_sandbox_for(self, *, outside_text: bool) -> bool:
+        """Whether a task's sandbox gets the limited network. ``outside_text``:
+        the task quotes what somebody outside the project wrote."""
+        return self.sandbox_network == "restricted" or (self.sandbox_network == "auto" and outside_text)
+
     def stored_key_for(self, provider: str) -> Optional[str]:
         """The key that is set for a provider, usable as things stand or not."""
         return getattr(self, f"{provider}_api_key", None) if provider in LLM_PROVIDERS else None
@@ -775,9 +848,18 @@ def get_settings() -> Settings:
         ci_autofix=env_bool("JULES_CI_AUTOFIX", True),
         ci_autofix_attempts=env_int("JULES_CI_AUTOFIX_ATTEMPTS", 2, minimum=0, maximum=5),
         keep_unfinished_work=env_bool("JULES_KEEP_UNFINISHED_WORK", True),
+        sandbox_network=_sandbox_network(env_str("JULES_SANDBOX_NETWORK")),
+        sandbox_extra_hosts=clean_hosts(env_str("JULES_SANDBOX_ALLOWED_HOSTS")),
         # "\n" typed into a one-line field of a hosting dashboard is meant as a line break.
         task_guidelines=(env_str("JULES_TASK_GUIDELINES") or "").replace("\\n", "\n").strip()[:MAX_GUIDELINES_CHARS],
     )
+
+
+def _sandbox_network(raw: Optional[str]) -> str:
+    value = (raw or "auto").strip().lower()
+    aliases = {"limited": "restricted", "restrict": "restricted", "closed": "restricted", "unrestricted": "open"}
+    value = aliases.get(value, value)
+    return value if value in SANDBOX_NETWORK_MODES else "auto"
 
 
 def _commit_authorship(raw: Optional[str]) -> str:

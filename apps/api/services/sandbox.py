@@ -70,6 +70,12 @@ README_FILES = ("README.md", "README.rst", "README.txt", "README", "Readme.md", 
 KEY_FILE_BYTES = 1600
 README_BYTES = 500
 KEY_FILES_TOTAL_BYTES = 2400
+# The repository's own instructions for coding agents (https://agents.md): how
+# it is set up, built and tested, and what its conventions are. They are handed
+# to the agent with the task, in a budget of their own - what stands there
+# saves the turns the agent would spend finding it out.
+GUIDE_FILES = ("AGENTS.md", "Agents.md", "agents.md")
+GUIDE_BYTES = 16000
 
 # Where builds and test runs put their output: in a directory of one of these
 # names next to the project's manifest (dist/ beside package.json), or in a
@@ -108,6 +114,10 @@ def _in_batches(arguments: Sequence[str], limit: int = 40_000) -> List[List[str]
         batches[-1].append(argument)
         length += cost
     return batches
+
+
+# "Every address", in the notation E2B's deny list takes.
+ALL_TRAFFIC = "0.0.0.0/0"
 
 
 class SandboxError(RuntimeError):
@@ -176,6 +186,8 @@ class E2BWorkspace:
         self.sandbox_id: str = str(getattr(sandbox, "sandbox_id", "") or "")
         self.workdir = DEFAULT_WORKDIR
         self.description = f"E2B sandbox {self.sandbox_id}".strip()
+        # The sandbox can only connect to the hosts it was given (see create).
+        self.network_limited = False
 
     @classmethod
     def create(
@@ -185,7 +197,11 @@ class E2BWorkspace:
         template: Optional[str] = None,
         lifetime_seconds: int = 600,
         metadata: Optional[Dict[str, str]] = None,
+        allowed_hosts: Optional[Sequence[str]] = None,
     ) -> "E2BWorkspace":
+        """Start a sandbox. With ``allowed_hosts`` it can connect to those
+        hosts and to nothing else (E2B filters by the name a connection asks
+        for: the Host header on port 80, the server name of TLS on port 443)."""
         if not api_key:
             raise SandboxError("E2B_API_KEY is not configured, so no sandbox can be started.")
         try:
@@ -204,12 +220,22 @@ class E2BWorkspace:
             options["template"] = template
         if metadata:
             options["metadata"] = metadata
+        if allowed_hosts is not None:
+            # Names can only be allowed when everything else is denied.
+            options["network"] = {"allow_out": list(allowed_hosts), "deny_out": [ALL_TRAFFIC]}
         try:
             sandbox = Sandbox.create(**options)
+        except TypeError as exc:
+            if allowed_hosts is None:
+                raise SandboxError(_describe_e2b_error(exc)) from exc
+            raise SandboxError(
+                f"The installed E2B SDK cannot limit a sandbox's network ({exc}). Upgrade the e2b package."
+            ) from exc
         except Exception as exc:
             raise SandboxError(_describe_e2b_error(exc)) from exc
 
         workspace = cls(sandbox)
+        workspace.network_limited = allowed_hosts is not None
         try:
             located = workspace.run("pwd", timeout=20.0)
             if located.ok and located.stdout.strip().startswith("/"):
@@ -293,6 +319,8 @@ class KeyFile:
     content: str
     size: int  # bytes of the whole file
     truncated: bool = False
+    # The file is the repository's instructions for agents (AGENTS.md), not a fact about it.
+    guide: bool = False
 
 
 @dataclass
@@ -460,17 +488,19 @@ class RepoCheckout:
         return [line for line in lines[1:] if line.strip()], total
 
     def key_files(self) -> List[KeyFile]:
-        """The repository's manifests and the start of its README.
+        """The repository's manifests, the start of its README and its
+        instructions for agents (AGENTS.md, marked ``guide``).
 
         Best effort: an empty list if nothing could be read. Symbolic links,
         binary and empty files are skipped; the total size is bounded.
         """
-        names = " ".join(shlex.quote(name) for name in MANIFEST_FILES + README_FILES)
+        names = " ".join(shlex.quote(name) for name in MANIFEST_FILES + README_FILES + GUIDE_FILES)
         readmes = "|".join(README_FILES)
+        guides = "|".join(GUIDE_FILES)
         script = (
             f"for f in {names}; do "
             'if [ -f "$f" ] && [ ! -L "$f" ] && [ -s "$f" ] && grep -Iq \'\' "$f"; then '
-            f'case "$f" in {readmes}) n={README_BYTES};; *) n={KEY_FILE_BYTES};; esac; '
+            f'case "$f" in {readmes}) n={README_BYTES};; {guides}) n={GUIDE_BYTES};; *) n={KEY_FILE_BYTES};; esac; '
             'printf \'%s %s \' "$f" "$(wc -c < "$f" | tr -d \' \')"; '
             'head -c "$n" "$f" | base64 | tr -d \'\\n\'; printf \'\\n\'; '
             "fi; done"
@@ -482,27 +512,34 @@ class RepoCheckout:
         if not result.ok:
             return []
         found: List[KeyFile] = []
-        seen_readme = False
+        seen_readme = seen_guide = False
         used = 0
         for line in result.stdout.splitlines():
             pieces = line.split(" ")
             if len(pieces) != 3 or not pieces[1].isdigit():
                 continue
             path, size = pieces[0], int(pieces[1])
-            is_readme = path in README_FILES
-            if is_readme and seen_readme:
+            is_readme, is_guide = path in README_FILES, path in GUIDE_FILES
+            if (is_readme and seen_readme) or (is_guide and seen_guide):
                 continue  # README.md and readme.md are the same file on some filesystems
             try:
                 content = base64.b64decode(pieces[2], validate=True).decode("utf-8", "replace")
             except (binascii.Error, ValueError):
                 continue
-            truncated = size > (README_BYTES if is_readme else KEY_FILE_BYTES)
+            truncated = size > (README_BYTES if is_readme else GUIDE_BYTES if is_guide else KEY_FILE_BYTES)
             if truncated:
                 # End on a whole line rather than in the middle of one.
                 last_newline = content.rfind("\n")
                 if last_newline >= len(content) // 2:
                     content = content[: last_newline + 1]
-            if not content.strip() or used + len(content) > KEY_FILES_TOTAL_BYTES:
+            if not content.strip():
+                continue
+            if is_guide:
+                # Its budget is its own: it does not crowd out the manifests.
+                seen_guide = True
+                found.append(KeyFile(path=path, content=content, size=size, truncated=truncated, guide=True))
+                continue
+            if used + len(content) > KEY_FILES_TOTAL_BYTES:
                 continue
             seen_readme = seen_readme or is_readme
             used += len(content)

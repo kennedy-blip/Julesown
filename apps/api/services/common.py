@@ -1,4 +1,5 @@
-"""Small shared helpers: time budgets, secret redaction and text clipping."""
+"""Small shared helpers: time budgets, secret redaction, text clipping and
+what to do with text that somebody outside the project wrote."""
 from __future__ import annotations
 
 import re
@@ -85,6 +86,38 @@ def clip(text: str, limit: int, *, tail_share: float = 0.7) -> str:
     head = max(0, limit - tail)
     omitted = len(text) - head - tail
     return f"{text[:head]}\n[... {omitted} characters omitted ...]\n{text[-tail:] if tail else ''}"
+
+
+# Text that a reader of an issue on GitHub does not see, and a model reads all
+# the same: HTML comments, Markdown link definitions that are used as comments
+# ("[//]: # (...)"), and characters without a shape - the zero-width space, the
+# word joiner, the byte order mark, the overrides of the writing direction and
+# the "tag" characters, which spell out text that no font draws.
+_HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.DOTALL)
+_COMMENT_LINK_RE = re.compile(
+    r"^[ \t]{0,3}\[[^\]\n]*\]:[ \t]*(?:#|<>)[ \t]+(?:\(.*\)|\".*\"|'.*')[ \t]*$", re.MULTILINE
+)
+_SHAPELESS_RE = re.compile("[\u200b\u2060\ufeff\u202a-\u202e\u2066-\u2069\U000e0000-\U000e007f]")
+
+
+def visible_text(text: str) -> str:
+    """``text`` as somebody who reads it on GitHub sees it: without what
+    Markdown does not render and without characters that have no shape.
+
+    An issue is shown to its reader and handed to a model. Whatever only the
+    model would get to see is the place for instructions meant for the model
+    alone, so it is taken out before anything is built from the text.
+    """
+    cleaned = _HTML_COMMENT_RE.sub("", text or "")
+    cleaned = _COMMENT_LINK_RE.sub("", cleaned)
+    cleaned = _SHAPELESS_RE.sub("", cleaned)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+def quoted(text: str) -> str:
+    """``text`` as a quotation: every line starts with "> ". Nothing inside
+    it can then pass for a line of the text around it."""
+    return "\n".join(f"> {line}".rstrip() for line in (text or "").splitlines()) or ">"
 
 
 def listed(items: Sequence[str], limit: int = 6) -> str:

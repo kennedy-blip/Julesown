@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional
 
 from ..config import Settings
@@ -101,6 +101,8 @@ def _e2b_workspace(settings: Settings, task_id: str, lifetime_seconds: int) -> W
         template=settings.e2b_template,
         lifetime_seconds=lifetime_seconds,
         metadata={"app": "jules-clone", "task": task_id},
+        # For the task at hand (see TaskRunner.run): GitHub and the package registries only.
+        allowed_hosts=settings.sandbox_hosts if settings.sandbox_limited else None,
     )
 
 
@@ -179,6 +181,14 @@ def build_pr_body(
     lines += ["## Summary", "", outcome.summary.strip() or "_The agent did not write a summary._", ""]
     lines += ["## Task", ""]
     lines += [f"> {line}" for line in task["prompt"].strip().splitlines()[:40]]
+    if task.get("untrusted_author"):
+        # The reviewer should know whose words were part of the task.
+        lines += [
+            "",
+            f"The issue quoted in the task was written by @{task['untrusted_author']}, who is not a "
+            "collaborator of this repository. The agent was told to take it as the description of a "
+            "problem and not as instructions; review the change with that in mind.",
+        ]
     lines += ["", "## Changes", ""]
     for change in changeset.changes[:60]:
         label = STATUS_LABELS.get(change.status, change.status)
@@ -612,9 +622,36 @@ class TaskRunner:
 
             # 3. Sandbox ------------------------------------------------------
             stage("sandbox", "Starting sandbox")
-            workspace = self.deps.workspace_factory(settings, task_id, int(budget) + 60)
+            # A task that quotes what somebody outside the project wrote (an
+            # issue) can carry instructions of theirs. The agent is told whose
+            # words are whose; as a second line of defence its sandbox reaches
+            # GitHub and the package registries and nothing else.
+            stranger = str(task.get("untrusted_author") or "")
+            if stranger:
+                emit(
+                    "info",
+                    f"The issue was written by @{stranger}, who is not a collaborator: its text is given to "
+                    "the agent as a quotation, not as instructions",
+                )
+            limited = settings.limits_sandbox_for(outside_text=bool(stranger))
+            lifetime = int(budget) + 60
+            try:
+                workspace = self.deps.workspace_factory(
+                    replace(settings, sandbox_limited=True) if limited else settings, task_id, lifetime
+                )
+            except SandboxError as exc:
+                if not limited or settings.sandbox_network == "restricted":
+                    raise
+                # Here the limit is a precaution nobody asked for by name: a
+                # sandbox that cannot have it must not cost the task.
+                emit("warn", f"The sandbox could not be started with a limited network ({exc}); starting it without the limit")
+                limited = False
+                workspace = self.deps.workspace_factory(settings, task_id, lifetime)
             update(sandbox=workspace.description)
             emit("info", f"Sandbox ready: {workspace.description}")
+            limited = limited and bool(getattr(workspace, "network_limited", False))
+            if limited:
+                emit("info", "The sandbox's network is limited to GitHub and the package registries")
 
             # 4. Clone --------------------------------------------------------
             files: List[str] = []
@@ -682,6 +719,7 @@ class TaskRunner:
                 reserve_seconds=COMMIT_RESERVE_SECONDS,
                 new_project=new_project,
                 update=target is not None,
+                limited_network=limited,
             )
             outcome = agent.run(
                 prompt=agent_prompt,

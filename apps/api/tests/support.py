@@ -17,6 +17,7 @@ import copy
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -140,6 +141,8 @@ class GitRemote:
 
     def create(self, slug: str, files: Dict[str, str], *, branch: str = "main") -> Path:
         bare = self.path_for(slug)
+        if bare.exists():
+            shutil.rmtree(bare)
         git(self.root, "init", "--quiet", "--bare", f"--initial-branch={branch}", str(bare))
         with tempfile.TemporaryDirectory(dir=str(self.root)) as scratch:
             git(scratch, "init", "--quiet", f"--initial-branch={branch}")

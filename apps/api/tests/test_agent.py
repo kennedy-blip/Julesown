@@ -21,6 +21,7 @@ from apps.api.services.agent import (
 from apps.api.services.common import Deadline, Redactor, clip, plain_text
 from apps.api.services.llm import LLMError, LLMResponse, ToolCall
 from apps.api.services.sandbox import (
+    GUIDE_BYTES,
     KEY_FILE_BYTES,
     KEY_FILES_TOTAL_BYTES,
     README_BYTES,
@@ -755,6 +756,68 @@ def test_key_files_are_part_of_the_first_message(remote: GitRemote, tmp_path):
     assert wrote == "Wrote package.json (1 lines)."
     assert refused.startswith("Error: README.md already exists")
 
+
+def test_guide_files_are_read_beside_the_main_budget(remote: GitRemote, tmp_path):
+    manifest = '{"name": "demo"}\n'
+    readme = "# Demo\n" + "More text.\n" * 500
+    guide = "# Agent instructions\n" + "Run py.test for the tests.\n" * 500
+    checkout = checkout_of(
+        remote,
+        tmp_path,
+        {"package.json": manifest, "README.md": readme, "AGENTS.md": guide},
+    )
+    files = checkout.key_files()
+    by_path = {item.path: item for item in files}
+    assert sorted(by_path) == ["AGENTS.md", "README.md", "package.json"]
+    guide_file = by_path["AGENTS.md"]
+    assert guide_file.guide is True
+    assert not guide_file.truncated
+    assert guide_file.content.startswith("# Agent instructions")
+    readme_file = by_path["README.md"]
+    assert readme_file.guide is False
+    assert readme_file.truncated
+    assert len(readme_file.content) <= README_BYTES
+
+    # A guide larger than its own budget is cut at whole lines, like a README.
+    big_guide = "x\n" * 10000
+    checkout2 = checkout_of(
+        remote, tmp_path, {"package.json": manifest, "AGENTS.md": big_guide}
+    )
+    big = checkout2.key_files()
+    by_path = {item.path: item for item in big}
+    assert sorted(by_path) == ["AGENTS.md", "package.json"]
+    big_guide_file = by_path["AGENTS.md"]
+    assert big_guide_file.guide is True
+    assert big_guide_file.truncated and big_guide_file.size == len(big_guide)
+    assert big_guide_file.content.endswith("\n")
+    assert len(big_guide_file.content) <= GUIDE_BYTES
+
+
+def test_guide_is_shown_above_the_manifests_in_the_first_message(remote: GitRemote, tmp_path):
+    checkout = checkout_of(
+        remote,
+        tmp_path,
+        {
+            "package.json": '{"name": "demo"}\n',
+            "AGENTS.md": "Tests are run with py.test.\n",
+        },
+    )
+    llm = ScriptedLLM(
+        [
+            [("finish", {"summary": "done"})],
+            [("finish", {"summary": "done"})],
+        ]
+    )
+    agent, _events = make_agent(checkout, llm)
+    outcome = run(agent, key_files=checkout.key_files())
+    first = llm.requests[0][1]["content"]
+    assert "The repository's own instructions for coding agents" in first
+    assert "Tests are run with py.test." in first
+    assert "--- AGENTS.md ---" in first
+    assert "--- package.json (17 bytes) ---" in first
+    # A guide is not counted as something the agent has read: only files it
+    # actually opened with read_file.
+    assert outcome.files_read == ["package.json"]
 
 def test_being_shown_the_manifest_is_not_the_same_as_looking(remote: GitRemote, tmp_path):
     """The manifest is in the first message, but a file that describes the
