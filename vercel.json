@@ -7,11 +7,7 @@
     },
     {
       "src": "apps/web/package.json",
-      "use": "@vercel/next",
-      "config": {
-        "distDir": ".next",
-        "rootDirectory": "apps/web"
-      }
+      "use": "@vercel/next"
     }
   ],
   "routes": [
