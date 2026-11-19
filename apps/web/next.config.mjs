@@ -5,7 +5,6 @@ const apiBase = (process.env.API_BASE_URL || 'http://localhost:8000').replace(/\
 
 const nextConfig = {
   reactStrictMode: true,
-  swcMinify: true,
   async rewrites() {
     // On Vercel, vercel.json sends /api/* straight to the Python function
     // before Next.js sees the request. A proxy rule would only add a route to

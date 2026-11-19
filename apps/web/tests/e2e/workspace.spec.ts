@@ -43,6 +43,35 @@ test.describe('the workspace', () => {
     );
   });
 
+  test('shows what the agent does while it is still doing it', async ({ page, standin }) => {
+    await standin.reset({
+      script: [
+        [['read_file', { path: 'calc.py' }]],
+        // (The log shows the command as well as its output: what is waited for is only in the output.)
+        [['run_command', { command: 'sleep 3 && echo "waited $((6 * 7)) ticks"', timeout: 30 }]],
+        [['finish', { summary: 'Looked at the calculator and changed nothing.', pr_title: 'Nothing' }]],
+      ],
+    });
+    await openWorkspace(page);
+    await startTask(page, 'acme/demo', 'Look at the calculator');
+
+    // The first step is on screen while the second one is still running: the
+    // log is streamed, not delivered in one piece at the end.
+    const log = page.getByTestId('terminal-body');
+    await expect(log).toContainText('read_file calc.py');
+    await expect(log).not.toContainText('waited 42 ticks');
+    await expect(page.getByTestId('terminal-state')).toHaveText('Running');
+    await expect(page.getByTestId('run-task')).toBeDisabled();
+
+    const result = await finishedResult(page);
+    await expect(log).toContainText('waited 42 ticks');
+    // Nothing was changed, so there is nothing to open a pull request for - and none is claimed.
+    await expect(result).toHaveAttribute('data-state', 'completed');
+    await expect(page.getByTestId('no-changes')).toBeVisible();
+    await expect(page.getByTestId('pr-link')).toHaveCount(0);
+    expect((await standin.state()).pulls['acme/demo']).toBeUndefined();
+  });
+
   test('keeps a task in the history across a reload', async ({ page }) => {
     await openWorkspace(page);
     await startTask(page, 'acme/demo', 'Fix the failing test');

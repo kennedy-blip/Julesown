@@ -69,13 +69,16 @@ function InstallationNote({ installation }: { installation: AppInstallation }) {
   );
 }
 
+// One list for "nothing yet", so that the search is not run again on every render.
+const NO_REPOSITORIES: RepoSummary[] = [];
+
 export function RepositoryPicker({ listing, loading, error, selected, onSelect, onRefresh, unavailable }: RepositoryPickerProps) {
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const repositories: RepoSummary[] = listing ? listing.repositories : [];
+  const repositories: RepoSummary[] = listing ? listing.repositories : NO_REPOSITORIES;
   const matches = useMemo(() => searchRepositories(repositories, query), [repositories, query]);
   const shown = matches.slice(0, MAX_ROWS);
   const searching = query.trim() !== '';

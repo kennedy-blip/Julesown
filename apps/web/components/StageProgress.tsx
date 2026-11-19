@@ -1,6 +1,5 @@
 'use client';
 
-import React from 'react';
 import { Check, Loader2, Minus, X, HelpCircle } from 'lucide-react';
 import type { TaskRecord } from '@/lib/api';
 import type { SessionState } from '@/lib/sessions';

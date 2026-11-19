@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Terminal as TerminalIcon, Copy, Check } from 'lucide-react';
 import type { LogEntry } from '@/lib/api';
 import type { SessionState } from '@/lib/sessions';

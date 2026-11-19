@@ -1,6 +1,8 @@
 # Node & Build Outputs
 node_modules/
 .next/
+# Written by Next.js on every build and dev run
+next-env.d.ts
 out/
 build/
 dist/

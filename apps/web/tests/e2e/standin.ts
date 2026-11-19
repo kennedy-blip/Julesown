@@ -62,7 +62,7 @@ export class StandIn {
   }
 }
 
-export const test = base.extend<{ standin: StandIn }>({
+export const test = base.extend<{ standin: StandIn; quietConsole: void }>({
   // For every test, whether it asks for the stand-in or not: none of them
   // starts with what another one left behind.
   standin: [
@@ -70,6 +70,24 @@ export const test = base.extend<{ standin: StandIn }>({
       const standin = new StandIn(request);
       await standin.reset();
       await use(standin);
+    },
+    { auto: true },
+  ],
+  // Whatever a test is about, the page must not have thrown or logged an error
+  // while it ran (a hydration mismatch, a failed render, a rejected promise).
+  quietConsole: [
+    async ({ page }, use) => {
+      const problems: string[] = [];
+      page.on('pageerror', (error) => problems.push(`uncaught: ${error.message}`));
+      page.on('console', (message) => {
+        if (message.type() !== 'error') return;
+        // The browser's own note about a request the server refused, which is
+        // what some tests are about (a wrong access key, a wrong provider key).
+        if (/^Failed to load resource/.test(message.text())) return;
+        problems.push(message.text());
+      });
+      await use();
+      expect(problems, 'errors in the page').toEqual([]);
     },
     { auto: true },
   ],
