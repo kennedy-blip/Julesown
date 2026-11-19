@@ -142,7 +142,7 @@ class TaskStore:
                 record.update(fields)
 
     def log(self, task_id: str, level: str, message: str) -> Dict[str, Any]:
-        entry = {"ts": time.time(), "level": level, "message": message}
+        entry = {"ts": time.time(), "level": level, "message": message, "task_id": task_id}
         with self._lock:
             record = self._tasks.get(task_id)
             if record is not None and len(record["log_entries"]) < MAX_LOG_ENTRIES:

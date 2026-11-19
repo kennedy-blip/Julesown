@@ -6,7 +6,10 @@ where it is imported as ``apps.api.main``) and run locally with
 """
 from __future__ import annotations
 
-from typing import Any, List
+import logging
+import time
+import uuid
+from typing import Any, Callable, Dict, List
 
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import http_exception_handler
@@ -14,12 +17,120 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from .config import SERVICE_VERSION, env_str, load_local_env
+from .config import SERVICE_VERSION, env_bool, env_str, load_local_env
 
 load_local_env()
 
 from .routers import github, health, llm, tasks, webhooks  # noqa: E402  (after the environment is loaded)
+
+logger = logging.getLogger("jules.api")
+
+
+class _JsonFormatter(logging.Formatter):
+    """One JSON object per log line: easy to ingest by log collectors."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json as _json
+
+        payload: Dict[str, Any] = {
+            "ts": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key in ("request_id", "method", "path", "status_code", "duration_ms", "task_id"):
+            value = getattr(record, key, None)
+            if value is not None:
+                payload[key] = value
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return _json.dumps(payload)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JsonFormatter())
+logging.getLogger("jules").handlers = [_handler]
+logging.getLogger("jules").setLevel(logging.INFO)
+logging.getLogger("jules").propagate = False
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Every request gets an ``X-Request-ID`` (generated or echoed from the
+    client) so that log lines and errors can be traced end to end across the
+    API, the sandbox and GitHub."""
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Any:
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex
+        request.state.request_id = request_id
+        start = time.time()
+        response = await call_next(request)
+        response.headers["x-request-id"] = request_id
+        duration_ms = int((time.time() - start) * 1000)
+        logger.info(
+            "request",
+            extra={
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "duration_ms": duration_ms,
+            },
+        )
+        return response
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Simple in-memory rate limiter for task-creating endpoints.
+
+    ``JULES_RATE_LIMIT_REQUESTS`` (default 60) requests per
+    ``JULES_RATE_LIMIT_WINDOW_SECONDS`` (default 60) per client IP.
+    Only the task-creating endpoints are counted; health and GitHub webhook
+    endpoints are exempt.
+    """
+
+    def __init__(self, app: Any) -> None:
+        super().__init__(app)
+        self._calls: Dict[str, List[float]] = {}
+
+    def _client_key(self, request: Request) -> str:
+        forwarded = request.headers.get("x-forwarded-for")
+        client = forwarded.split(",")[0].strip() if forwarded else ""
+        return client or (request.client.host if request.client else "unknown")
+
+    def _allowed(self, key: str) -> bool:
+        # Rate limiting is opt-in for production deployments; local
+        # development and tests are unaffected.
+        if not env_bool("JULES_RATE_LIMIT_ENABLED", False):
+            return True
+        now = time.time()
+        window = int(env_str("JULES_RATE_LIMIT_WINDOW_SECONDS", "60"))
+        limit = int(env_str("JULES_RATE_LIMIT_REQUESTS", "60"))
+        calls = [t for t in self._calls.get(key, []) if now - t < window]
+        if len(calls) >= limit:
+            self._calls[key] = calls
+            return False
+        calls.append(now)
+        self._calls[key] = calls
+        return True
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Any:
+        path = request.url.path
+        if path.startswith("/api/v1/tasks") or path.startswith("/api/tasks"):
+            key = self._client_key(request)
+            if not self._allowed(key):
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "detail": {
+                            "code": "rate_limited",
+                            "message": "Too many task requests. Slow down and try again later.",
+                        }
+                    },
+                )
+        return await call_next(request)
+
 
 app = FastAPI(
     title="Jules Agent Platform API",
@@ -49,8 +160,11 @@ if _cors_origins:
         allow_origins=_cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-Jules-Key"],
+        allow_headers=["Authorization", "Content-Type", "X-Jules-Key", "X-Request-ID"],
     )
+
+app.add_middleware(RequestIdMiddleware)
+app.add_middleware(RateLimitMiddleware)
 
 app.include_router(health.router)
 app.include_router(webhooks.router)
