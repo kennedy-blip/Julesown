@@ -813,7 +813,7 @@ class RepoCheckout:
                 + "; do printf '%s ' \"$s\"; git cat-file blob \"$s\" | base64 | tr -d '\\n' || exit 1; "
                 "printf '\\n'; done"
             )
-            fetched = self.git_shell(script, timeout=120.0)
+            fetched = self.git_shell(script, timeout=300.0)
             if not fetched.ok:
                 raise SandboxError(f"Could not read the changed files: {fetched.output()[-400:]}")
             for line in fetched.stdout.splitlines():

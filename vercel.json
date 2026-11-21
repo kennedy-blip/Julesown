@@ -6,10 +6,9 @@
       "use": "@vercel/python"
     },
     {
-      "src": "apps/web/package.json",
+      "src": "package.json",
       "use": "@vercel/next",
       "config": {
-        "distDir": ".next",
         "rootDirectory": "apps/web"
       }
     }
@@ -18,10 +17,6 @@
     {
       "src": "/api/(.*)",
       "dest": "apps/api/main.py"
-    },
-    {
-      "src": "/_next/static/immutable/(.*)",
-      "dest": "/_next/static/$1"
     }
   ]
 }

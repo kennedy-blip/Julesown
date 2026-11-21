@@ -60,7 +60,7 @@ OUTLINE_MIN_CHARS = 1_500
 # How long one model call may take. With other providers to fall back on the
 # pool decides (see FailoverClient.patience): a provider that hangs is given up
 # on sooner than one that has been answering.
-MODEL_CALL_SECONDS = 90.0
+MODEL_CALL_SECONDS = 300.0
 _TPM_LIMIT_RE = re.compile(r"Limit\s+(\d+)", re.IGNORECASE)
 
 COMMAND_ENV = {
@@ -631,8 +631,8 @@ class CodingAgent:
         checkout: RepoCheckout,
         emit: Emit,
         deadline: Deadline,
-        max_turns: int = 30,
-        command_timeout: float = 120.0,
+        max_turns: int = 60,
+        command_timeout: float = 300.0,
         max_output_tokens: int = 8192,
         reserve_seconds: float = 25.0,
         sleep: Callable[[float], None] = time.sleep,
