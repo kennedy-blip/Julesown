@@ -799,9 +799,9 @@ def get_settings() -> Settings:
         github_webhook_secret=env_str("GITHUB_WEBHOOK_SECRET"),
         access_key=env_str("JULES_ACCESS_KEY"),
         allow_public_access=env_bool("JULES_ALLOW_PUBLIC_ACCESS"),
-        task_budget_seconds=env_int("JULES_TASK_BUDGET_SECONDS", 270, minimum=30, maximum=1700),
-        max_agent_turns=env_int("JULES_MAX_AGENT_TURNS", 30, minimum=1, maximum=200),
-        command_timeout_seconds=env_int("JULES_COMMAND_TIMEOUT_SECONDS", 120, minimum=5, maximum=900),
+        task_budget_seconds=env_int("JULES_TASK_BUDGET_SECONDS", 1200, minimum=30, maximum=3600),
+        max_agent_turns=env_int("JULES_MAX_AGENT_TURNS", 60, minimum=1, maximum=200),
+        command_timeout_seconds=env_int("JULES_COMMAND_TIMEOUT_SECONDS", 300, minimum=5, maximum=3600),
         max_output_tokens=env_int("JULES_MAX_OUTPUT_TOKENS", 8192, minimum=256, maximum=64000),
         # Google's own tools read GOOGLE_API_KEY as well; either name works here.
         gemini_api_key=env_str("GEMINI_API_KEY") or env_str("GOOGLE_API_KEY"),
